@@ -1,0 +1,313 @@
+// table 结构
+// [datablock(4kb)] * n  总大小2mb  每个block，4kb对齐
+// [datablockmeta]*n 总大小不受限制 描述每个block 的meta 4kb 对齐
+// table meta 最后一个block table的Meta置 4kb
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    collections::binary_heap::PeekMut,
+    io::{Cursor, Read, Seek, Write},
+    iter::Peekable,
+    ops::Not,
+    u64, usize,
+};
+
+use bincode::{config::LittleEndian, Options};
+use serde::{Deserialize, Serialize};
+
+use crate::db::{
+    common::{
+        kv_opertion_len, new_buffer, read_kv_operion, write_kv_operion, Buffer, KVOpertion,
+        KVOpertionRef, KViterAgg, Key, OpId, OpType, Result, Value,
+    },
+    memtable::Memtable,
+    sstable::block::{fill_block, next_block_postion, write_block_metas, DataBlockMeta},
+    store::{Store, StoreId},
+};
+
+use super::{block::{
+    block_data_start_offset, read_block_meta, search_in_block, BlockIter, DATA_BLOCK_SIZE,
+}, SStableBlock};
+const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct TableMeta {
+    last_key: Key,
+    data_block_count: u64,
+    meta_block_count: u64,
+}
+
+struct TableIter<'a, T: Store> {
+    table: &'a TableReader<T>,
+    table_meta: TableMeta,
+    block_metas: Vec<DataBlockMeta>,
+    current_block_num: usize,
+}
+
+// Helper: Conversion from KVOpertionRef to KVOpertion
+// SStableBlock needs owned KVOpertion. BlockIter yields KVOpertionRef.
+// Requires OpType: Clone in common.rs
+impl From<KVOpertionRef<'_>> for KVOpertion {
+    fn from(kv_ref: KVOpertionRef) -> Self {
+        KVOpertion {
+            id: *kv_ref.id,              // OpId is Copy
+            key: kv_ref.key.to_string(), // Clone &str -> String
+            op: kv_ref.op.clone(),       // Clone OpType
+        }
+    }
+}
+
+impl<'a, T: Store> TableIter<'a, T> {
+    fn new(table: &'a TableReader<T>) -> Self {
+        let table_meta = table.read_table_meta();
+        let metas = table.read_block_meta(&table_meta);
+        TableIter {
+            table,
+            table_meta,
+            block_metas: metas,
+            current_block_num: 0,
+        }
+    }
+}
+impl<'a, T: Store> Iterator for TableIter<'a, T> {
+    type Item = SStableBlock;
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+        // read next block from tablefile at current_block_num*DATA_BLOCK_SIZE 
+        // save it in a new block
+        // return return none if no more block
+        // update current_block_num
+    }
+}
+
+pub fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
+    assert!(it.peek().is_some());
+    let mut block_buffer = new_buffer(DATA_BLOCK_SIZE);
+    let mut metas = Vec::<DataBlockMeta>::new();
+    let mut block_count = 0;
+    //  check it next,if is none write block meta, table meta, return
+    // write kv to block
+    while it.peek().is_some() && block_count < BLOCK_COUNT_LIMIT {
+        // reset buffer and fill with it
+        block_buffer.set_position(0);
+        let (first_key, last_key, count) = fill_block(&mut block_buffer, it);
+        // write to store
+        store.write_seek(block_count * DATA_BLOCK_SIZE);
+        append_buffer_to_store(&block_buffer, store);
+        block_count += 1;
+        let meta = DataBlockMeta {
+            last_key,
+            count: count,
+        };
+        metas.push(meta);
+    }
+    // save block meta to store
+    store.write_seek(next_block_postion(store.len()));
+    assert_eq!(store.len() % DATA_BLOCK_SIZE, 0);
+    block_buffer.set_position(0);
+    write_block_metas(&metas, &mut block_buffer);
+
+    let mut meta_block_count = block_buffer.position() / (DATA_BLOCK_SIZE as u64);
+    let a = if block_buffer.position() % (DATA_BLOCK_SIZE as u64) == 0 {
+        0
+    } else {
+        1
+    };
+    meta_block_count += a;
+
+    append_buffer_to_store(&block_buffer, store);
+    // store seek to next block
+    store.write_seek(next_block_postion(store.len()));
+    // save table meta to store
+
+    assert_eq!(store.len() % DATA_BLOCK_SIZE, 0);
+    let table_last_key = metas.last().unwrap().last_key.clone();
+
+    block_buffer.set_position(0);
+    write_table_meta(
+        &TableMeta {
+            last_key: table_last_key,
+            data_block_count: block_count as u64,
+            meta_block_count,
+        },
+        &mut block_buffer,
+    );
+    append_buffer_to_store(&block_buffer, store);
+
+    // flush store
+    store.flush();
+}
+
+// write to last block
+fn append_buffer_to_store<T: Store>(buffer: &Buffer, store: &mut T) {
+    let v = buffer.get_ref();
+    store.append(&v[0..buffer.position() as usize]);
+}
+
+struct TableReader<T: Store> {
+    store: T,
+}
+
+// for level 0,must consider multiple key with diff value/or delete
+impl<T: Store> TableReader<T> {
+    fn new(mut store: T) -> Self {
+        TableReader { store }
+    }
+    fn read_table_meta(&self) -> TableMeta {
+        let meta_postion = (self.store.len() / DATA_BLOCK_SIZE) * DATA_BLOCK_SIZE;
+        let mut data = vec![0; DATA_BLOCK_SIZE];
+        self.store.read_at(&mut data.as_mut_slice(), meta_postion);
+        let mut block = Cursor::new(data);
+        read_table_meta(&mut block)
+    }
+    fn read_block_meta(&self, table_meta: &TableMeta) -> Vec<DataBlockMeta> {
+        let offset = block_data_start_offset(table_meta.data_block_count as usize);
+        let mut buffer = new_buffer((table_meta.meta_block_count as usize) * DATA_BLOCK_SIZE);
+        self.store.read_at(buffer.get_mut().as_mut_slice(), offset);
+        let metas = read_block_meta(&mut buffer, table_meta.data_block_count as usize);
+        metas
+    }
+    fn to_iter(&self) -> TableIter<T> {
+        todo!()
+    }
+    fn find(&self, key: &Key, id: OpId) -> Option<OpType> {
+        // check table last_key return none if key is greater
+        let table_meta = self.read_table_meta();
+        if table_meta.last_key.lt(key) {
+            return None;
+        }
+        let metas = self.read_block_meta(&table_meta);
+        // find block which is the first block whose last_key is greater or eq key
+        for (i, meta) in metas.iter().enumerate() {
+            if meta.last_key.ge(&key) {
+                let mut buffer = new_buffer(DATA_BLOCK_SIZE);
+                let mut v = buffer.get_mut().as_mut_slice();
+                self.store.read_at(&mut v, DATA_BLOCK_SIZE * i);
+                let res = search_in_block(&mut buffer, meta.count as usize, key, id);
+                return res;
+            }
+        }
+        None
+    }
+}
+
+fn write_table_meta(meta: &TableMeta, w: &mut Buffer) {
+    assert_eq!(w.position(), 0);
+    bincode::serialize_into(&mut *w, &meta);
+    assert!((w.position() as usize) < DATA_BLOCK_SIZE);
+}
+fn read_table_meta(r: &mut Buffer) -> TableMeta {
+    assert_eq!(r.position(), 0);
+    bincode::deserialize_from(r).unwrap()
+}
+
+#[cfg(test)]
+mod test {
+    use bincode::serialize_into;
+
+    use super::{TableMeta, DATA_BLOCK_SIZE};
+    use std::{
+        hash::BuildHasher, io::Cursor, iter::Peekable, os::unix::fs::MetadataExt, process::Output,
+        rc::Rc, str::FromStr, usize,
+    };
+
+    use crate::db::{
+        common::{
+            kv_opertion_len, read_kv_operion, test::create_data_source_for_test, write_kv_operion,
+            KVOpertion, KVOpertionRef, OpType,
+        },
+        sstable::{
+            self,
+            block::{read_block_meta, search_in_block, write_block_metas, DataBlockMeta},
+            table::{
+                create_table, fill_block, next_block_postion, read_table_meta, write_table_meta,
+            },
+        },
+        store::{Memstore, Store},
+    };
+
+    use super::{KViterAgg, TableReader};
+
+    fn create_test_table(size: usize) -> TableReader<Memstore> {
+        use crate::db::common::test::create_data_source_for_test;
+        let v = create_data_source_for_test(size);
+        let id = "1".to_string();
+        let mut store = Memstore::new(&id);
+        let mut it = v.iter().map(|kv| KVOpertionRef::new(kv));
+        let mut iter = KViterAgg::new(vec![&mut it]).peekable();
+        create_table(&mut store, &mut iter);
+        let table: TableReader<Memstore> = TableReader::new(store);
+        table
+    }
+
+    // #[test]
+    // fn test_table_build_use_large_iter_and_check_by_iterator() {
+    //     let num = 80000;
+    //     //test data more than table
+    //     let mut kvs = create_data_source_for_test(num);
+    //     let duplicate_key = 100.to_string();
+    //     // duplictae key 100
+    //     kvs.insert(
+    //         101,
+    //         KVOpertion {
+    //             id: num as u64,
+    //             key: duplicate_key.clone(),
+    //             op: OpType::Write("test".to_string()),
+    //         },
+    //     );
+    //
+    //     let mut kvs_ref = kvs.iter().map(|kv| KVOpertionRef::new(&kv));
+    //     let mut iter = KViterAgg::new(vec![&mut kvs_ref]).peekable();
+    //     let id = "1".to_string();
+    //     let mut store = Memstore::new(&id);
+    //     create_table(&mut store, &mut iter);
+    //
+    //     //check iter is not empty
+    //     assert!(iter.peek().is_some());
+    //
+    //     let table = TableReader::new(store);
+    //     let table_iter = table.to_iter();
+    //     for (i, kv) in table_iter.enumerate() {
+    //         if *kv.key == duplicate_key {
+    //             assert_eq!(*kv.id, num as u64);
+    //             assert_eq!(*kv.op, OpType::Write("test".to_string()));
+    //         } else {
+    //             assert_eq!(*kv.id, i as u64);
+    //             assert_eq!(*kv.key, i.to_string());
+    //             assert_eq!(*kv.op, OpType::Write(i.to_string()));
+    //         }
+    //     }
+    //
+    //     //test data less than table
+    // }
+    #[test]
+    fn test_table_meta_read_write() {
+        let meta = TableMeta {
+            last_key: "last".to_string(),
+            data_block_count: 1,
+            meta_block_count: 1,
+        };
+        let mut block = Cursor::new(Vec::new());
+        write_table_meta(&meta, &mut block);
+        block.set_position(0);
+        let res = read_table_meta(&mut block);
+        assert_eq!(res, meta);
+    }
+
+    #[test]
+    fn test_table_reader() {
+        let len = 100;
+        let table = create_test_table(len);
+
+        for i in 0..len {
+            let res = table
+                .find(&i.to_string(), i as u64)
+                .expect(&format!("{} should in table", i));
+            assert_eq!(res, OpType::Write(i.to_string()));
+        }
+
+        let res = table.find(&"100".to_string(), 100);
+        assert!(res.is_none());
+    }
+}
