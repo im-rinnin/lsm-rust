@@ -37,7 +37,7 @@ impl<'a> BlockIter<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub struct DataBlockMeta {
     pub last_key: Key,
     pub count: usize,

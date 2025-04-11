@@ -16,9 +16,6 @@ mod table;
 mod block;
 
 struct SStableMeta {}
-struct SStableBlock {
-    data: Vec<KVOpertion>,
-}
 pub struct SStbleIter<'a, T: Store> {
     sstable: &'a SStable<T>,
 }
