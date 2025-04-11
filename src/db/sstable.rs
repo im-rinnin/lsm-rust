@@ -1,6 +1,6 @@
 use crate::db::store::StoreId;
-use crate::db::KVOpRef;
 
+use super::common::KVOpertionRef;
 // all sstable create compaction read
 use super::common::Key;
 use super::store::Store;
@@ -12,10 +12,11 @@ pub struct SStable<T: Store> {
     id: SStableId,
     store: T,
 }
+mod table;
 mod block;
 
 struct SStableMeta {}
-struct SstableBlock {
+struct SStableBlock {
     data: Vec<KVOpertion>,
 }
 pub struct SStbleIter<'a, T: Store> {
@@ -35,7 +36,7 @@ impl<T: Store> SStable<T> {
         unimplemented!()
     }
     // build from kv iterator
-    pub fn from_iter(iters: Vec<&mut dyn Iterator<Item = KVOpRef>>) -> Self {
+    pub fn from_iter(iters: Vec<&mut dyn Iterator<Item = KVOpertionRef>>) -> Self {
         unimplemented!()
     }
     // to iter
@@ -47,7 +48,7 @@ fn id_to_store_name(id: SStableId) -> String {
 }
 
 impl<'a, T: Store> Iterator for SStbleIter<'a, T> {
-    type Item = KVOpRef<'a>;
+    type Item = KVOpertionRef<'a>;
     fn next(&mut self) -> Option<Self::Item> {
         unimplemented!()
     }
@@ -55,6 +56,8 @@ impl<'a, T: Store> Iterator for SStbleIter<'a, T> {
 
 #[cfg(test)]
 mod test {
+    use crate::db::common::{KVOpertion, KVOpertionRef};
+
 
     fn build_iter() -> (Vec<i32>, Vec<i32>, Vec<bool>) {
         let mut keys: Vec<i32> = (0..10).collect();
