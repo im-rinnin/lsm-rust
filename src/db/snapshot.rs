@@ -1,12 +1,13 @@
 use std::sync::Arc;
+use super::sstable::table::TableReader;
 
-use super::{common::*, sstable::SStable, store::Store, Levels};
+use super::{common::*,  store::Store, Levels};
 pub struct Snapshot<T: Store> {
     sstables: Levels<T>,
     key_id: OpId,
 }
 impl<T: Store> Snapshot<T> {
-    pub fn new(key_id: OpId, sstables: Vec<Vec<Arc<SStable<T>>>>) -> Self {
+    pub fn new(key_id: OpId, sstables: Vec<Vec<Arc<TableReader<T>>>>) -> Self {
         unimplemented!()
     }
     pub fn query(&self, q: KeyQuery) -> Result<Option<Value>> {

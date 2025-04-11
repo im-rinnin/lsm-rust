@@ -35,6 +35,26 @@ impl BlockIter {
             current: 0,
         }
     }
+
+    // Searches for the latest operation for a given key with an OpId <= the provided op_id.
+    // This method consumes the iterator up to the point where the key is found or passed.
+    pub fn search(&mut self, key: &Key, op_id: OpId) -> Option<OpType> {
+        let mut result: Option<OpType> = None;
+        let mut last_matching_id: OpId = 0; // Keep track of the highest ID found for the key <= op_id
+
+        while let Some(kv_op) = self.next() {
+
+            if kv_op.key.eq(key) {
+                // Found the key, check if this operation's ID is relevant
+                if kv_op.id <= op_id && kv_op.id >= last_matching_id {
+                    // This is the latest relevant operation found so far for this key
+                    result = Some(kv_op.op.clone()); // Update result with the operation type
+                    last_matching_id = kv_op.id; // Update the latest ID found
+                }
+            }
+        }
+        result // Return the OpType of the latest relevant operation found, if any
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
@@ -78,34 +98,8 @@ pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (Key, Key, us
 
     (first, last, len)
 }
-
-use super::OpId;
-use super::OpType;
-pub fn search_in_block(r: &mut Buffer, kv_len: usize, key: &Key, op_id: OpId) -> Option<OpType> {
-    r.set_position(0);
-    // Clone the buffer for the iterator, as BlockIter now takes ownership
-    let mut block_iter = BlockIter::new(r.clone(), kv_len).peekable();
-    while block_iter.peek().is_some() {
-        let mut kv_op = block_iter.next().unwrap();
-        if kv_op.id > op_id {
-            continue;
-        }
-        // find last kv id is less or eq
-        if kv_op.key.eq(key) {
-            let mut res = kv_op;
-            while block_iter.peek().is_some() {
-                let kv_op = block_iter.next().unwrap();
-                if kv_op.id <= op_id && kv_op.key.eq(key) {
-                    res = kv_op;
-                } else {
-                    break;
-                }
-            }
-            return Some(res.op);
-        }
-    }
-    None
-}
+use crate::db::common::OpId;
+use crate::db::common::OpType;
 
 // false if reach block size limit
 fn write_kv_to_block(kv_ref: KVOpertionRef, w: &mut Buffer) -> bool {
@@ -143,7 +137,6 @@ mod test {
     use crate::db::common::KViterAgg;
     use crate::db::sstable::block::fill_block;
     use crate::db::sstable::block::next_block_postion;
-    use crate::db::sstable::block::search_in_block;
     use crate::db::sstable::block::DATA_BLOCK_SIZE;
 
     use super::read_block_meta;
@@ -233,7 +226,7 @@ mod test {
         );
     }
     #[test]
-    fn test_search_in_block() {
+    fn test_block_iter_search() {
         // build block (0..100)
         let mut count = 100;
         let mut kvs = create_data_source_for_test(count);
@@ -245,30 +238,44 @@ mod test {
         ));
         count += 2;
         let kvs_ref = kvs.iter().map(|kv| KVOpertionRef::new(&kv));
-        let mut block = Cursor::new(Vec::new());
+        let mut buffer = new_buffer(DATA_BLOCK_SIZE); // Use new_buffer for consistency
         for kv in kvs_ref {
-            write_kv_operion(&kv, &mut block);
+            write_kv_operion(&kv, &mut buffer);
         }
-        let res = search_in_block(&mut block, count, &0.to_string(), 0).unwrap();
-        let expect = OpType::Write(0.to_string());
-        assert_eq!(res, expect);
 
-        let res = search_in_block(&mut block, count, &50.to_string(), 50).unwrap();
-        let expect = OpType::Write(50.to_string());
-        assert_eq!(res, expect);
+        // Test searching for key "0" with op_id 0
+        let mut iter0 = BlockIter::new(buffer.clone(), count); // Clone buffer for each search
+        let res0 = iter0.search(&0.to_string(), 0).unwrap();
+        let expect0 = OpType::Write(0.to_string());
+        assert_eq!(res0, expect0);
 
-        let res = search_in_block(&mut block, count, &100.to_string(), 50);
-        assert!(res.is_none());
+        // Test searching for key "50" with op_id 50
+        let mut iter50 = BlockIter::new(buffer.clone(), count);
+        let res50 = iter50.search(&50.to_string(), 50).unwrap();
+        let expect50 = OpType::Write(50.to_string());
+        assert_eq!(res50, expect50);
 
-        let res = search_in_block(&mut block, count, &5.to_string(), 1);
-        assert!(res.is_none());
+        // Test searching for key "100" (doesn't exist) with op_id 50
+        let mut iter100 = BlockIter::new(buffer.clone(), count);
+        let res100 = iter100.search(&100.to_string(), 50);
+        assert!(res100.is_none());
 
-        let res = search_in_block(&mut block, count, &99.to_string(), 100).unwrap();
-        let expect = OpType::Delete;
-        assert_eq!(res, expect);
-        let res = search_in_block(&mut block, count, &99.to_string(), 105).unwrap();
-        let expect = OpType::Write(1.to_string());
-        assert_eq!(res, expect);
+        // Test searching for key "5" with op_id 1 (should not find because op_id 5 > 1)
+        let mut iter5_low_id = BlockIter::new(buffer.clone(), count);
+        let res5_low_id = iter5_low_id.search(&5.to_string(), 1);
+        assert!(res5_low_id.is_none());
+
+        // Test searching for key "99" with op_id 100 (should find the Delete operation)
+        let mut iter99_100 = BlockIter::new(buffer.clone(), count);
+        let res99_100 = iter99_100.search(&99.to_string(), 100).unwrap();
+        let expect99_100 = OpType::Delete;
+        assert_eq!(res99_100, expect99_100);
+
+        // Test searching for key "99" with op_id 105 (should find the Write operation with id 101)
+        let mut iter99_105 = BlockIter::new(buffer.clone(), count);
+        let res99_105 = iter99_105.search(&99.to_string(), 105).unwrap();
+        let expect99_105 = OpType::Write(1.to_string());
+        assert_eq!(res99_105, expect99_105);
     }
     #[test]
     fn test_block_iter() {

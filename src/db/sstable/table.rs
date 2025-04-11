@@ -27,9 +27,10 @@ use crate::db::{
 
 use super::{
     block::{
-        block_data_start_offset, read_block_meta, search_in_block, BlockIter, DATA_BLOCK_SIZE,
+        block_data_start_offset, read_block_meta,  BlockIter, DATA_BLOCK_SIZE,
     },
 };
+pub type SStableId=u64;
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 
@@ -181,7 +182,7 @@ fn append_buffer_to_store<T: Store>(buffer: &Buffer, store: &mut T) {
     store.append(&v[0..buffer.position() as usize]);
 }
 
-struct TableReader<T: Store> {
+pub struct TableReader<T: Store> {
     store: T,
 }
 
@@ -220,8 +221,11 @@ impl<T: Store> TableReader<T> {
             if meta.last_key.ge(&key) {
                 let mut buffer = new_buffer(DATA_BLOCK_SIZE);
                 let mut v = buffer.get_mut().as_mut_slice();
+                // Read the block data
                 self.store.read_at(&mut v, DATA_BLOCK_SIZE * i);
-                let res = search_in_block(&mut buffer, meta.count as usize, key, id);
+                // Create an iterator for the block and search within it
+                let mut block_iter = BlockIter::new(buffer, meta.count as usize);
+                let res = block_iter.search(key, id);
                 return res;
             }
         }
@@ -257,7 +261,7 @@ mod test {
         sstable::{
             self,
             block::{
-                read_block_meta, search_in_block, write_block_metas, BlockIter, DataBlockMeta,
+                read_block_meta,  write_block_metas, BlockIter, DataBlockMeta,
             },
             table::{
                 create_table, fill_block, next_block_postion, read_table_meta, write_table_meta,
