@@ -15,7 +15,7 @@ pub trait Store {
     fn append(&mut self, data: &[u8]);
     fn read_at(&self, buf: &mut [u8], offset: usize);
     // store is append only, so seek positon should >= current positon
-    fn write_seek(&mut self, position: usize);
+    fn write_at(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
     fn get_id(&self) -> StoreId;
@@ -54,7 +54,7 @@ impl Store for Memstore {
         let res = self.store.borrow_mut().read(buf).unwrap();
         self.store.borrow_mut().set_position(position);
     }
-    fn write_seek(&mut self, position: usize) {
+    fn write_at(&mut self, position: usize) {
         assert!(self.store.borrow().position() as usize <= position);
         self.store.borrow_mut().set_position(position as u64);
     }
@@ -86,7 +86,7 @@ impl Store for Filestore {
     fn read_at(&self, buf: &mut [u8], offset: usize) {
         unimplemented!()
     }
-    fn write_seek(&mut self, position: usize) {
+    fn write_at(&mut self, position: usize) {
         todo!()
     }
     fn get_id(&self) -> StoreId {
@@ -130,5 +130,54 @@ mod test {
         let mut s = data.as_slice();
         let d: TestSerde = bincode::deserialize_from(&mut s).unwrap();
         let t: TestSerde = bincode::deserialize_from(&mut s).unwrap();
+    }
+
+    #[test]
+    fn test_read_at_memstore() {
+        let id = "test_read_at".to_string();
+        let mut m = Memstore::new(&id);
+        let data = b"0123456789abcdef";
+        m.append(data);
+        let original_pos = m.store.borrow().position();
+        assert_eq!(original_pos, data.len() as u64);
+
+        // Read from offset 5, length 4
+        let mut read_buf = [0u8; 4];
+        m.read_at(&mut read_buf, 5);
+        assert_eq!(&read_buf, b"5678");
+        // Check position is restored
+        assert_eq!(m.store.borrow().position(), original_pos);
+
+        // Read from offset 0, length 10
+        let mut read_buf_2 = [0u8; 10];
+        m.read_at(&mut read_buf_2, 0);
+        assert_eq!(&read_buf_2, b"0123456789");
+        assert_eq!(m.store.borrow().position(), original_pos);
+    }
+    #[test]
+    fn test_write_at_memstore() {
+        let id = "test_write_at".to_string();
+        let mut m = Memstore::new(&id);
+        let initial_data = b"initial";
+        m.append(initial_data);
+        let initial_pos = m.store.borrow().position();
+        assert_eq!(initial_pos, initial_data.len() as u64);
+
+        // Test seeking forward
+        let seek_pos = initial_pos as usize + 10;
+        m.write_at(seek_pos);
+        assert_eq!(m.store.borrow().position(), seek_pos as u64);
+
+        // Test seeking to current position (should work)
+        m.write_at(seek_pos);
+        assert_eq!(m.store.borrow().position(), seek_pos as u64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_write_at_memstore_panic() {
+        let mut m = Memstore::new(&"panic_test".to_string());
+        m.append(b"some data");
+        m.write_at(1); // Seek backwards, should panic due to assert
     }
 }

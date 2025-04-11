@@ -8,6 +8,7 @@ struct MemtableItem {
     op_id: OpId,
     op: OpType,
 }
+// todo! update  to high perf and thread safe map
 pub struct Memtable {
     table: BTreeMap<String, LinkedList<MemtableItem>>,
     max_op_id: Option<OpId>,

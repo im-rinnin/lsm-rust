@@ -129,7 +129,7 @@ pub fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>
         block_buffer.set_position(0);
         let (first_key, last_key, count) = fill_block(&mut block_buffer, it);
         // write to store
-        store.write_seek(block_count * DATA_BLOCK_SIZE);
+        store.write_at(block_count * DATA_BLOCK_SIZE);
         append_buffer_to_store(&block_buffer, store);
         block_count += 1;
         let meta = DataBlockMeta {
@@ -139,7 +139,7 @@ pub fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>
         metas.push(meta);
     }
     // save block meta to store
-    store.write_seek(next_block_postion(store.len()));
+    store.write_at(next_block_postion(store.len()));
     assert_eq!(store.len() % DATA_BLOCK_SIZE, 0);
     block_buffer.set_position(0);
     write_block_metas(&metas, &mut block_buffer);
@@ -154,7 +154,7 @@ pub fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>
 
     append_buffer_to_store(&block_buffer, store);
     // store seek to next block
-    store.write_seek(next_block_postion(store.len()));
+    store.write_at(next_block_postion(store.len()));
     // save table meta to store
 
     assert_eq!(store.len() % DATA_BLOCK_SIZE, 0);

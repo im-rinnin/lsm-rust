@@ -30,7 +30,7 @@ pub struct Config {
 
 pub struct DB<T: Store> {
     m: Memtable,
-    // todo immutable memtable
+    // todo! immutable memtable
     //vec[n]: level n
     levels: Levels<T>,
     // sstable not need by db, but maybe other snapshot need it, delete it if reference count is 1  (no snapshot need it)
