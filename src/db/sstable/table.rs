@@ -101,7 +101,7 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
         let block_meta = self.block_metas[self.current_block_num].clone(); // Assuming DataBlockMeta is Clone
 
         // Create a BlockIter to read KVOpertions from the buffer
-        let block_iter = BlockIter::new(&mut block_buffer, block_meta.count);
+        let block_iter = BlockIter::new(block_buffer, block_meta.count); // Pass ownership
 
         // Collect all KVOpertions into a Vec
         let data: Vec<KVOpertion> = block_iter.collect();

@@ -10,24 +10,24 @@ use crate::db::common::{
 };
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
-pub struct BlockIter<'a> {
-    buffer: &'a mut Buffer,
+pub struct BlockIter {
+    buffer: Buffer, // Owns the buffer now
     count: usize,
     current: usize,
 }
-impl<'a> Iterator for BlockIter<'a> {
+impl Iterator for BlockIter {
     type Item = KVOpertion;
     fn next(&mut self) -> Option<Self::Item> {
         if self.current == self.count {
             return None;
         }
-        let res = read_kv_operion(self.buffer);
+        let res = read_kv_operion(&mut self.buffer);
         self.current += 1;
         return Some(res);
     }
 }
-impl<'a> BlockIter<'a> {
-    pub fn new(buffer: &'a mut Buffer, count: usize) -> Self {
+impl BlockIter {
+    pub fn new(mut buffer: Buffer, count: usize) -> Self { // Takes ownership of buffer
         buffer.set_position(0);
         BlockIter {
             buffer,
@@ -83,7 +83,8 @@ use super::OpId;
 use super::OpType;
 pub fn search_in_block(r: &mut Buffer, kv_len: usize, key: &Key, op_id: OpId) -> Option<OpType> {
     r.set_position(0);
-    let mut block_iter = BlockIter::new(r, kv_len).peekable();
+    // Clone the buffer for the iterator, as BlockIter now takes ownership
+    let mut block_iter = BlockIter::new(r.clone(), kv_len).peekable();
     while block_iter.peek().is_some() {
         let mut kv_op = block_iter.next().unwrap();
         if kv_op.id > op_id {
@@ -277,7 +278,7 @@ mod test {
         let mut buffer = new_buffer(DATA_BLOCK_SIZE);
         fill_block(&mut buffer, &mut kv_iter_agg);
         buffer.set_position(0);
-        let block_iter = BlockIter::new(&mut buffer, 100);
+        let block_iter = BlockIter::new(buffer, 100); // Pass ownership
         let mut count = 0;
         for (i, kv) in block_iter.enumerate() {
             assert_eq!(kv.key, i.to_string());
