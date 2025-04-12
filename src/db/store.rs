@@ -265,6 +265,90 @@ mod test {
     }
 
     #[test]
+    fn test_filestore_seek() {
+        use std::fs::OpenOptions;
+
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_path_buf();
+
+        // Open with read, write, create
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+
+        let mut filestore = Filestore { f: file };
+
+        // Write 10 bytes
+        let initial_data = b"0123456789";
+        filestore.append(initial_data);
+        filestore.flush();
+        assert_eq!(filestore.len(), 10);
+
+        // Seek to position 15 (pads bytes 10-14 with 0)
+        let seek_pos = 15;
+        filestore.seek(seek_pos);
+        filestore.flush(); // Ensure padding is written
+        assert_eq!(filestore.len(), seek_pos); // Length should now be 15
+
+        // Append 5 bytes
+        let appended_data = b"abcde";
+        filestore.append(appended_data);
+        filestore.flush();
+        let final_len = seek_pos + appended_data.len(); // 15 + 5 = 20
+        assert_eq!(filestore.len(), final_len);
+
+        // Read all data and check
+        let mut read_buf = vec![0u8; final_len];
+        filestore.read_at(&mut read_buf, 0);
+
+        // Check initial data
+        assert_eq!(&read_buf[0..initial_data.len()], initial_data);
+        // Check padding
+        assert_eq!(&read_buf[initial_data.len()..seek_pos], &[0u8; 5]);
+        // Check appended data
+        assert_eq!(&read_buf[seek_pos..final_len], appended_data);
+    }
+
+    #[test]
+    fn test_filestore_read_at() {
+        use std::fs::OpenOptions;
+
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_path_buf();
+
+        // Open with read, write, create
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+
+        let mut filestore = Filestore { f: file };
+
+        // Append 10 bytes
+        let data = b"0123456789";
+        filestore.append(data);
+        filestore.flush();
+        assert_eq!(filestore.len(), 10);
+
+        // Read range [5, 10) -> 5 bytes at offset 5
+        let mut read_buf1 = [0u8; 5];
+        filestore.read_at(&mut read_buf1, 5);
+        assert_eq!(&read_buf1, b"56789");
+
+        // Read range [5, 20) -> 15 bytes at offset 5
+        // Expect "56789" followed by 10 zero bytes padding
+        let mut read_buf2 = [0u8; 15];
+        filestore.read_at(&mut read_buf2, 5);
+        assert_eq!(&read_buf2[0..5], b"56789");
+        assert_eq!(&read_buf2[5..15], &[0u8; 10]);
+    }
+
+    #[test]
     fn test_memstore_pad_in_write() {
         let id = "test_pad".to_string();
         let mut m = Memstore::new(&id);
