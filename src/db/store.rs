@@ -5,16 +5,16 @@ use std::{
     usize,
 };
 
-use byteorder::WriteBytesExt;
-
 use super::common::Result;
 pub type StoreId = String;
+// append only data store
 pub trait Store {
     fn new(id: &StoreId) -> Self;
     fn flush(&mut self);
     fn append(&mut self, data: &[u8]);
     fn read_at(&self, buf: &mut [u8], offset: usize);
     // store is append only, so seek positon should >= current positon
+    // pad the space with zero in [current postion,position)
     fn write_at(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
@@ -56,6 +56,14 @@ impl Store for Memstore {
     }
     fn write_at(&mut self, position: usize) {
         assert!(self.store.borrow().position() as usize <= position);
+        let current_pos = self.store.borrow().position() as usize;
+        if current_pos < position {
+            let padding_size = position - current_pos;
+            self.store
+                .borrow_mut()
+                .write_all(&vec![0u8; padding_size])
+                .unwrap();
+        }
         self.store.borrow_mut().set_position(position as u64);
     }
 
@@ -179,5 +187,27 @@ mod test {
         let mut m = Memstore::new(&"panic_test".to_string());
         m.append(b"some data");
         m.write_at(1); // Seek backwards, should panic due to assert
+    }
+    #[test]
+    fn test_memstore_pad_in_write() {
+        let id = "test_pad".to_string();
+        let mut m = Memstore::new(&id);
+
+        // Write initial data
+        m.append(b"initial");
+        assert_eq!(m.store.borrow().position(), 7);
+
+        // Seek forward with padding
+        m.write_at(10);
+        assert_eq!(m.store.borrow().position(), 10);
+
+        // Verify padding was written
+        let mut buf = vec![0; 10];
+        m.read_at(&mut buf, 0);
+        assert_eq!(&buf[0..7], b"initial");
+        assert_eq!(&buf[7..10], &[0u8; 3]);
+
+        // Verify position is maintained
+        assert_eq!(m.store.borrow().position(), 10);
     }
 }
