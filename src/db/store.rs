@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fs::File,
     io::{Cursor, Read, Write},
     usize,
 };
@@ -9,38 +10,36 @@ use super::common::Result;
 pub type StoreId = String;
 // append only data store
 pub trait Store {
-    fn new(id: &StoreId) -> Self;
     fn flush(&mut self);
     fn append(&mut self, data: &[u8]);
     fn read_at(&self, buf: &mut [u8], offset: usize);
     // store is append only, so seek positon should >= current positon
     // pad the space with zero in [current postion,position)
-    fn write_at(&mut self, position: usize);
+    fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
-    fn get_id(&self) -> StoreId;
 }
 
 pub struct Memstore {
     store: RefCell<Cursor<Vec<u8>>>,
     id: StoreId,
 }
-pub struct Filestore {}
-
-impl Memstore {
-    fn end(self) -> Vec<u8> {
-        self.store.take().into_inner()
-    }
+pub struct Filestore {
+    f: File,
 }
 
-impl Store for Memstore {
-    fn close(self) {}
-    fn new(id: &StoreId) -> Self {
+impl Memstore {
+    pub fn new(id: &StoreId) -> Self {
         Memstore {
             store: RefCell::new(Cursor::new(Vec::new())),
             id: id.clone(),
         }
     }
+}
+
+impl Store for Memstore {
+    fn close(self) {}
+
     fn len(&self) -> usize {
         self.store.borrow().position() as usize
     }
@@ -54,7 +53,7 @@ impl Store for Memstore {
         let res = self.store.borrow_mut().read(buf).unwrap();
         self.store.borrow_mut().set_position(position);
     }
-    fn write_at(&mut self, position: usize) {
+    fn seek(&mut self, position: usize) {
         assert!(self.store.borrow().position() as usize <= position);
         let current_pos = self.store.borrow().position() as usize;
         if current_pos < position {
@@ -67,47 +66,70 @@ impl Store for Memstore {
         self.store.borrow_mut().set_position(position as u64);
     }
 
-    fn get_id(&self) -> StoreId {
-        self.id.clone()
-    }
 }
 
 impl Filestore {
     fn open(dir_path: String) -> Self {
-        unimplemented!()
+        let res = File::open(dir_path);
+        Filestore { f: res.unwrap() }
     }
 }
 impl Store for Filestore {
     fn flush(&mut self) {
-        unimplemented!()
-    }
-    fn new(id: &StoreId) -> Self {
-        todo!()
+        self.f.sync_data();
     }
     fn len(&self) -> usize {
-        todo!()
+        let meta = self.f.metadata().unwrap();
+        meta.len() as usize
     }
     fn close(self) {
-        todo!()
+        self.f.sync_all();
     }
-    fn append(&mut self, data: &[u8]) {}
+    fn append(&mut self, data: &[u8]) {
+        self.f.write_all(data).unwrap()
+    }
     fn read_at(&self, buf: &mut [u8], offset: usize) {
-        unimplemented!()
+        use std::os::unix::fs::FileExt;
+        let bytes_read = self.f.read_at(buf, offset as u64).unwrap();
+        // pad zero
+        if bytes_read < buf.len() {
+            buf[bytes_read..].fill(0);
+        }
     }
-    fn write_at(&mut self, position: usize) {
-        todo!()
+
+    fn seek(&mut self, position: usize) {
+        use std::io::{Seek, SeekFrom};
+
+        let current_pos = self.f.seek(SeekFrom::Current(0)).unwrap() as usize;
+        assert!(current_pos <= position, "Seeking backwards is not allowed in append-only store logic");
+
+        let file_len = self.len();
+
+        if position > file_len {
+            // Need to pad
+            let padding_size = position - file_len;
+            // Seek to the end to append padding
+            self.f.seek(SeekFrom::End(0)).unwrap();
+            // Write zeros
+            // Consider writing in chunks for large padding? For now, a single write.
+            let padding = vec![0u8; padding_size];
+            self.f.write_all(&padding).unwrap();
+        }
+        // Ensure the cursor is at the desired final position
+        self.f.seek(SeekFrom::Start(position as u64)).unwrap();
     }
-    fn get_id(&self) -> StoreId {
-        todo!()
-    }
+    
 }
 
 #[cfg(test)]
 mod test {
     use std::{
+        fs::File,
         io::{Read, Write},
         str::FromStr,
     };
+    use super::Filestore;
+    use tempfile::NamedTempFile;
 
     use serde::{Deserialize, Serialize};
 
@@ -173,11 +195,11 @@ mod test {
 
         // Test seeking forward
         let seek_pos = initial_pos as usize + 10;
-        m.write_at(seek_pos);
+        m.seek(seek_pos);
         assert_eq!(m.store.borrow().position(), seek_pos as u64);
 
         // Test seeking to current position (should work)
-        m.write_at(seek_pos);
+        m.seek(seek_pos);
         assert_eq!(m.store.borrow().position(), seek_pos as u64);
     }
 
@@ -186,8 +208,62 @@ mod test {
     fn test_write_at_memstore_panic() {
         let mut m = Memstore::new(&"panic_test".to_string());
         m.append(b"some data");
-        m.write_at(1); // Seek backwards, should panic due to assert
+        m.seek(1); // Seek backwards, should panic due to assert
     }
+    #[test]
+    fn test_filestore_len() {
+        use std::fs::{self, File};
+        use tempfile::NamedTempFile;
+        
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path();
+        
+        // Test empty file
+        let filestore = Filestore { f: File::open(path).unwrap() };
+        assert_eq!(filestore.len(), 0);
+
+        // Test with some data
+        fs::write(path, b"test data").unwrap();
+        let filestore = Filestore { f: File::open(path).unwrap() };
+        assert_eq!(filestore.len(), 9);
+    }
+
+    #[test]
+    fn test_filestore_append() {
+        use std::fs::OpenOptions;
+
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_path_buf();
+
+        // Need to open with write and create permissions for append
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+
+        let mut filestore = Filestore { f: file };
+
+        // Append first part
+        let data1 = b"hello";
+        filestore.append(data1);
+        filestore.flush(); // Ensure data is written for len() and read_at()
+        assert_eq!(filestore.len(), data1.len());
+
+        // Append second part
+        let data2 = b" world";
+        filestore.append(data2);
+        filestore.flush();
+        let total_len = data1.len() + data2.len();
+        assert_eq!(filestore.len(), total_len);
+
+        // Check content with read_at
+        let mut read_buf = vec![0u8; total_len];
+        filestore.read_at(&mut read_buf, 0);
+        assert_eq!(read_buf.as_slice(), b"hello world");
+    }
+
     #[test]
     fn test_memstore_pad_in_write() {
         let id = "test_pad".to_string();
@@ -198,7 +274,7 @@ mod test {
         assert_eq!(m.store.borrow().position(), 7);
 
         // Seek forward with padding
-        m.write_at(10);
+        m.seek(10);
         assert_eq!(m.store.borrow().position(), 10);
 
         // Verify padding was written
