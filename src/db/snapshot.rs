@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use super::sstable::table::TableReader;
 
-use super::{common::*,  store::Store, Levels};
+use super::{common::*,  store::Store, level::Level};
 pub struct Snapshot<T: Store> {
-    sstables: Levels<T>,
+    levels: Vec<Level<T>>,
     key_id: OpId,
 }
 impl<T: Store> Snapshot<T> {

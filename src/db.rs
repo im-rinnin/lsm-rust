@@ -2,6 +2,7 @@ mod store;
 
 mod common;
 mod db_meta;
+mod level;
 mod logfile;
 mod memtable;
 mod snapshot;
@@ -13,12 +14,11 @@ use common::*;
 use logfile::LogFile;
 use memtable::Memtable;
 use snapshot::Snapshot;
+use sstable::table::TableReader;
 use store::Filestore;
 use store::Memstore;
 use store::Store;
-use sstable::table::TableReader;
 
-type Levels<T> = Vec<Vec<Arc<TableReader<T>>>>;
 
 pub struct Config {
     block_size: usize,
@@ -31,7 +31,7 @@ pub struct DB<T: Store> {
     m: Memtable,
     // todo! immutable memtable
     //vec[n]: level n
-    levels: Levels<T>,
+    levels: Vec<level::Level<T>>,
     // sstable not need by db, but maybe other snapshot need it, delete it if reference count is 1  (no snapshot need it)
     unactive_sstables: Sender<Arc<TableReader<T>>>,
     logfile: LogFile<T>,

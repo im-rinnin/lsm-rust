@@ -35,7 +35,7 @@ fn binary_search(i: Vec<i32>, target: i32) -> Option<usize> {
 
 mod db;
 fn main() {
-    let a = vec![1, 2, 3, 4, 5, 7, 8];
+    let a:std::ops::Range<i32> = 1..2;
     let mut c =Cursor::new(a);
     c.set_position(1);
 }
