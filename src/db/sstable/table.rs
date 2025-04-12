@@ -17,11 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{
     common::{
-        kv_opertion_len, new_buffer, read_kv_operion, write_kv_operion, Buffer, KVOpertion,
-        KVOpertionRef, KViterAgg, Key, OpId, OpType, Result, Value,
+        kv_opertion_len, new_buffer, Buffer, KVOpertion, KVOpertionRef, KViterAgg, Key, OpId,
+        OpType, Result, Value,
     },
     memtable::Memtable,
-    sstable::block::{fill_block, next_block_postion, write_block_metas, DataBlockMeta},
+    sstable::block::{fill_block, next_block_start_postion, write_block_metas, DataBlockMeta},
     store::{Store, StoreId},
 };
 
@@ -117,7 +117,7 @@ fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
         block_buffer.set_position(0);
         let (first_key, last_key, count) = fill_block(&mut block_buffer, it);
         // write to store
-        store.write_at(block_count * DATA_BLOCK_SIZE);
+        store.seek(block_count * DATA_BLOCK_SIZE);
         append_buffer_to_store(&block_buffer, store);
         block_count += 1;
         let meta = DataBlockMeta {
@@ -127,7 +127,7 @@ fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
         metas.push(meta);
     }
     // save block meta to store
-    store.write_at(next_block_postion(store.len()));
+    store.seek(next_block_start_postion(store.len()));
     assert_eq!(store.len() % DATA_BLOCK_SIZE, 0);
     block_buffer.set_position(0);
     write_block_metas(&metas, &mut block_buffer);
@@ -142,7 +142,7 @@ fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
 
     append_buffer_to_store(&block_buffer, store);
     // store seek to next block
-    store.write_at(next_block_postion(store.len()));
+    store.seek(next_block_start_postion(store.len()));
     // save table meta to store
 
     assert_eq!(store.len() % DATA_BLOCK_SIZE, 0);
@@ -237,23 +237,22 @@ mod test {
         rc::Rc, str::FromStr, usize,
     };
 
+    use super::super::block::test::pad_zero;
     use crate::db::{
-        common::test::create_kv_data_for_test,
-        common::{
-            kv_opertion_len, read_kv_operion, write_kv_operion, KVOpertion, KVOpertionRef, OpType,
-        },
+        common::{kv_opertion_len, KVOpertion, KVOpertionRef, OpType},
         sstable::{
             self,
             block::{read_block_meta, write_block_metas, BlockIter, DataBlockMeta},
             table::{
-                create_table, fill_block, next_block_postion, read_table_meta, write_table_meta,
+                create_table, fill_block, next_block_start_postion, read_table_meta,
+                write_table_meta,
             },
         },
         store::{Memstore, Store},
     };
 
+    use super::super::block::test::create_kv_data_for_test;
     use super::{KViterAgg, TableReader};
-
     fn create_test_table(size: usize) -> TableReader<Memstore> {
         let v = create_kv_data_for_test(size);
         let id = "1".to_string();
@@ -298,10 +297,9 @@ mod test {
             }
         }
         // table has not enough space to save all kv
-        assert!(kv_index<num);
+        assert!(kv_index < num);
         // check kv num
-        assert_eq!(kv_index, lasy_key.parse::<usize>().unwrap()  + 1);
-
+        assert_eq!(kv_index, lasy_key.parse::<usize>().unwrap() + 1);
     }
     #[test]
     fn test_table_meta_read_write() {
@@ -324,7 +322,7 @@ mod test {
 
         for i in 0..len {
             let res = table
-                .find(&i.to_string(), i as u64)
+                .find(&pad_zero(i as u64), i as u64)
                 .expect(&format!("{} should in table", i));
             assert_eq!(res, OpType::Write(i.to_string()));
         }

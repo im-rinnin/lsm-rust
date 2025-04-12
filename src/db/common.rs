@@ -79,42 +79,8 @@ pub fn kv_opertion_len(kv_ref: &KVOpertionRef) -> usize {
             0
         }
 }
-pub fn write_kv_operion(kv_opertion: &KVOpertionRef, w: &mut dyn Write) {
-    w.write_u64::<LittleEndian>(*kv_opertion.id);
-    let key_len = kv_opertion.key.len() as u64;
-    w.write_u64::<LittleEndian>(key_len);
-    w.write(kv_opertion.key.as_bytes());
-    match kv_opertion.op {
-        OpType::Delete => {
-            w.write_u8(0);
-        }
-        OpType::Write(v) => {
-            w.write_u8(1);
-            let v_len = v.len() as u64;
-            w.write_u64::<LittleEndian>(v_len);
-            w.write(v.as_bytes());
-        }
-    }
-}
-pub fn read_kv_operion(r: &mut Cursor<Vec<u8>>) -> KVOpertion {
-    let id = r.read_u64::<LittleEndian>().unwrap();
-    let key_len = r.read_u64::<LittleEndian>().unwrap();
-    let mut tmp = vec![0; key_len as usize];
-    r.read_exact(&mut tmp);
-    let key = String::from_utf8(tmp).unwrap();
-    let op_type = r.read_u8().unwrap();
-    let op = match op_type {
-        0 => OpType::Delete,
-        _ => {
-            let value_len = r.read_u64::<LittleEndian>().unwrap();
-            let mut tmp = vec![0; value_len as usize];
-            r.read_exact(&mut tmp);
-            let value = String::from_utf8(tmp).unwrap();
-            OpType::Write(value)
-        }
-    };
-    KVOpertion { id, key, op }
-}
+
+
 pub struct KViterAgg<'a> {
     iters: Vec<&'a mut dyn Iterator<Item = KVOpertionRef<'a>>>,
     iters_next: Vec<Option<KVOpertionRef<'a>>>,
@@ -203,19 +169,7 @@ pub mod test {
     use crate::db::common::{kv_opertion_len, KVOpertion, KVOpertionRef, KViterAgg};
 
     use super::OpType;
-    pub fn create_kv_data_for_test(size: usize) -> Vec<KVOpertion> {
-        let mut v = Vec::new();
 
-        for i in 0..size {
-            let tmp = KVOpertion::new(i as u64, i.to_string(), OpType::Write(i.to_string()));
-            v.push(tmp);
-        }
-
-        let it = v.iter();
-        let mut out_it = it.map(|a| (&a.id, &a.key, &a.op));
-
-        v
-    }
     #[test]
     fn test_kv_iter_agg() {
         // input iter :diff length ,diff order ,no duplicte key in same iter but in diff
