@@ -203,7 +203,7 @@ pub mod test {
     use crate::db::common::{kv_opertion_len, KVOpertion, KVOpertionRef, KViterAgg};
 
     use super::OpType;
-    pub fn create_data_source_for_test(size: usize) -> Vec<KVOpertion> {
+    pub fn create_kv_data_for_test(size: usize) -> Vec<KVOpertion> {
         let mut v = Vec::new();
 
         for i in 0..size {

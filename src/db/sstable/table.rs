@@ -25,12 +25,8 @@ use crate::db::{
     store::{Store, StoreId},
 };
 
-use super::{
-    block::{
-        block_data_start_offset, read_block_meta,  BlockIter, DATA_BLOCK_SIZE,
-    },
-};
-pub type SStableId=u64;
+use super::block::{block_data_start_offset, read_block_meta, BlockIter, DATA_BLOCK_SIZE};
+pub type SStableId = u64;
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 
@@ -47,18 +43,13 @@ struct TableIter<'a, T: Store> {
     block_metas: Vec<DataBlockMeta>,
     current_block_num: usize,
 }
+struct SStableBlock {
+    data: Vec<KVOpertion>,
+    meta: DataBlockMeta,
+}
 
-// Helper: Conversion from KVOpertionRef to KVOpertion
-// SStableBlock needs owned KVOpertion. BlockIter yields KVOpertionRef.
-// Requires OpType: Clone in common.rs
-impl From<KVOpertionRef<'_>> for KVOpertion {
-    fn from(kv_ref: KVOpertionRef) -> Self {
-        KVOpertion {
-            id: *kv_ref.id,              // OpId is Copy
-            key: kv_ref.key.to_string(), // Clone &str -> String
-            op: kv_ref.op.clone(),       // Clone OpType
-        }
-    }
+pub struct TableReader<T: Store> {
+    store: T,
 }
 
 impl<'a, T: Store> TableIter<'a, T> {
@@ -72,10 +63,6 @@ impl<'a, T: Store> TableIter<'a, T> {
             current_block_num: 0,
         }
     }
-}
-struct SStableBlock {
-    data: Vec<KVOpertion>,
-    meta: DataBlockMeta,
 }
 impl<'a, T: Store> Iterator for TableIter<'a, T> {
     type Item = SStableBlock; // The iterator yields SStableBlock
@@ -118,7 +105,7 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
     }
 }
 
-pub fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
+fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
     assert!(it.peek().is_some());
     let mut block_buffer = new_buffer(DATA_BLOCK_SIZE);
     let mut metas = Vec::<DataBlockMeta>::new();
@@ -180,10 +167,6 @@ pub fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>
 fn append_buffer_to_store<T: Store>(buffer: &Buffer, store: &mut T) {
     let v = buffer.get_ref();
     store.append(&v[0..buffer.position() as usize]);
-}
-
-pub struct TableReader<T: Store> {
-    store: T,
 }
 
 // for level 0,must consider multiple key with diff value/or delete
@@ -248,21 +231,20 @@ mod test {
     use bincode::serialize_into;
 
     use super::{TableMeta, DATA_BLOCK_SIZE};
+    use core::panic;
     use std::{
         hash::BuildHasher, io::Cursor, iter::Peekable, os::unix::fs::MetadataExt, process::Output,
         rc::Rc, str::FromStr, usize,
     };
 
     use crate::db::{
+        common::test::create_kv_data_for_test,
         common::{
-            kv_opertion_len, read_kv_operion, test::create_data_source_for_test, write_kv_operion,
-            KVOpertion, KVOpertionRef, OpType,
+            kv_opertion_len, read_kv_operion, write_kv_operion, KVOpertion, KVOpertionRef, OpType,
         },
         sstable::{
             self,
-            block::{
-                read_block_meta,  write_block_metas, BlockIter, DataBlockMeta,
-            },
+            block::{read_block_meta, write_block_metas, BlockIter, DataBlockMeta},
             table::{
                 create_table, fill_block, next_block_postion, read_table_meta, write_table_meta,
             },
@@ -273,8 +255,7 @@ mod test {
     use super::{KViterAgg, TableReader};
 
     fn create_test_table(size: usize) -> TableReader<Memstore> {
-        use crate::db::common::test::create_data_source_for_test;
-        let v = create_data_source_for_test(size);
+        let v = create_kv_data_for_test(size);
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
         let mut it = v.iter().map(|kv| KVOpertionRef::new(kv));
@@ -285,21 +266,10 @@ mod test {
     }
 
     #[test]
-    #[ignore = "reason"]
     fn test_table_build_use_large_iter_and_check_by_iterator() {
-        let num = 80000;
+        let num = 70000;
         //test data more than table
-        let mut kvs = create_data_source_for_test(num);
-        let duplicate_key = 100.to_string();
-        // duplictae key 100
-        kvs.insert(
-            101,
-            KVOpertion {
-                id: num as u64,
-                key: duplicate_key.clone(),
-                op: OpType::Write("test".to_string()),
-            },
-        );
+        let mut kvs = create_kv_data_for_test(num);
 
         let mut kvs_ref = kvs.iter().map(|kv| KVOpertionRef::new(&kv));
         let mut iter = KViterAgg::new(vec![&mut kvs_ref]).peekable();
@@ -307,10 +277,10 @@ mod test {
         let mut store = Memstore::new(&id);
         create_table(&mut store, &mut iter);
 
-        //check iter is not empty
-        assert!(iter.peek().is_some());
-
         let table = TableReader::new(store);
+        let meta = table.read_table_meta();
+        let lasy_key = meta.last_key;
+
         let table_iter = table.to_iter();
         let mut kv_index = 0; // Track index in the original kvs Vec
 
@@ -321,32 +291,17 @@ mod test {
                 // if KViterAgg sorts correctly.
                 let original_kv = &kvs[kv_index];
 
-                // Check the duplicated key specifically
-                if kv.key == duplicate_key {
-                    // The later operation (higher ID) should be present
-                    if kv.id == num as u64 {
-                        assert_eq!(kv.op, OpType::Write("test".to_string()));
-                    } else {
-                        // This is the original entry for key 100
-                        assert_eq!(kv.id, 100);
-                        assert_eq!(kv.op, OpType::Write("100".to_string()));
-                    }
-                } else {
-                    // Compare with original data for non-duplicated keys
-                    assert_eq!(kv.id, original_kv.id);
-                    assert_eq!(kv.key, original_kv.key);
-                    assert_eq!(kv.op, original_kv.op);
-                }
+                assert_eq!(kv.id, original_kv.id);
+                assert_eq!(kv.key, original_kv.key);
+                assert_eq!(kv.op, original_kv.op);
                 kv_index += 1;
             }
         }
-        // Check if all items from the original vec were processed
-        // Note: This assertion might fail if the duplicate key logic in create_table
-        //       or KViterAgg discards one of the duplicates. Adjust as needed based
-        //       on the intended behavior of duplicate keys.
-        // assert_eq!(kv_index, kvs.len());
+        // table has not enough space to save all kv
+        assert!(kv_index<num);
+        // check kv num
+        assert_eq!(kv_index, lasy_key.parse::<usize>().unwrap()  + 1);
 
-        //test data less than table
     }
     #[test]
     fn test_table_meta_read_write() {

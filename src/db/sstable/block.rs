@@ -133,7 +133,7 @@ mod test {
     use crate::db::common::kv_opertion_len;
     use crate::db::common::new_buffer;
     use crate::db::common::read_kv_operion;
-    use crate::db::common::test::create_data_source_for_test;
+    use crate::db::common::test::create_kv_data_for_test;
     use crate::db::common::write_kv_operion;
     use crate::db::common::KViterAgg;
     use crate::db::sstable::block::fill_block;
@@ -191,7 +191,7 @@ mod test {
     }
     #[test]
     fn test_fill_block() {
-        let kvs = create_data_source_for_test(2048);
+        let kvs = create_kv_data_for_test(2048);
         let mut kv_iter = kvs.iter().map(|kv| KVOpertionRef::new(kv));
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block = new_buffer(0);
@@ -202,7 +202,7 @@ mod test {
         assert!(block.position() < DATA_BLOCK_SIZE as u64);
         assert!(kv_iter_agg.peek().is_some());
 
-        let kvs = create_data_source_for_test(10);
+        let kvs = create_kv_data_for_test(10);
         let mut kv_iter = kvs.iter().map(|kv| KVOpertionRef::new(kv));
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block = new_buffer(0);
@@ -230,7 +230,7 @@ mod test {
     fn test_block_iter_search() {
         // build block (0..100)
         let mut count = 100;
-        let mut kvs = create_data_source_for_test(count);
+        let mut kvs = create_kv_data_for_test(count);
         kvs.push(KVOpertion::new(100, 99.to_string(), OpType::Delete));
         kvs.push(KVOpertion::new(
             101,
@@ -280,7 +280,7 @@ mod test {
     }
     #[test]
     fn test_block_iter() {
-        let iter = create_data_source_for_test(100);
+        let iter = create_kv_data_for_test(100);
         let mut kv_iter = iter.iter().map(|kv| KVOpertionRef::new(kv));
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut buffer = new_buffer(DATA_BLOCK_SIZE);
