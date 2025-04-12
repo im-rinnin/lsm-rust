@@ -27,7 +27,8 @@ impl Iterator for BlockIter {
     }
 }
 impl BlockIter {
-    pub fn new(mut buffer: Buffer, count: usize) -> Self { // Takes ownership of buffer
+    pub fn new(mut buffer: Buffer, count: usize) -> Self {
+        // Takes ownership of buffer
         buffer.set_position(0);
         BlockIter {
             buffer,
@@ -43,7 +44,6 @@ impl BlockIter {
         let mut last_matching_id: OpId = 0; // Keep track of the highest ID found for the key <= op_id
 
         while let Some(kv_op) = self.next() {
-
             if kv_op.key.eq(key) {
                 // Found the key, check if this operation's ID is relevant
                 if kv_op.id <= op_id && kv_op.id >= last_matching_id {
@@ -81,7 +81,7 @@ pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (Key, Key, us
     let first = it.peek().unwrap().key.clone();
     let mut len = 0;
     let mut last_position = 0;
-    for item in &mut *it {
+    while let Some(item) = it.peek() {
         let size = kv_opertion_len(&item);
         if size + w.position() as usize >= DATA_BLOCK_SIZE {
             break;
@@ -89,6 +89,7 @@ pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (Key, Key, us
         last_position = w.position();
         write_kv_operion(&item, w);
         len += 1;
+        it.next();
     }
     let position = w.position();
     w.set_position(last_position);
