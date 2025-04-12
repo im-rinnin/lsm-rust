@@ -167,6 +167,7 @@ pub fn read_block_meta(r: &mut Buffer, count: usize) -> Vec<DataBlockMeta> {
 #[cfg(test)]
 pub mod test {
     use std::io::Cursor;
+    use std::ops::Range;
 
     use super::read_kv_operion;
     use super::write_kv_operion;
@@ -195,12 +196,10 @@ pub mod test {
         // Use format! to pad with leading zeros
         format!("{:0>6}", s)
     }
-
-    // Moved from common.rs test module
-    pub fn create_kv_data_for_test(size: usize) -> Vec<KVOpertion> {
+    pub fn create_kv_data_with_range(r: Range<usize>) -> Vec<KVOpertion> {
         let mut v = Vec::new();
 
-        for i in 0..size {
+        for i in r {
             let tmp = KVOpertion::new(i as u64, pad_zero(i as u64), OpType::Write(i.to_string()));
             v.push(tmp);
         }
@@ -209,6 +208,11 @@ pub mod test {
         let mut out_it = it.map(|a| (&a.id, &a.key, &a.op));
 
         v
+    }
+
+    // Moved from common.rs test module
+    pub fn create_kv_data_for_test(size: usize) -> Vec<KVOpertion> {
+        create_kv_data_with_range(0..size)
     }
 
     #[test]

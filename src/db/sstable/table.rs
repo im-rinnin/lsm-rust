@@ -233,8 +233,7 @@ mod test {
     use super::{TableMeta, DATA_BLOCK_SIZE};
     use core::panic;
     use std::{
-        hash::BuildHasher, io::Cursor, iter::Peekable, os::unix::fs::MetadataExt, process::Output,
-        rc::Rc, str::FromStr, usize,
+        hash::BuildHasher, io::Cursor, iter::Peekable, ops::Range, os::unix::fs::MetadataExt, process::Output, rc::Rc, str::FromStr, usize
     };
 
     use super::super::block::test::pad_zero;
@@ -242,7 +241,7 @@ mod test {
         common::{kv_opertion_len, KVOpertion, KVOpertionRef, OpType},
         sstable::{
             self,
-            block::{read_block_meta, write_block_metas, BlockIter, DataBlockMeta},
+            block::{read_block_meta, test::create_kv_data_with_range, write_block_metas, BlockIter, DataBlockMeta},
             table::{
                 create_table, fill_block, next_block_start_postion, read_table_meta,
                 write_table_meta,
@@ -253,8 +252,8 @@ mod test {
 
     use super::super::block::test::create_kv_data_for_test;
     use super::{KViterAgg, TableReader};
-    fn create_test_table(size: usize) -> TableReader<Memstore> {
-        let v = create_kv_data_for_test(size);
+    fn create_test_table(range: Range<usize>) -> TableReader<Memstore> { 
+        let v = create_kv_data_with_range(range);
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
         let mut it = v.iter().map(|kv| KVOpertionRef::new(kv));
@@ -262,6 +261,9 @@ mod test {
         create_table(&mut store, &mut iter);
         let table: TableReader<Memstore> = TableReader::new(store);
         table
+    }
+    fn create_test_table_with_size(size: usize) -> TableReader<Memstore> {
+        create_test_table(0..size)
     }
 
     #[test]
@@ -318,7 +320,7 @@ mod test {
     #[test]
     fn test_table_reader() {
         let len = 100;
-        let table = create_test_table(len);
+        let table = create_test_table_with_size(len);
 
         for i in 0..len {
             let res = table
