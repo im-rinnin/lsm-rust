@@ -118,14 +118,12 @@ pub fn read_kv_operion(r: &mut Cursor<Vec<u8>>) -> KVOpertion {
 pub struct KViterAgg<'a> {
     iters: Vec<&'a mut dyn Iterator<Item = KVOpertionRef<'a>>>,
     iters_next: Vec<Option<KVOpertionRef<'a>>>,
-    position: Vec<usize>,
 }
 impl<'a> KViterAgg<'a> {
     pub fn new(iters: Vec<&'a mut dyn Iterator<Item = KVOpertionRef<'a>>>) -> Self {
         let mut res = KViterAgg {
             iters,
             iters_next: Vec::new(),
-            position: Vec::new(),
         };
         for it in res.iters.iter_mut() {
             res.iters_next.push(it.next());
@@ -151,16 +149,15 @@ impl<'a> Iterator for KViterAgg<'a> {
             return None;
         }
 
-        let mut res: Option<KVOpertionRef> = None;
-        self.position.clear();
-        for (n, i) in self.iters_next.iter_mut().enumerate() {
-            if i.is_some() {
-                let v = i.as_ref().unwrap();
-                match res {
+        let mut kv_smallest_key: Option<KVOpertionRef> = None;
+        let mut position = Vec::new();
+        for (index, current_kv) in self.iters_next.iter_mut().enumerate() {
+            if let Some(v) = current_kv {
+                match kv_smallest_key {
                     None => {
-                        res = i.clone();
-                        assert_eq!(self.position.len(), 0);
-                        self.position.push(n);
+                        kv_smallest_key = current_kv.clone();
+                        assert_eq!(position.len(), 0);
+                        position.push(index);
                     }
                     Some(ref kv_res) => {
                         let cmp_res = kv_res.key.cmp(v.key);
@@ -171,35 +168,35 @@ impl<'a> Iterator for KViterAgg<'a> {
                                 let id_cmp = kv_res.id.cmp(v.id);
                                 match id_cmp {
                                     Ordering::Greater => {
-                                        self.position.push(n);
+                                        position.push(index);
                                     }
                                     Ordering::Equal => {
                                         panic!("should not be same id ")
                                     }
                                     Ordering::Less => {
-                                        res = i.clone();
-                                        self.position.push(n);
+                                        kv_smallest_key = current_kv.clone();
+                                        position.push(index);
                                     }
                                 }
-                                assert!(self.position.len() > 1);
+                                assert!(position.len() > 1);
                             }
                             Ordering::Greater => {
-                                res = i.clone();
-                                self.position.clear();
-                                self.position.push(n);
+                                kv_smallest_key = current_kv.clone();
+                                position.clear();
+                                position.push(index);
                             }
                         }
                     }
                 }
             }
         }
-        assert!(res.is_some());
-        // remove all other kv same key with output
-        for position in &self.position {
+        assert!(kv_smallest_key.is_some());
+        // remove all other kv same key but id is less
+        for position in &position {
             let t = self.iters_next.get_mut(*position).unwrap();
             *t = None;
         }
-        res
+        kv_smallest_key
     }
 }
 pub mod test {
@@ -225,7 +222,7 @@ pub mod test {
         // iter,ordered in same iter
         // [(id,key)]
         let a = vec![(1, 1), (3, 3), (4, 4), (7, 7), (10, 99)];
-        let b = vec![(2, 2), (5, 3), (6, 6), (8, 8), (9, 9)];
+        let b = vec![(2, 2), (5, 3), (6, 6), (28, 8), (9, 9)];
         let c = vec![(11, 3), (18, 8)];
 
         let f = |a: &(u64, u64)| -> KVOpertion {
@@ -249,7 +246,7 @@ pub mod test {
             (4, 4),
             (6, 6),
             (7, 7),
-            (18, 8),
+            (28, 8),
             (9, 9),
             (10, 99),
         ];
