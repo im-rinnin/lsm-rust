@@ -227,7 +227,7 @@ fn read_table_meta(r: &mut Buffer) -> TableMeta {
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use bincode::serialize_into;
 
     use super::{TableMeta, DATA_BLOCK_SIZE};
@@ -252,7 +252,7 @@ mod test {
 
     use super::super::block::test::create_kv_data_for_test;
     use super::{KViterAgg, TableReader};
-    fn create_test_table(range: Range<usize>) -> TableReader<Memstore> { 
+    pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> { 
         let v = create_kv_data_with_range(range);
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
