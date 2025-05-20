@@ -2,6 +2,7 @@ mod store;
 
 mod common;
 mod db_meta;
+mod key;
 mod level;
 mod logfile;
 mod memtable;
@@ -18,7 +19,6 @@ use sstable::table::TableReader;
 use store::Filestore;
 use store::Memstore;
 use store::Store;
-
 
 pub struct Config {
     block_size: usize,

@@ -1,7 +1,7 @@
+use super::{key::KeyVec, sstable::table::TableReader};
 use std::sync::Arc;
-use super::sstable::table::TableReader;
 
-use super::{common::*,  store::Store, level::Level};
+use super::{common::*, level::Level, store::Store};
 pub struct Snapshot<T: Store> {
     levels: Vec<Level<T>>,
     key_id: OpId,
@@ -13,7 +13,7 @@ impl<T: Store> Snapshot<T> {
     pub fn query(&self, q: KeyQuery) -> Result<Option<Value>> {
         unimplemented!()
     }
-    pub fn range_query(&self, start: Key, end: Key) -> Result<Option<Vec<Value>>> {
+    pub fn range_query(&self, start: KeyVec, end: KeyVec) -> Result<Option<Vec<Value>>> {
         unimplemented!()
     }
 }

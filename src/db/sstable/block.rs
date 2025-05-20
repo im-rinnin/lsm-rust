@@ -4,12 +4,13 @@ use std::usize;
 
 use crate::db::common::OpId;
 use crate::db::common::OpType;
+use crate::db::key::KeySlice;
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
-use crate::db::common::{kv_opertion_len, Buffer, KVOpertion, KVOpertionRef, KViterAgg, Key}; // Removed write_kv_operion
+use crate::db::common::{kv_opertion_len, Buffer, KVOpertion, KVOpertionRef, KViterAgg}; // Removed write_kv_operion
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
 // may contains same key
@@ -18,10 +19,10 @@ pub struct BlockIter {
     count: usize,
     current: usize,
 }
-
+use crate::db::key::KeyVec;
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub struct DataBlockMeta {
-    pub last_key: Key,
+    pub last_key: KeyVec,
     pub count: usize,
 }
 
@@ -50,18 +51,18 @@ impl BlockIter {
     // Searches for the latest operation for a given key with an OpId <= the provided op_id.
     // This method consumes the iterator up to the point where the key is found or passed.
     // deduplicate kv, return kv with max id
-    pub fn search(&mut self, key: &Key, op_id: OpId) -> Option<OpType> {
+    pub fn search(&mut self, key: KeySlice, op_id: OpId) -> Option<OpType> {
         let mut result: Option<OpType> = None;
         let mut last_matching_id: OpId = 0; // Keep track of the highest ID found for the key <= op_id
 
         while let Some(kv_op) = self.next() {
             // Optimization: If the current key is greater than the target key,
             // we can stop searching as keys are sorted within the block.
-            if kv_op.key > *key {
+            if kv_op.key.as_ref() > key.as_ref() {
                 break; // No need to check further
             }
 
-            if kv_op.key.eq(key) {
+            if kv_op.key.as_ref().eq(key.as_ref()) {
                 // Found the key, check if this operation's ID is relevant
                 if kv_op.id <= op_id && kv_op.id >= last_matching_id {
                     // This is the latest relevant operation found so far for this key
@@ -79,7 +80,7 @@ pub fn read_kv_operion(r: &mut Cursor<Vec<u8>>) -> KVOpertion {
     let key_len = r.read_u64::<LittleEndian>().unwrap();
     let mut tmp = vec![0; key_len as usize];
     r.read_exact(&mut tmp);
-    let key = String::from_utf8(tmp).unwrap();
+    let key = KeyVec::from_vec(tmp);
     let op_type = r.read_u8().unwrap();
     let op = match op_type {
         0 => OpType::Delete,
@@ -99,7 +100,7 @@ pub fn write_kv_operion(kv_opertion: &KVOpertionRef, w: &mut dyn Write) {
     w.write_u64::<LittleEndian>(*kv_opertion.id);
     let key_len = kv_opertion.key.len() as u64;
     w.write_u64::<LittleEndian>(key_len);
-    w.write(kv_opertion.key.as_bytes());
+    w.write(kv_opertion.key.as_ref());
     match kv_opertion.op {
         OpType::Delete => {
             w.write_u8(0);
@@ -124,7 +125,7 @@ pub fn next_block_start_postion(current_postion: usize) -> usize {
 // fill block with kv from it until block reach size limit or it end
 // return first_key last_key keylen
 // it has at least one item
-pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (Key, Key, usize) {
+pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (KeyVec, KeyVec, usize) {
     assert!(it.peek().is_some());
     assert!(kv_opertion_len(it.peek().unwrap()) < DATA_BLOCK_SIZE);
 
@@ -147,7 +148,7 @@ pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (Key, Key, us
     w.set_position(position);
     assert!(w.position() < DATA_BLOCK_SIZE as u64);
 
-    (first, last, len)
+    (first.as_ref().into(), last, len)
 }
 
 pub fn write_block_metas(metas: &Vec<DataBlockMeta>, w: &mut Buffer) {
@@ -174,7 +175,9 @@ pub mod test {
     use crate::db::common::kv_opertion_len;
     use crate::db::common::new_buffer;
     use crate::db::common::KViterAgg;
-    use crate::db::common::{KVOpertion, OpType}; 
+    use crate::db::common::{KVOpertion, OpType};
+    use crate::db::key::KeySlice;
+    use crate::db::key::KeyVec;
     use crate::db::sstable::block::fill_block;
     use crate::db::sstable::block::next_block_start_postion;
     use crate::db::sstable::block::DATA_BLOCK_SIZE;
@@ -200,7 +203,11 @@ pub mod test {
         let mut v = Vec::new();
 
         for i in r {
-            let tmp = KVOpertion::new(i as u64, pad_zero(i as u64), OpType::Write(i.to_string()));
+            let tmp = KVOpertion::new(
+                i as u64,
+                pad_zero(i as u64).as_bytes().into(),
+                OpType::Write(i.to_string()),
+            );
             v.push(tmp);
         }
 
@@ -218,7 +225,7 @@ pub mod test {
     #[test]
     fn test_data_meta_read_write() {
         let meta = DataBlockMeta {
-            last_key: "234".to_string(),
+            last_key: KeyVec::from("234".as_bytes()),
             count: 10,
         };
         let mut buffer = Cursor::new(Vec::new());
@@ -233,7 +240,7 @@ pub mod test {
     fn test_kv_operation_serializer_deserializer() {
         let op = KVOpertion {
             id: 1,
-            key: "123".to_string(),
+            key: "123".to_string().as_bytes().into(),
             op: OpType::Delete,
         };
         let mut v = Vec::new();
@@ -246,7 +253,7 @@ pub mod test {
 
         let op = KVOpertion {
             id: 1,
-            key: "123".to_string(),
+            key: "123".to_string().as_bytes().into(),
             op: OpType::Write("234".to_string()),
         };
         let mut v = Vec::new();
@@ -264,8 +271,8 @@ pub mod test {
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block = new_buffer(0);
         let (first, last, len) = fill_block(&mut block, &mut kv_iter_agg);
-        assert_eq!(first, pad_zero(0));
-        assert_eq!(last, pad_zero(122));
+        assert_eq!(first, pad_zero(0).as_bytes().into());
+        assert_eq!(last, pad_zero(122).as_bytes().into());
         assert_eq!(len, 123);
         assert!(block.position() < DATA_BLOCK_SIZE as u64);
         assert!(kv_iter_agg.peek().is_some());
@@ -275,8 +282,8 @@ pub mod test {
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block = new_buffer(0);
         let (first, last, len) = fill_block(&mut block, &mut kv_iter_agg);
-        assert_eq!(first, pad_zero(0));
-        assert_eq!(last, pad_zero(9));
+        assert_eq!(first, pad_zero(0).as_bytes().into());
+        assert_eq!(last, pad_zero(9).as_bytes().into());
         assert_eq!(len, 10);
 
         assert!(block.position() < DATA_BLOCK_SIZE as u64);
@@ -303,20 +310,24 @@ pub mod test {
         // Find the position of the first element with key >= "5"
         let insert_pos = kvs
             .iter()
-            .position(|kv| kv.key >= "5".to_string())
+            .position(|kv| kv.key >= "5".to_string().as_bytes().into())
             .unwrap_or(kvs.len());
 
         kvs.insert(
             insert_pos,
             KVOpertion::new(
                 15, // Insert the one with the higher ID first if needed, though search handles it
-                5.to_string(),
+                5.to_string().as_bytes().into(),
                 OpType::Write("duplicate_15".to_string()),
             ),
         );
         kvs.insert(
             insert_pos,
-            KVOpertion::new(11, 5.to_string(), OpType::Write("duplicate_5".to_string())),
+            KVOpertion::new(
+                11,
+                5.to_string().as_bytes().into(),
+                OpType::Write("duplicate_5".to_string()),
+            ),
         );
 
         let count = kvs.len();
@@ -332,9 +343,10 @@ pub mod test {
         let mut iter = BlockIter::new(buffer.clone(), count);
 
         // Check search result for key "5" with a high enough op_id
-        let search_key = 5.to_string();
+        let f = 5.to_string();
+        let search_key = KeySlice::from(f.as_bytes());
         let search_op_id = 20; // Ensure all versions are considered
-        let result = iter.search(&search_key, search_op_id);
+        let result = iter.search(search_key, search_op_id);
 
         // Assert that the latest version ("duplicate_15") is found
         assert_eq!(result, Some(OpType::Write("duplicate_15".to_string())));
@@ -344,10 +356,14 @@ pub mod test {
         // build block (0..100)
         let mut count = 100;
         let mut kvs = create_kv_data_for_test(count);
-        kvs.push(KVOpertion::new(100, pad_zero(99), OpType::Delete));
+        kvs.push(KVOpertion::new(
+            100,
+            pad_zero(99).as_bytes().into(),
+            OpType::Delete,
+        ));
         kvs.push(KVOpertion::new(
             101,
-            pad_zero(99),
+            pad_zero(99).as_bytes().into(),
             OpType::Write(1.to_string()),
         ));
         count += 2;
@@ -359,35 +375,44 @@ pub mod test {
 
         // Test searching for key "0" with op_id 0
         let mut iter0 = BlockIter::new(buffer.clone(), count); // Clone buffer for each search
-        let res0 = iter0.search(&pad_zero(0), 0).unwrap();
+
+        let res0 = iter0
+            .search(KeySlice::from(pad_zero(0).as_ref()), 0)
+            .unwrap();
         let expect0 = OpType::Write(0.to_string());
         assert_eq!(res0, expect0);
 
         // Test searching for key "50" with op_id 50
         let mut iter50 = BlockIter::new(buffer.clone(), count);
-        let res50 = iter50.search(&pad_zero(50), 50).unwrap();
+        let res50 = iter50
+            .search(KeySlice::from(pad_zero(50).as_bytes()), 50)
+            .unwrap();
         let expect50 = OpType::Write(50.to_string());
         assert_eq!(res50, expect50);
 
         // Test searching for key "100" (doesn't exist) with op_id 50
         let mut iter100 = BlockIter::new(buffer.clone(), count);
-        let res100 = iter100.search(&pad_zero(100), 50);
+        let res100 = iter100.search(KeySlice::from(pad_zero(100).as_bytes()), 50);
         assert!(res100.is_none());
 
         // Test searching for key "5" with op_id 1 (should not find because op_id 5 > 1)
         let mut iter5_low_id = BlockIter::new(buffer.clone(), count);
-        let res5_low_id = iter5_low_id.search(&pad_zero(5), 1);
+        let res5_low_id = iter5_low_id.search(KeySlice::from(pad_zero(5).as_bytes()), 1);
         assert!(res5_low_id.is_none());
 
         // Test searching for key "99" with op_id 100 (should find the Delete operation)
         let mut iter99_100 = BlockIter::new(buffer.clone(), count);
-        let res99_100 = iter99_100.search(&pad_zero(99), 100).unwrap();
+        let res99_100 = iter99_100
+            .search(KeySlice::from(pad_zero(99).as_bytes()), 100)
+            .unwrap();
         let expect99_100 = OpType::Delete;
         assert_eq!(res99_100, expect99_100);
 
         // Test searching for key "99" with op_id 105 (should find the Write operation with id 101)
         let mut iter99_105 = BlockIter::new(buffer.clone(), count);
-        let res99_105 = iter99_105.search(&pad_zero(99), 105).unwrap();
+        let res99_105 = iter99_105
+            .search(KeySlice::from(pad_zero(99).as_bytes()), 105)
+            .unwrap();
         let expect99_105 = OpType::Write(1.to_string());
         assert_eq!(res99_105, expect99_105);
     }
@@ -402,7 +427,7 @@ pub mod test {
         let block_iter = BlockIter::new(buffer, 100); // Pass ownership
         let mut count = 0;
         for (i, kv) in block_iter.enumerate() {
-            assert_eq!(kv.key, pad_zero(i as u64));
+            assert_eq!(kv.key, pad_zero(i as u64).as_bytes().into());
             count += 1;
         }
         assert_eq!(count, 100);

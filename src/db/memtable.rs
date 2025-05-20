@@ -3,6 +3,7 @@ use std::collections::linked_list::Iter as ListIter;
 use std::collections::{BTreeMap, LinkedList};
 use std::fmt::Result;
 
+use super::key::KeyVec;
 use super::{KVOpertion, KeyQuery, OpId, OpType};
 struct MemtableItem {
     op_id: OpId,
@@ -10,14 +11,15 @@ struct MemtableItem {
 }
 // todo! update  to high perf and thread safe map
 pub struct Memtable {
-    table: BTreeMap<String, LinkedList<MemtableItem>>,
+    table: BTreeMap<KeyVec, LinkedList<MemtableItem>>,
     max_op_id: Option<OpId>,
 }
+use crate::db::key::KeySlice;
 
 struct MemtableIterator<'a> {
-    table_iter: Iter<'a, String, LinkedList<MemtableItem>>,
+    table_iter: Iter<'a, KeyVec, LinkedList<MemtableItem>>,
     list_iter: Option<ListIter<'a, MemtableItem>>,
-    current_key: Option<&'a str>,
+    current_key: Option<KeySlice<'a>>,
 }
 
 impl MemtableItem {
@@ -119,20 +121,20 @@ impl Memtable {
 }
 
 impl<'a> Iterator for MemtableIterator<'a> {
-    type Item = (&'a str, &'a MemtableItem);
+    type Item = (KeySlice<'a>, &'a MemtableItem);
     fn next(&mut self) -> Option<Self::Item> {
         // get from list iter if list is some
         if let Some(iter) = self.list_iter.as_mut() {
             if let Some(item) = iter.next() {
-                return Some((self.current_key.expect("should exits key"), item));
+                return Some((self.current_key.clone().expect("should exits key"), item));
             }
         }
         // get new list from table
         if let Some((key, list)) = self.table_iter.next() {
-            self.current_key = Some(key);
+            self.current_key = Some(key.as_ref().into());
             let mut iter = list.iter();
             let res = Some((
-                key.as_str(),
+                key.as_ref().into(),
                 iter.next().expect("should have at least one item"),
             ));
             self.list_iter = Some(iter);
@@ -163,7 +165,11 @@ mod test {
     fn test_empty_count() {
         let mut m = Memtable::new();
         assert_eq!(m.len(), 0);
-        let op = KVOpertion::new(1, 1.to_string(), OpType::Write(1.to_string()));
+        let op = KVOpertion::new(
+            1,
+            1.to_string().as_bytes().into(),
+            OpType::Write(1.to_string()),
+        );
         m.insert(op);
         assert_eq!(m.len(), 1);
     }
@@ -175,22 +181,30 @@ mod test {
         // put 1..20
         for i in 0..20 {
             let op_id = get_next_id(&mut id);
-            let op = KVOpertion::new(op_id, i.to_string(), OpType::Write(i.to_string()));
+            let op = KVOpertion::new(
+                op_id,
+                i.to_string().as_bytes().into(),
+                OpType::Write(i.to_string()),
+            );
             m.insert(op);
         }
         // delete 10
         let op_id = get_next_id(&mut id);
-        let op = KVOpertion::new(op_id, 10.to_string(), OpType::Delete);
+        let op = KVOpertion::new(op_id, 10.to_string().as_bytes().into(), OpType::Delete);
         m.insert(op);
         // overwirte  12 to 100
         let op_id = get_next_id(&mut id);
-        let op = KVOpertion::new(op_id, 12.to_string(), OpType::Write(100.to_string()));
+        let op = KVOpertion::new(
+            op_id,
+            12.to_string().as_bytes().into(),
+            OpType::Write(100.to_string()),
+        );
         m.insert(op);
         // check op id and key match in 0..10
         for i in 0..10 {
             let res = m.get(KeyQuery {
                 op_id: id,
-                key: i.to_string(),
+                key: i.to_string().as_bytes().into(),
             });
             assert!(res.is_some());
             assert_eq!(res.unwrap().1, i.to_string());
@@ -198,27 +212,27 @@ mod test {
         //check delete
         let res = m.get(KeyQuery {
             op_id: id,
-            key: 10.to_string(),
+            key: 10.to_string().as_bytes().into(),
         });
         assert!(res.is_none());
         // 10 is delete but still can be get by op id 10
         let res = m.get(KeyQuery {
             op_id: 10,
-            key: 10.to_string(),
+            key: 10.to_string().as_bytes().into(),
         });
         assert!(res.is_some());
         assert_eq!(res.unwrap().1, 10.to_string());
         // check key not exit
         let res = m.get(KeyQuery {
             op_id: id,
-            key: 100.to_string(),
+            key: 100.to_string().as_bytes().into(),
         });
         assert!(res.is_none());
         // check op id not match
         // key 5 op id is 5 so should not found if use op id 1
         let res = m.get(KeyQuery {
             op_id: 1,
-            key: 5.to_string(),
+            key: 5.to_string().as_bytes().into(),
         });
         assert!(res.is_none());
     }
@@ -233,18 +247,22 @@ mod test {
         for i in id_unorderd {
             let op = KVOpertion::new(
                 get_next_id(&mut id),
-                i.to_string(),
+                i.to_string().as_bytes().into(),
                 OpType::Write(i.to_string()),
             );
             m.insert(op);
         }
         // delete 2
-        let op = KVOpertion::new(get_next_id(&mut id), 2.to_string(), OpType::Delete);
+        let op = KVOpertion::new(
+            get_next_id(&mut id),
+            2.to_string().as_bytes().into(),
+            OpType::Delete,
+        );
         m.insert(op);
         // overwirte 3 to 100
         let op = KVOpertion::new(
             get_next_id(&mut id),
-            3.to_string(),
+            3.to_string().as_bytes().into(),
             OpType::Write(100.to_string()),
         );
         m.insert(op);
@@ -265,7 +283,9 @@ mod test {
             values.push(v);
             ops.push(&i.1.op);
         }
-        assert_eq!(keys, ["0", "1", "2", "2", "3", "3", "4"]);
+        // Convert KeySlice to String for comparison
+        let keys_as_strings: Vec<String> = keys.into_iter().map(|k| k.to_string()).collect();
+        assert_eq!(keys_as_strings, ["0", "1", "2", "2", "3", "3", "4"]);
         assert_eq!(ids, [4, 2, 1, 5, 0, 6, 3]);
         assert_eq!(
             values,

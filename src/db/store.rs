@@ -65,7 +65,6 @@ impl Store for Memstore {
         }
         self.store.borrow_mut().set_position(position as u64);
     }
-
 }
 
 impl Filestore {
@@ -101,7 +100,10 @@ impl Store for Filestore {
         use std::io::{Seek, SeekFrom};
 
         let current_pos = self.f.seek(SeekFrom::Current(0)).unwrap() as usize;
-        assert!(current_pos <= position, "Seeking backwards is not allowed in append-only store logic");
+        assert!(
+            current_pos <= position,
+            "Seeking backwards is not allowed in append-only store logic"
+        );
 
         let file_len = self.len();
 
@@ -118,17 +120,16 @@ impl Store for Filestore {
         // Ensure the cursor is at the desired final position
         self.f.seek(SeekFrom::Start(position as u64)).unwrap();
     }
-    
 }
 
 #[cfg(test)]
 mod test {
+    use super::Filestore;
     use std::{
         fs::File,
         io::{Read, Write},
         str::FromStr,
     };
-    use super::Filestore;
     use tempfile::NamedTempFile;
 
     use serde::{Deserialize, Serialize};
@@ -214,17 +215,21 @@ mod test {
     fn test_filestore_len() {
         use std::fs::{self, File};
         use tempfile::NamedTempFile;
-        
+
         let tmp_file = NamedTempFile::new().unwrap();
         let path = tmp_file.path();
-        
+
         // Test empty file
-        let filestore = Filestore { f: File::open(path).unwrap() };
+        let filestore = Filestore {
+            f: File::open(path).unwrap(),
+        };
         assert_eq!(filestore.len(), 0);
 
         // Test with some data
         fs::write(path, b"test data").unwrap();
-        let filestore = Filestore { f: File::open(path).unwrap() };
+        let filestore = Filestore {
+            f: File::open(path).unwrap(),
+        };
         assert_eq!(filestore.len(), 9);
     }
 

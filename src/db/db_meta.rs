@@ -1,8 +1,8 @@
-use super::store::Store;
 use super::sstable::table::SStableId;
+use super::store::Store;
 use super::OpId;
 
-const META_FILE_NAME:&str="db_meta";
+const META_FILE_NAME: &str = "db_meta";
 pub struct DBMeta<T: Store> {
     meta_data_store: T,
     next_key_id: OpId, //read from logfile so dont need to save to file when update this
@@ -17,7 +17,7 @@ impl<T: Store> DBMeta<T> {
         unimplemented!()
     }
 
-    fn open(path:&str)->Self{
+    fn open(path: &str) -> Self {
         unimplemented!()
     }
 

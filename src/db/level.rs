@@ -1,8 +1,8 @@
 use super::{
-    common::{KVOpertion, Key, OpId},
+    common::{KVOpertion, OpId},
+    key::{KeySlice, KeyVec},
     sstable::table::*,
-    store::Store,
-    store::StoreId,
+    store::{Store, StoreId},
 };
 struct StoreCreator<T: Store> {
     t: T,
@@ -26,9 +26,9 @@ impl<T: Store> Level<T> {
             next_table_index_for_compact: 0,
         }
     }
-    fn search(&self, key: &Key, id: OpId) -> Option<KVOpertion> {
+    fn search(&self, key: KeySlice, id: OpId) -> Option<KVOpertion> {
         // find table may contain key (by check table last key)
-        // return none if not found 
+        // return none if not found
         // search kv in that tables, compare result, return kv with biggest id, return none if notfound
         todo!()
     }

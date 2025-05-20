@@ -1,3 +1,4 @@
+use crate::db::key::KeySlice;
 use std::{
     cmp::Ordering,
     io::{Cursor, Read, Write},
@@ -8,16 +9,14 @@ use std::{
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
-use std::mem::size_of; // Added for kv_opertion_len
+use std::mem::size_of;
 
-pub type Key = String;
-pub type Value = String;
+use super::key::KeyVec; // Added for kv_opertion_len // Added for kv_opertion_len
 
-const KEY_SIZE_LIMIT: usize = 128;
-const VALUE_SIZE_LIMIT: usize = 300;
+pub type Value<'a> = &'a [u8];
 
 pub struct KeyQuery {
-    pub key: Key,
+    pub key: KeyVec,
     pub op_id: OpId,
 }
 
@@ -31,7 +30,7 @@ pub enum Error {}
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct KVOpertionRef<'a> {
     pub id: &'a OpId,
-    pub key: &'a String,
+    pub key: KeySlice<'a>,
     pub op: &'a OpType,
 }
 
@@ -39,7 +38,7 @@ impl<'a> KVOpertionRef<'a> {
     pub fn new(kv_op: &'a KVOpertion) -> Self {
         KVOpertionRef {
             id: &kv_op.id,
-            key: &kv_op.key,
+            key: kv_op.key.as_ref().into(),
             op: &kv_op.op,
         }
     }
@@ -48,11 +47,11 @@ impl<'a> KVOpertionRef<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct KVOpertion {
     pub id: OpId,
-    pub key: String,
+    pub key: KeyVec,
     pub op: OpType,
 }
 impl KVOpertion {
-    pub fn new(id: OpId, key: String, op: OpType) -> Self {
+    pub fn new(id: OpId, key: KeyVec, op: OpType) -> Self {
         KVOpertion {
             id: id,
             key: key,
@@ -79,7 +78,6 @@ pub fn kv_opertion_len(kv_ref: &KVOpertionRef) -> usize {
             0
         }
 }
-
 
 pub struct KViterAgg<'a> {
     iters: Vec<&'a mut dyn Iterator<Item = KVOpertionRef<'a>>>,
@@ -126,7 +124,7 @@ impl<'a> Iterator for KViterAgg<'a> {
                         position.push(index);
                     }
                     Some(ref kv_res) => {
-                        let cmp_res = kv_res.key.cmp(v.key);
+                        let cmp_res = kv_res.key.cmp(&v.key);
                         match cmp_res {
                             Ordering::Less => { //nothing
                             }
@@ -181,8 +179,8 @@ pub mod test {
 
         let f = |a: &(u64, u64)| -> KVOpertion {
             let id = a.0;
-            let key = a.1;
-            KVOpertion::new(id, key.to_string(), OpType::Write(key.to_string()))
+            let key = a.1.to_string();
+            KVOpertion::new(id, key.as_bytes().into(), OpType::Write(key.to_string()))
         };
 
         let a_ops: Vec<KVOpertion> = a.iter().map(f).collect();
@@ -205,7 +203,15 @@ pub mod test {
             (10, 99),
         ];
         let output_ids: Vec<(u64, u64)> = kv_iter
-            .map(|i| (*i.id, str::parse(i.key).unwrap()))
+            // Convert KeyVec to String before parsing
+            .map(|i| {
+                (
+                    *i.id,
+                    String::from_utf8_lossy(i.key.inner())
+                        .parse::<u64>()
+                        .unwrap(),
+                )
+            })
             .collect();
         assert_eq!(output_ids, expect);
     }
@@ -214,7 +220,7 @@ pub mod test {
     fn test_kv_operation_size() {
         let op = KVOpertion {
             id: 1,
-            key: "123".to_string(),
+            key: "123".as_bytes().into(),
             op: OpType::Delete,
         };
 
@@ -223,7 +229,7 @@ pub mod test {
 
         let op = KVOpertion {
             id: 1,
-            key: "123".to_string(),
+            key: "123".as_bytes().into(),
             op: OpType::Write("234".to_string()),
         };
         let op_ref = crate::db::common::KVOpertionRef::new(&op);
