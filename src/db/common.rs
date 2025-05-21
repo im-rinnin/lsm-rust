@@ -27,23 +27,6 @@ pub fn new_buffer(size: usize) -> Buffer {
 }
 pub enum Error {}
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
-pub struct KVOpertionRef<'a> {
-    pub id: &'a OpId,
-    pub key: KeySlice<'a>,
-    pub op: &'a OpType,
-}
-
-impl<'a> KVOpertionRef<'a> {
-    pub fn new(kv_op: &'a KVOpertion) -> Self {
-        KVOpertionRef {
-            id: &kv_op.id,
-            key: kv_op.key.as_ref().into(),
-            op: &kv_op.op,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct KVOpertion {
     pub id: OpId,
@@ -67,12 +50,12 @@ pub enum OpType {
     Write(ValueVec),
     Delete,
 }
-pub fn kv_opertion_len(kv_ref: &KVOpertionRef) -> usize {
+pub fn kv_opertion_len(kvop: &KVOpertion) -> usize {
     size_of::<u64>()
-        + kv_ref.key.len()
+        + kvop.key.len()
         + size_of::<u64>()
         + size_of::<u8>()
-        + if let OpType::Write(v) = kv_ref.op {
+        + if let OpType::Write(v) = &kvop.op {
             v.len() + size_of::<u64>()
         } else {
             0
@@ -80,11 +63,11 @@ pub fn kv_opertion_len(kv_ref: &KVOpertionRef) -> usize {
 }
 
 pub struct KViterAgg<'a> {
-    iters: Vec<&'a mut dyn Iterator<Item = KVOpertionRef<'a>>>,
-    iters_next: Vec<Option<KVOpertionRef<'a>>>,
+    iters: Vec<&'a mut dyn Iterator<Item = &'a KVOpertion>>,
+    iters_next: Vec<Option<&'a KVOpertion>>,
 }
 impl<'a> KViterAgg<'a> {
-    pub fn new(iters: Vec<&'a mut dyn Iterator<Item = KVOpertionRef<'a>>>) -> Self {
+    pub fn new(iters: Vec<&'a mut dyn Iterator<Item = &'a KVOpertion>>) -> Self {
         let mut res = KViterAgg {
             iters,
             iters_next: Vec::new(),
@@ -97,7 +80,7 @@ impl<'a> KViterAgg<'a> {
 }
 
 impl<'a> Iterator for KViterAgg<'a> {
-    type Item = KVOpertionRef<'a>;
+    type Item = &'a KVOpertion;
     fn next(&mut self) -> Option<Self::Item> {
         let mut has_next = false;
         for (i, n) in self.iters_next.iter_mut().enumerate() {
@@ -113,7 +96,7 @@ impl<'a> Iterator for KViterAgg<'a> {
             return None;
         }
 
-        let mut kv_smallest_key: Option<KVOpertionRef> = None;
+        let mut kv_smallest_key: Option<&KVOpertion> = None;
         let mut position = Vec::new();
         for (index, current_kv) in self.iters_next.iter_mut().enumerate() {
             if let Some(v) = current_kv {
@@ -129,7 +112,7 @@ impl<'a> Iterator for KViterAgg<'a> {
                             Ordering::Less => { //nothing
                             }
                             Ordering::Equal => {
-                                let id_cmp = kv_res.id.cmp(v.id);
+                                let id_cmp = kv_res.id.cmp(&v.id);
                                 match id_cmp {
                                     Ordering::Greater => {
                                         position.push(index);
@@ -164,7 +147,7 @@ impl<'a> Iterator for KViterAgg<'a> {
     }
 }
 pub mod test {
-    use crate::db::common::{kv_opertion_len, KVOpertion, KVOpertionRef, KViterAgg};
+    use crate::db::common::{kv_opertion_len, KVOpertion, KViterAgg};
 
     use super::OpType;
 
@@ -188,11 +171,11 @@ pub mod test {
         };
 
         let a_ops: Vec<KVOpertion> = a.iter().map(f).collect();
-        let mut a_iter_ref = a_ops.iter().map(|i| KVOpertionRef::new(&i));
+        let mut a_iter_ref = a_ops.iter();
         let b_ops: Vec<_> = b.iter().map(f).collect();
-        let mut b_iter_ref = b_ops.iter().map(|i| KVOpertionRef::new(&i));
+        let mut b_iter_ref = b_ops.iter();
         let c_ops: Vec<_> = c.iter().map(f).collect();
-        let mut c_iter_ref = c_ops.iter().map(|i| KVOpertionRef::new(&i));
+        let mut c_iter_ref = c_ops.iter();
 
         let kv_iter = KViterAgg::new(vec![&mut a_iter_ref, &mut b_iter_ref, &mut c_iter_ref]);
         let expect = vec![
@@ -210,7 +193,7 @@ pub mod test {
             // Convert KeyVec to String before parsing
             .map(|i| {
                 (
-                    *i.id,
+                    i.id,
                     String::from_utf8_lossy(i.key.inner())
                         .parse::<u64>()
                         .unwrap(),
@@ -228,15 +211,13 @@ pub mod test {
             op: OpType::Delete,
         };
 
-        let op_ref = crate::db::common::KVOpertionRef::new(&op);
-        assert_eq!(20, kv_opertion_len(&op_ref));
+        assert_eq!(20, kv_opertion_len(&op));
 
         let op = KVOpertion {
             id: 1,
             key: "123".as_bytes().into(),
             op: OpType::Write("234".as_bytes().into()),
         };
-        let op_ref = crate::db::common::KVOpertionRef::new(&op);
-        assert_eq!(31, kv_opertion_len(&op_ref));
+        assert_eq!(31, kv_opertion_len(&op));
     }
 }

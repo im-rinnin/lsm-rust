@@ -10,7 +10,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
-use crate::db::common::{kv_opertion_len, Buffer, KVOpertion, KVOpertionRef, KViterAgg}; // Removed write_kv_operion
+use crate::db::common::{kv_opertion_len, Buffer, KVOpertion, KViterAgg}; // Removed write_kv_operion
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
 // may contains same key
@@ -96,12 +96,12 @@ pub fn read_kv_operion(r: &mut Cursor<Vec<u8>>) -> KVOpertion {
 }
 
 // Moved from common.rs
-pub fn write_kv_operion(kv_opertion: &KVOpertionRef, w: &mut dyn Write) {
-    w.write_u64::<LittleEndian>(*kv_opertion.id);
+pub fn write_kv_operion(kv_opertion: &KVOpertion, w: &mut dyn Write) {
+    w.write_u64::<LittleEndian>(kv_opertion.id);
     let key_len = kv_opertion.key.len() as u64;
     w.write_u64::<LittleEndian>(key_len);
     w.write(kv_opertion.key.as_ref());
-    match kv_opertion.op {
+    match &kv_opertion.op {
         OpType::Delete => {
             w.write_u8(0);
         }
@@ -186,7 +186,6 @@ pub mod test {
     use super::write_block_metas;
     use super::BlockIter;
     use super::DataBlockMeta;
-    use super::KVOpertionRef;
     // pad zero at begin to length 6
     // panic if len of i is eq or more than 6
     // e.g. 11 ->"000011" 123456->"123456"
@@ -244,9 +243,8 @@ pub mod test {
             op: OpType::Delete,
         };
         let mut v = Vec::new();
-        let op_ref = KVOpertionRef::new(&op);
-        write_kv_operion(&op_ref, &mut v);
-        assert_eq!(v.len(), kv_opertion_len(&op_ref));
+        write_kv_operion(&op, &mut v);
+        assert_eq!(v.len(), kv_opertion_len(&op));
         let mut c = Cursor::new(v);
         let op_res = read_kv_operion(&mut c);
         assert_eq!(op_res, op);
@@ -257,9 +255,8 @@ pub mod test {
             op: OpType::Write("234".as_bytes().into()),
         };
         let mut v = Vec::new();
-        let op_ref = crate::db::common::KVOpertionRef::new(&op);
-        write_kv_operion(&op_ref, &mut v);
-        assert_eq!(v.len(), kv_opertion_len(&op_ref));
+        write_kv_operion(&op, &mut v);
+        assert_eq!(v.len(), kv_opertion_len(&op));
         let mut c = Cursor::new(v);
         let op_res = read_kv_operion(&mut c);
         assert_eq!(op_res, op);
@@ -267,7 +264,7 @@ pub mod test {
     #[test]
     fn test_fill_block() {
         let kvs = create_kv_data_for_test(2048);
-        let mut kv_iter = kvs.iter().map(|kv| KVOpertionRef::new(kv));
+        let mut kv_iter = kvs.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block = new_buffer(0);
         let (first, last, len) = fill_block(&mut block, &mut kv_iter_agg);
@@ -278,7 +275,7 @@ pub mod test {
         assert!(kv_iter_agg.peek().is_some());
 
         let kvs = create_kv_data_for_test(10);
-        let mut kv_iter = kvs.iter().map(|kv| KVOpertionRef::new(kv));
+        let mut kv_iter = kvs.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block = new_buffer(0);
         let (first, last, len) = fill_block(&mut block, &mut kv_iter_agg);
@@ -335,8 +332,7 @@ pub mod test {
         // Build buffer
         let mut buffer = new_buffer(DATA_BLOCK_SIZE);
         for kv in kvs.iter() {
-            let kv_ref = KVOpertionRef::new(kv);
-            write_kv_operion(&kv_ref, &mut buffer);
+            write_kv_operion(&kv, &mut buffer);
         }
 
         // Create BlockIter
@@ -370,7 +366,7 @@ pub mod test {
             OpType::Write(1.to_string().as_bytes().into()),
         ));
         count += 2;
-        let kvs_ref = kvs.iter().map(|kv| KVOpertionRef::new(&kv));
+        let kvs_ref = kvs.iter();
         let mut buffer = new_buffer(DATA_BLOCK_SIZE); // Use new_buffer for consistency
         for kv in kvs_ref {
             write_kv_operion(&kv, &mut buffer);
@@ -422,7 +418,7 @@ pub mod test {
     #[test]
     fn test_block_iter() {
         let iter = create_kv_data_for_test(100);
-        let mut kv_iter = iter.iter().map(|kv| KVOpertionRef::new(kv));
+        let mut kv_iter = iter.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut buffer = new_buffer(DATA_BLOCK_SIZE);
         fill_block(&mut buffer, &mut kv_iter_agg);

@@ -17,8 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{
     common::{
-        kv_opertion_len, new_buffer, Buffer, KVOpertion, KVOpertionRef, KViterAgg, OpId, OpType,
-        Result, Value,
+        kv_opertion_len, new_buffer, Buffer, KVOpertion, KViterAgg, OpId, OpType, Result, Value,
     },
     key::{KeySlice, KeyVec},
     memtable::Memtable,
@@ -240,7 +239,7 @@ pub mod test {
 
     use super::super::block::test::pad_zero;
     use crate::db::{
-        common::{kv_opertion_len, KVOpertion, KVOpertionRef, OpType},
+        common::{kv_opertion_len, KVOpertion, OpType},
         sstable::{
             self,
             block::{
@@ -261,7 +260,7 @@ pub mod test {
         let v = create_kv_data_with_range(range);
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
-        let mut it = v.iter().map(|kv| KVOpertionRef::new(kv));
+        let mut it = v.iter();
         let mut iter = KViterAgg::new(vec![&mut it]).peekable();
         create_table(&mut store, &mut iter);
         let table: TableReader<Memstore> = TableReader::new(store);
@@ -277,7 +276,7 @@ pub mod test {
         //test data more than table
         let mut kvs = create_kv_data_for_test(num);
 
-        let mut kvs_ref = kvs.iter().map(|kv| KVOpertionRef::new(&kv));
+        let mut kvs_ref = kvs.iter();
         let mut iter = KViterAgg::new(vec![&mut kvs_ref]).peekable();
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
