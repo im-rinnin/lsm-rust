@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{
     common::{
-        kv_opertion_len, new_buffer, Buffer, KVOpertion, KVOpertionRef, KViterAgg, Key, OpId,
-        OpType, Result, Value,
+        kv_opertion_len, new_buffer, Buffer, KVOpertion, KVOpertionRef, KViterAgg, OpId, OpType,
+        Result, Value,
     },
+    key::{KeySlice, KeyVec},
     memtable::Memtable,
     sstable::block::{fill_block, next_block_start_postion, write_block_metas, DataBlockMeta},
     store::{Store, StoreId},
@@ -32,7 +33,7 @@ const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct TableMeta {
-    last_key: Key,
+    last_key: KeyVec,
     data_block_count: u64,
     meta_block_count: u64,
 }
@@ -192,16 +193,16 @@ impl<T: Store> TableReader<T> {
         TableIter::new(self)
     }
 
-    fn find(&self, key: &Key, id: OpId) -> Option<OpType> {
+    fn find(&self, key: KeySlice, id: OpId) -> Option<OpType> {
         // check table last_key return none if key is greater
         let table_meta = self.read_table_meta();
-        if table_meta.last_key.lt(key) {
+        if table_meta.last_key.as_ref().lt(key.as_ref()) {
             return None;
         }
         let metas = self.read_block_meta(&table_meta);
         // find block which is the first block whose last_key is greater or eq key
         for (i, meta) in metas.iter().enumerate() {
-            if meta.last_key.ge(&key) {
+            if meta.last_key.as_ref().ge(key.as_ref()) {
                 let mut buffer = new_buffer(DATA_BLOCK_SIZE);
                 let mut v = buffer.get_mut().as_mut_slice();
                 // Read the block data
@@ -233,7 +234,8 @@ pub mod test {
     use super::{TableMeta, DATA_BLOCK_SIZE};
     use core::panic;
     use std::{
-        hash::BuildHasher, io::Cursor, iter::Peekable, ops::Range, os::unix::fs::MetadataExt, process::Output, rc::Rc, str::FromStr, usize
+        hash::BuildHasher, io::Cursor, iter::Peekable, ops::Range, os::unix::fs::MetadataExt,
+        process::Output, rc::Rc, str::FromStr, usize,
     };
 
     use super::super::block::test::pad_zero;
@@ -241,7 +243,10 @@ pub mod test {
         common::{kv_opertion_len, KVOpertion, KVOpertionRef, OpType},
         sstable::{
             self,
-            block::{read_block_meta, test::create_kv_data_with_range, write_block_metas, BlockIter, DataBlockMeta},
+            block::{
+                read_block_meta, test::create_kv_data_with_range, write_block_metas, BlockIter,
+                DataBlockMeta,
+            },
             table::{
                 create_table, fill_block, next_block_start_postion, read_table_meta,
                 write_table_meta,
@@ -252,7 +257,7 @@ pub mod test {
 
     use super::super::block::test::create_kv_data_for_test;
     use super::{KViterAgg, TableReader};
-    pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> { 
+    pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> {
         let v = create_kv_data_with_range(range);
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
@@ -301,12 +306,13 @@ pub mod test {
         // table has not enough space to save all kv
         assert!(kv_index < num);
         // check kv num
-        assert_eq!(kv_index, lasy_key.parse::<usize>().unwrap() + 1);
+        let lasy_key_string = lasy_key.to_string();
+        assert_eq!(kv_index, lasy_key_string.parse::<usize>().unwrap() + 1);
     }
     #[test]
     fn test_table_meta_read_write() {
         let meta = TableMeta {
-            last_key: "last".to_string(),
+            last_key: "last".to_string().as_bytes().into(),
             data_block_count: 1,
             meta_block_count: 1,
         };
@@ -324,12 +330,12 @@ pub mod test {
 
         for i in 0..len {
             let res = table
-                .find(&pad_zero(i as u64), i as u64)
+                .find(pad_zero(i as u64).as_bytes().into(), i as u64)
                 .expect(&format!("{} should in table", i));
-            assert_eq!(res, OpType::Write(i.to_string()));
+            assert_eq!(res, OpType::Write(i.to_string().as_bytes().into()));
         }
 
-        let res = table.find(&"100".to_string(), 100);
+        let res = table.find("100".as_bytes().into(), 0);
         assert!(res.is_none());
     }
 }

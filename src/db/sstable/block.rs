@@ -89,7 +89,7 @@ pub fn read_kv_operion(r: &mut Cursor<Vec<u8>>) -> KVOpertion {
             let mut tmp = vec![0; value_len as usize];
             r.read_exact(&mut tmp);
             let value = String::from_utf8(tmp).unwrap();
-            OpType::Write(value)
+            OpType::Write(value.as_bytes().into())
         }
     };
     KVOpertion { id, key, op }
@@ -109,7 +109,7 @@ pub fn write_kv_operion(kv_opertion: &KVOpertionRef, w: &mut dyn Write) {
             w.write_u8(1);
             let v_len = v.len() as u64;
             w.write_u64::<LittleEndian>(v_len);
-            w.write(v.as_bytes());
+            w.write(v.as_ref());
         }
     }
 }
@@ -206,7 +206,7 @@ pub mod test {
             let tmp = KVOpertion::new(
                 i as u64,
                 pad_zero(i as u64).as_bytes().into(),
-                OpType::Write(i.to_string()),
+                OpType::Write(i.to_string().as_bytes().into()),
             );
             v.push(tmp);
         }
@@ -254,7 +254,7 @@ pub mod test {
         let op = KVOpertion {
             id: 1,
             key: "123".to_string().as_bytes().into(),
-            op: OpType::Write("234".to_string()),
+            op: OpType::Write("234".as_bytes().into()),
         };
         let mut v = Vec::new();
         let op_ref = crate::db::common::KVOpertionRef::new(&op);
@@ -318,7 +318,7 @@ pub mod test {
             KVOpertion::new(
                 15, // Insert the one with the higher ID first if needed, though search handles it
                 5.to_string().as_bytes().into(),
-                OpType::Write("duplicate_15".to_string()),
+                OpType::Write("duplicate_15".as_bytes().into()),
             ),
         );
         kvs.insert(
@@ -326,7 +326,7 @@ pub mod test {
             KVOpertion::new(
                 11,
                 5.to_string().as_bytes().into(),
-                OpType::Write("duplicate_5".to_string()),
+                OpType::Write("duplicate_5".as_bytes().into()),
             ),
         );
 
@@ -349,7 +349,10 @@ pub mod test {
         let result = iter.search(search_key, search_op_id);
 
         // Assert that the latest version ("duplicate_15") is found
-        assert_eq!(result, Some(OpType::Write("duplicate_15".to_string())));
+        assert_eq!(
+            result,
+            Some(OpType::Write("duplicate_15".as_bytes().into()))
+        );
     }
     #[test]
     fn test_block_iter_search() {
@@ -364,7 +367,7 @@ pub mod test {
         kvs.push(KVOpertion::new(
             101,
             pad_zero(99).as_bytes().into(),
-            OpType::Write(1.to_string()),
+            OpType::Write(1.to_string().as_bytes().into()),
         ));
         count += 2;
         let kvs_ref = kvs.iter().map(|kv| KVOpertionRef::new(&kv));
@@ -379,7 +382,7 @@ pub mod test {
         let res0 = iter0
             .search(KeySlice::from(pad_zero(0).as_ref()), 0)
             .unwrap();
-        let expect0 = OpType::Write(0.to_string());
+        let expect0 = OpType::Write(0.to_string().as_bytes().into());
         assert_eq!(res0, expect0);
 
         // Test searching for key "50" with op_id 50
@@ -387,7 +390,7 @@ pub mod test {
         let res50 = iter50
             .search(KeySlice::from(pad_zero(50).as_bytes()), 50)
             .unwrap();
-        let expect50 = OpType::Write(50.to_string());
+        let expect50 = OpType::Write(50.to_string().as_bytes().into());
         assert_eq!(res50, expect50);
 
         // Test searching for key "100" (doesn't exist) with op_id 50
@@ -413,7 +416,7 @@ pub mod test {
         let res99_105 = iter99_105
             .search(KeySlice::from(pad_zero(99).as_bytes()), 105)
             .unwrap();
-        let expect99_105 = OpType::Write(1.to_string());
+        let expect99_105 = OpType::Write(1.to_string().as_bytes().into());
         assert_eq!(res99_105, expect99_105);
     }
     #[test]

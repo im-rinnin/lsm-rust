@@ -11,7 +11,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::mem::size_of;
 
-use super::key::KeyVec; // Added for kv_opertion_len // Added for kv_opertion_len
+use super::key::{KeyVec, ValueVec}; // Added for kv_opertion_len // Added for kv_opertion_len
 
 pub type Value<'a> = &'a [u8];
 
@@ -64,7 +64,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type OpId = u64;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)] // Added Clone
 pub enum OpType {
-    Write(String),
+    Write(ValueVec),
     Delete,
 }
 pub fn kv_opertion_len(kv_ref: &KVOpertionRef) -> usize {
@@ -180,7 +180,11 @@ pub mod test {
         let f = |a: &(u64, u64)| -> KVOpertion {
             let id = a.0;
             let key = a.1.to_string();
-            KVOpertion::new(id, key.as_bytes().into(), OpType::Write(key.to_string()))
+            KVOpertion::new(
+                id,
+                key.as_bytes().into(),
+                OpType::Write(key.to_string().as_bytes().into()),
+            )
         };
 
         let a_ops: Vec<KVOpertion> = a.iter().map(f).collect();
@@ -230,7 +234,7 @@ pub mod test {
         let op = KVOpertion {
             id: 1,
             key: "123".as_bytes().into(),
-            op: OpType::Write("234".to_string()),
+            op: OpType::Write("234".as_bytes().into()),
         };
         let op_ref = crate::db::common::KVOpertionRef::new(&op);
         assert_eq!(31, kv_opertion_len(&op_ref));

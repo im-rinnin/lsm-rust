@@ -6,7 +6,9 @@ pub struct Key<T: AsRef<[u8]>> {
     data: T,
 }
 pub type KeySlice<'a> = Key<&'a [u8]>;
+pub type ValueSlice<'a> = Key<&'a [u8]>;
 pub type KeyVec = Key<Vec<u8>>;
+pub type ValueVec = Key<Vec<u8>>;
 
 impl<T: AsRef<[u8]>> Key<T> {
     pub fn as_ref(&self) -> &[u8] {
