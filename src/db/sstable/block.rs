@@ -10,12 +10,14 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
-use crate::db::common::{kv_opertion_len, Buffer, KVOpertion, KViterAgg}; // Removed write_kv_operion
+use crate::db::common::{kv_opertion_len, KVOpertion, KViterAgg}; // Removed write_kv_operion
+use crate::db::sstable::table::{new_buffer, read_block_meta, write_block_metas};
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
+pub type Block = Cursor<Vec<u8>>;
 // may contains same key
 pub struct BlockIter {
-    buffer: Buffer, // Owns the buffer now
+    buffer: Block, // Owns the buffer now
     count: usize,
     current: usize,
 }
@@ -38,7 +40,7 @@ impl Iterator for BlockIter {
     }
 }
 impl BlockIter {
-    pub fn new(mut buffer: Buffer, count: usize) -> Self {
+    pub fn new(mut buffer: Block, count: usize) -> Self {
         // Takes ownership of buffer
         buffer.set_position(0);
         BlockIter {
@@ -114,18 +116,10 @@ pub fn write_kv_operion(kv_opertion: &KVOpertion, w: &mut dyn Write) {
     }
 }
 
-pub fn block_data_start_offset(block_count: usize) -> usize {
-    block_count * DATA_BLOCK_SIZE
-}
-
-pub fn next_block_start_postion(current_postion: usize) -> usize {
-    (current_postion / DATA_BLOCK_SIZE + 1) * DATA_BLOCK_SIZE
-}
-
 // fill block with kv from it until block reach size limit or it end
 // return first_key last_key keylen
 // it has at least one item
-pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (KeyVec, KeyVec, usize) {
+pub fn fill_block(w: &mut Block, it: &mut Peekable<KViterAgg>) -> (KeyVec, KeyVec, usize) {
     assert!(it.peek().is_some());
     assert!(kv_opertion_len(it.peek().unwrap()) < DATA_BLOCK_SIZE);
 
@@ -151,36 +145,20 @@ pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (KeyVec, KeyV
     (first.as_ref().into(), last, len)
 }
 
-pub fn write_block_metas(metas: &Vec<DataBlockMeta>, w: &mut Buffer) {
-    assert_eq!(w.position(), 0);
-    for meta in metas {
-        bincode::serialize_into(&mut *w, &meta);
-    }
-}
-pub fn read_block_meta(r: &mut Buffer, count: usize) -> Vec<DataBlockMeta> {
-    assert_eq!(r.position(), 0);
-    let mut res = Vec::new();
-    for i in 0..count {
-        res.push(bincode::deserialize_from(&mut *r).unwrap());
-    }
-    res
-}
 #[cfg(test)]
 pub mod test {
-    use std::io::Cursor;
-    use std::ops::Range;
-
     use super::read_kv_operion;
     use super::write_kv_operion;
     use crate::db::common::kv_opertion_len;
-    use crate::db::common::new_buffer;
     use crate::db::common::KViterAgg;
     use crate::db::common::{KVOpertion, OpType};
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
     use crate::db::sstable::block::fill_block;
-    use crate::db::sstable::block::next_block_start_postion;
     use crate::db::sstable::block::DATA_BLOCK_SIZE;
+    use crate::db::sstable::table::new_buffer;
+    use std::io::Cursor;
+    use std::ops::Range;
 
     use super::read_block_meta;
     use super::write_block_metas;
@@ -285,18 +263,6 @@ pub mod test {
 
         assert!(block.position() < DATA_BLOCK_SIZE as u64);
         assert!(kv_iter_agg.peek().is_none());
-    }
-    #[test]
-    fn text_next_block_postion() {
-        assert_eq!(next_block_start_postion(1), DATA_BLOCK_SIZE);
-        assert_eq!(
-            next_block_start_postion(DATA_BLOCK_SIZE + 10),
-            (DATA_BLOCK_SIZE * 2)
-        );
-        assert_eq!(
-            next_block_start_postion(5 * DATA_BLOCK_SIZE + 10),
-            (DATA_BLOCK_SIZE * 6)
-        );
     }
     #[test]
     fn test_block_iter_search_with_same_key() {

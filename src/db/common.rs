@@ -20,11 +20,6 @@ pub struct KeyQuery {
     pub op_id: OpId,
 }
 
-pub type Buffer = Cursor<Vec<u8>>;
-// todo! add buffer pool
-pub fn new_buffer(size: usize) -> Buffer {
-    Cursor::new(vec![0; size])
-}
 pub enum Error {}
 
 #[derive(Debug, PartialEq, Eq)]

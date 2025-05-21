@@ -16,19 +16,30 @@ use bincode::{config::LittleEndian, Options};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{
-    common::{
-        kv_opertion_len, new_buffer, Buffer, KVOpertion, KViterAgg, OpId, OpType, Result, Value,
-    },
+    common::{kv_opertion_len, KVOpertion, KViterAgg, OpId, OpType, Result, Value},
     key::{KeySlice, KeyVec},
     memtable::Memtable,
-    sstable::block::{fill_block, next_block_start_postion, write_block_metas, DataBlockMeta},
+    sstable::block::{fill_block, Block, DataBlockMeta},
     store::{Store, StoreId},
 };
 
-use super::block::{block_data_start_offset, read_block_meta, BlockIter, DATA_BLOCK_SIZE};
+use super::block::{BlockIter, DATA_BLOCK_SIZE};
 pub type SStableId = u64;
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
+
+// todo! add buffer pool
+pub fn new_buffer(size: usize) -> Block {
+    Cursor::new(vec![0; size])
+}
+
+fn block_data_start_offset(block_count: usize) -> usize {
+    block_count * DATA_BLOCK_SIZE
+}
+
+fn next_block_start_postion(current_postion: usize) -> usize {
+    (current_postion / DATA_BLOCK_SIZE + 1) * DATA_BLOCK_SIZE
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct TableMeta {
@@ -164,9 +175,25 @@ fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
 }
 
 // write to last block
-fn append_buffer_to_store<T: Store>(buffer: &Buffer, store: &mut T) {
+fn append_buffer_to_store<T: Store>(buffer: &Block, store: &mut T) {
     let v = buffer.get_ref();
     store.append(&v[0..buffer.position() as usize]);
+}
+
+pub fn write_block_metas(metas: &Vec<DataBlockMeta>, w: &mut Block) {
+    assert_eq!(w.position(), 0);
+    for meta in metas {
+        bincode::serialize_into(&mut *w, &meta);
+    }
+}
+
+pub fn read_block_meta(r: &mut Block, count: usize) -> Vec<DataBlockMeta> {
+    assert_eq!(r.position(), 0);
+    let mut res = Vec::new();
+    for _ in 0..count {
+        res.push(bincode::deserialize_from(&mut *r).unwrap());
+    }
+    res
 }
 
 // for level 0,must consider multiple key with diff value/or delete
@@ -216,12 +243,12 @@ impl<T: Store> TableReader<T> {
     }
 }
 
-fn write_table_meta(meta: &TableMeta, w: &mut Buffer) {
+fn write_table_meta(meta: &TableMeta, w: &mut Block) {
     assert_eq!(w.position(), 0);
     bincode::serialize_into(&mut *w, &meta);
     assert!((w.position() as usize) < DATA_BLOCK_SIZE);
 }
-fn read_table_meta(r: &mut Buffer) -> TableMeta {
+fn read_table_meta(r: &mut Block) -> TableMeta {
     assert_eq!(r.position(), 0);
     bincode::deserialize_from(r).unwrap()
 }
@@ -242,10 +269,7 @@ pub mod test {
         common::{kv_opertion_len, KVOpertion, OpType},
         sstable::{
             self,
-            block::{
-                read_block_meta, test::create_kv_data_with_range, write_block_metas, BlockIter,
-                DataBlockMeta,
-            },
+            block::{test::create_kv_data_with_range, BlockIter, DataBlockMeta},
             table::{
                 create_table, fill_block, next_block_start_postion, read_table_meta,
                 write_table_meta,
@@ -307,6 +331,18 @@ pub mod test {
         // check kv num
         let lasy_key_string = lasy_key.to_string();
         assert_eq!(kv_index, lasy_key_string.parse::<usize>().unwrap() + 1);
+    }
+    #[test]
+    fn text_next_block_postion() {
+        assert_eq!(next_block_start_postion(1), DATA_BLOCK_SIZE);
+        assert_eq!(
+            next_block_start_postion(DATA_BLOCK_SIZE + 10),
+            (DATA_BLOCK_SIZE * 2)
+        );
+        assert_eq!(
+            next_block_start_postion(5 * DATA_BLOCK_SIZE + 10),
+            (DATA_BLOCK_SIZE * 6)
+        );
     }
     #[test]
     fn test_table_meta_read_write() {
