@@ -1,3 +1,4 @@
+// review this code ai?
 use std::iter::Peekable;
 use std::ops::Not;
 use std::usize;
@@ -5,6 +6,7 @@ use std::usize;
 use crate::db::common::OpId;
 use crate::db::common::OpType;
 use crate::db::key::KeySlice;
+use crate::db::key::ValueVec;
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
@@ -14,10 +16,10 @@ use crate::db::common::{kv_opertion_len, KVOpertion, KViterAgg}; // Removed writ
 use crate::db::sstable::table::{new_buffer, read_block_meta, write_block_metas};
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
-pub type Block = Cursor<Vec<u8>>;
+pub type Buffer = Cursor<Vec<u8>>;
 // may contains same key
 pub struct BlockIter {
-    buffer: Block, // Owns the buffer now
+    buffer: Buffer, // Owns the buffer now
     count: usize,
     current: usize,
 }
@@ -40,7 +42,7 @@ impl Iterator for BlockIter {
     }
 }
 impl BlockIter {
-    pub fn new(mut buffer: Block, count: usize) -> Self {
+    pub fn new(mut buffer: Buffer, count: usize) -> Self {
         // Takes ownership of buffer
         buffer.set_position(0);
         BlockIter {
@@ -90,8 +92,7 @@ pub fn read_kv_operion(r: &mut Cursor<Vec<u8>>) -> KVOpertion {
             let value_len = r.read_u64::<LittleEndian>().unwrap();
             let mut tmp = vec![0; value_len as usize];
             r.read_exact(&mut tmp);
-            let value = String::from_utf8(tmp).unwrap();
-            OpType::Write(value.as_bytes().into())
+            OpType::Write(ValueVec::from_vec(tmp))
         }
     };
     KVOpertion { id, key, op }
@@ -119,7 +120,7 @@ pub fn write_kv_operion(kv_opertion: &KVOpertion, w: &mut dyn Write) {
 // fill block with kv from it until block reach size limit or it end
 // return first_key last_key keylen
 // it has at least one item
-pub fn fill_block(w: &mut Block, it: &mut Peekable<KViterAgg>) -> (KeyVec, KeyVec, usize) {
+pub fn fill_block(w: &mut Buffer, it: &mut Peekable<KViterAgg>) -> (KeyVec, KeyVec, usize) {
     assert!(it.peek().is_some());
     assert!(kv_opertion_len(it.peek().unwrap()) < DATA_BLOCK_SIZE);
 

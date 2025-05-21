@@ -19,7 +19,7 @@ use crate::db::{
     common::{kv_opertion_len, KVOpertion, KViterAgg, OpId, OpType, Result, Value},
     key::{KeySlice, KeyVec},
     memtable::Memtable,
-    sstable::block::{fill_block, Block, DataBlockMeta},
+    sstable::block::{fill_block, Buffer, DataBlockMeta},
     store::{Store, StoreId},
 };
 
@@ -29,16 +29,8 @@ const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 
 // todo! add buffer pool
-pub fn new_buffer(size: usize) -> Block {
+pub fn new_buffer(size: usize) -> Buffer {
     Cursor::new(vec![0; size])
-}
-
-fn block_data_start_offset(block_count: usize) -> usize {
-    block_count * DATA_BLOCK_SIZE
-}
-
-fn next_block_start_postion(current_postion: usize) -> usize {
-    (current_postion / DATA_BLOCK_SIZE + 1) * DATA_BLOCK_SIZE
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -54,15 +46,6 @@ struct TableIter<'a, T: Store> {
     block_metas: Vec<DataBlockMeta>,
     current_block_num: usize,
 }
-struct SStableBlock {
-    data: Vec<KVOpertion>,
-    meta: DataBlockMeta,
-}
-
-pub struct TableReader<T: Store> {
-    store: T,
-}
-
 impl<'a, T: Store> TableIter<'a, T> {
     fn new(table: &'a TableReader<T>) -> Self {
         let table_meta = table.read_table_meta();
@@ -115,7 +98,22 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
         })
     }
 }
+struct SStableBlock {
+    data: Vec<KVOpertion>,
+    meta: DataBlockMeta,
+}
 
+pub struct TableReader<T: Store> {
+    store: T,
+}
+
+fn block_data_start_offset(block_count: usize) -> usize {
+    block_count * DATA_BLOCK_SIZE
+}
+
+fn next_block_start_postion(current_postion: usize) -> usize {
+    (current_postion / DATA_BLOCK_SIZE + 1) * DATA_BLOCK_SIZE
+}
 fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
     assert!(it.peek().is_some());
     let mut block_buffer = new_buffer(DATA_BLOCK_SIZE);
@@ -175,19 +173,19 @@ fn create_table<'a, T: Store>(store: &mut T, it: &mut Peekable<KViterAgg<'a>>) {
 }
 
 // write to last block
-fn append_buffer_to_store<T: Store>(buffer: &Block, store: &mut T) {
+fn append_buffer_to_store<T: Store>(buffer: &Buffer, store: &mut T) {
     let v = buffer.get_ref();
     store.append(&v[0..buffer.position() as usize]);
 }
 
-pub fn write_block_metas(metas: &Vec<DataBlockMeta>, w: &mut Block) {
+pub fn write_block_metas(metas: &Vec<DataBlockMeta>, w: &mut Buffer) {
     assert_eq!(w.position(), 0);
     for meta in metas {
         bincode::serialize_into(&mut *w, &meta);
     }
 }
 
-pub fn read_block_meta(r: &mut Block, count: usize) -> Vec<DataBlockMeta> {
+pub fn read_block_meta(r: &mut Buffer, count: usize) -> Vec<DataBlockMeta> {
     assert_eq!(r.position(), 0);
     let mut res = Vec::new();
     for _ in 0..count {
@@ -243,12 +241,12 @@ impl<T: Store> TableReader<T> {
     }
 }
 
-fn write_table_meta(meta: &TableMeta, w: &mut Block) {
+fn write_table_meta(meta: &TableMeta, w: &mut Buffer) {
     assert_eq!(w.position(), 0);
     bincode::serialize_into(&mut *w, &meta);
     assert!((w.position() as usize) < DATA_BLOCK_SIZE);
 }
-fn read_table_meta(r: &mut Block) -> TableMeta {
+fn read_table_meta(r: &mut Buffer) -> TableMeta {
     assert_eq!(r.position(), 0);
     bincode::deserialize_from(r).unwrap()
 }
