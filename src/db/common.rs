@@ -3,6 +3,7 @@ use std::{
     cmp::Ordering,
     io::{Cursor, Read, Write},
     rc::Rc,
+    thread::sleep,
     usize,
 };
 
@@ -20,6 +21,10 @@ pub struct KeyQuery {
     pub op_id: OpId,
 }
 
+pub type Buffer = Cursor<Vec<u8>>;
+pub fn new_buffer(size: usize) -> Buffer {
+    Cursor::new(vec![0; size])
+}
 pub enum Error {}
 
 #[derive(Debug, PartialEq, Eq)]
@@ -36,6 +41,53 @@ impl KVOpertion {
             op: op,
         }
     }
+
+    pub fn encode_size(&self) -> usize {
+        // id (u64) + key_len (u64) + key_data
+        let mut size = size_of::<u64>() + size_of::<u64>() + self.key.len();
+        // op_type (u8)
+        size += size_of::<u8>();
+        if let OpType::Write(v) = &self.op {
+            // value_len (u64) + value_data
+            size += size_of::<u64>() + v.len();
+        }
+        size
+    }
+    pub fn decode(r: &mut Buffer) -> Self {
+        let id = r.read_u64::<LittleEndian>().unwrap();
+        let key_len = r.read_u64::<LittleEndian>().unwrap();
+        let mut tmp = vec![0; key_len as usize];
+        r.read_exact(&mut tmp);
+        let key = KeyVec::from_vec(tmp);
+        let op_type = r.read_u8().unwrap();
+        let op = match op_type {
+            0 => OpType::Delete,
+            _ => {
+                let value_len = r.read_u64::<LittleEndian>().unwrap();
+                let mut tmp = vec![0; value_len as usize];
+                r.read_exact(&mut tmp);
+                OpType::Write(ValueVec::from_vec(tmp))
+            }
+        };
+        KVOpertion { id, key, op }
+    }
+    pub fn encode(&self, w: &mut Buffer) {
+        w.write_u64::<LittleEndian>(self.id).unwrap();
+        let key_len = self.key.len() as u64;
+        w.write_u64::<LittleEndian>(key_len).unwrap();
+        w.write_all(self.key.as_ref()).unwrap();
+        match &self.op {
+            OpType::Delete => {
+                w.write_u8(0).unwrap();
+            }
+            OpType::Write(v) => {
+                w.write_u8(1).unwrap();
+                let v_len = v.len() as u64;
+                w.write_u64::<LittleEndian>(v_len).unwrap();
+                w.write_all(v.as_ref()).unwrap();
+            }
+        }
+    }
 }
 pub type Result<T> = std::result::Result<T, Error>;
 // every Key in db has a unique id
@@ -44,17 +96,6 @@ pub type OpId = u64;
 pub enum OpType {
     Write(ValueVec),
     Delete,
-}
-pub fn kv_opertion_len(kvop: &KVOpertion) -> usize {
-    size_of::<u64>()
-        + kvop.key.len()
-        + size_of::<u64>()
-        + size_of::<u8>()
-        + if let OpType::Write(v) = &kvop.op {
-            v.len() + size_of::<u64>()
-        } else {
-            0
-        }
 }
 
 pub struct KViterAgg<'a> {
@@ -142,7 +183,7 @@ impl<'a> Iterator for KViterAgg<'a> {
     }
 }
 pub mod test {
-    use crate::db::common::{kv_opertion_len, KVOpertion, KViterAgg};
+    use crate::db::common::{new_buffer, KVOpertion, KViterAgg};
 
     use super::OpType;
 
@@ -206,13 +247,39 @@ pub mod test {
             op: OpType::Delete,
         };
 
-        assert_eq!(20, kv_opertion_len(&op));
+        assert_eq!(20, op.encode_size());
 
         let op = KVOpertion {
             id: 1,
             key: "123".as_bytes().into(),
             op: OpType::Write("234".as_bytes().into()),
         };
-        assert_eq!(31, kv_opertion_len(&op));
+        assert_eq!(31, op.encode_size());
+    }
+    #[test]
+    fn test_kv_operation_encode() {
+        let op = KVOpertion {
+            id: 1,
+            key: "123".to_string().as_bytes().into(),
+            op: OpType::Delete,
+        };
+        let mut v = new_buffer(1024);
+        op.encode(&mut v);
+        assert_eq!(v.position() as usize, op.encode_size());
+        v.set_position(0);
+        let op_res = KVOpertion::decode(&mut v);
+        assert_eq!(op_res, op);
+
+        let op = KVOpertion {
+            id: 1,
+            key: "123".to_string().as_bytes().into(),
+            op: OpType::Write("234".as_bytes().into()),
+        };
+        let mut v = new_buffer(1024);
+        op.encode(&mut v);
+        assert_eq!(v.position() as usize, op.encode_size());
+        v.set_position(0);
+        let op_res = KVOpertion::decode(&mut v);
+        assert_eq!(op_res, op);
     }
 }

@@ -1,4 +1,4 @@
-use super::{key::KeyVec, sstable::table::TableReader};
+use super::{key::KeyVec, table::TableReader};
 use std::sync::Arc;
 
 use super::{common::*, level::Level, store::Store};

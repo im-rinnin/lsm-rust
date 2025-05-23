@@ -1,7 +1,7 @@
 use super::{
     common::{KVOpertion, OpId},
     key::{KeySlice, KeyVec},
-    sstable::table::*,
+    table::*,
     store::{Store, StoreId},
 };
 struct StoreCreator<T: Store> {
@@ -42,9 +42,9 @@ fn compact<T: Store>(sc: StoreCreator<T>, level_low: &Level<T>, level_high: &Lev
 mod test {
     use std::ops::Range;
 
-    use crate::db::sstable::table::test::create_test_table;
+    use crate::db::table::test::create_test_table;
 
-    use crate::db::{sstable::table::TableReader, store::Memstore};
+    use crate::db::{table::TableReader, store::Memstore};
 
     #[test]
     fn test_search_in_level_n() {

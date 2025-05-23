@@ -1,4 +1,4 @@
-use super::sstable::table::SStableId;
+use super::table::SStableId;
 use super::store::Store;
 use super::OpId;
 

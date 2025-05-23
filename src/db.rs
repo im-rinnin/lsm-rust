@@ -7,7 +7,8 @@ mod level;
 mod logfile;
 mod memtable;
 mod snapshot;
-mod sstable;
+mod block;
+mod table;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use common::*;
 use logfile::LogFile;
 use memtable::Memtable;
 use snapshot::Snapshot;
-use sstable::table::TableReader;
+use table::TableReader;
 use store::Filestore;
 use store::Memstore;
 use store::Store;
