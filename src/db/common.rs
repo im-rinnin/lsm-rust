@@ -1,4 +1,5 @@
 use crate::db::key::KeySlice;
+use crate::db::key::ValueSlice;
 use std::{
     cmp::Ordering,
     io::{Cursor, Read, Write},
@@ -9,7 +10,6 @@ use std::{
 
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
-use serde::{Deserialize, Serialize};
 use std::mem::size_of;
 
 use super::key::{KeyVec, ValueVec}; // Added for kv_opertion_len // Added for kv_opertion_len
@@ -26,6 +26,75 @@ pub fn new_buffer(size: usize) -> Buffer {
     Cursor::new(vec![0; size])
 }
 pub enum Error {}
+#[derive(Debug, PartialEq, Eq)]
+pub struct KVOpertionRef<'a> {
+    pub id: OpId,
+    pub key: KeySlice<'a>,
+    pub op: OpTypeRef<'a>,
+}
+impl<'a> KVOpertionRef<'a> {
+    pub fn from_op(op: &'a KVOpertion) -> Self {
+        let op_type_ref = match &op.op {
+            OpType::Write(v) => OpTypeRef::Write(v.as_ref().into()),
+            OpType::Delete => OpTypeRef::Delete,
+        };
+        KVOpertionRef {
+            id: op.id,
+            key: op.key.as_ref().into(),
+            op: op_type_ref,
+        }
+    }
+    pub fn encode(&self, w: &mut Buffer) {
+        w.write_u64::<LittleEndian>(self.id).unwrap();
+        let key_len = self.key.len() as u64;
+        w.write_u64::<LittleEndian>(key_len).unwrap();
+        w.write_all(self.key.as_ref()).unwrap();
+        match &self.op {
+            OpTypeRef::Delete => {
+                w.write_u8(0).unwrap();
+            }
+            OpTypeRef::Write(v) => {
+                w.write_u8(1).unwrap();
+                let v_len = v.len() as u64;
+                w.write_u64::<LittleEndian>(v_len).unwrap();
+                w.write_all(v.as_ref()).unwrap();
+            }
+        }
+    }
+    pub fn decode(r: &'a [u8]) -> Self {
+        let mut cursor = Cursor::new(r);
+        let id = cursor.read_u64::<LittleEndian>().unwrap();
+        let key_len = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+        let key_start = cursor.position() as usize;
+        let key_end = key_start + key_len;
+        let key = KeySlice::from(&r[key_start..key_end]);
+
+        cursor.set_position(key_end as u64);
+        let op_type = cursor.read_u8().unwrap();
+        let op = match op_type {
+            0 => OpTypeRef::Delete,
+            _ => {
+                let value_len = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+                let value_start = cursor.position() as usize;
+                let value_end = value_start + value_len;
+                let value = ValueSlice::from(&r[value_start..value_end]);
+                OpTypeRef::Write(value)
+            }
+        };
+        KVOpertionRef { id, key, op }
+    }
+    pub fn encode_size(&self) -> usize {
+        // id (u64) + key_len (u64) + key_data
+        let mut size = size_of::<u64>() + size_of::<u64>() + self.key.len();
+        // op_type (u8)
+        size += size_of::<u8>();
+        if let OpTypeRef::Write(v) = &self.op {
+            // value_len (u64) + value_data
+            size += size_of::<u64>() + v.len();
+        }
+        size
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct KVOpertion {
@@ -41,52 +110,32 @@ impl KVOpertion {
             op: op,
         }
     }
+    pub fn from_ref(op_ref: KVOpertionRef) -> Self {
+        let op_type = match op_ref.op {
+            OpTypeRef::Write(v) => OpType::Write(ValueVec::from_vec(v.as_ref().to_vec())),
+            OpTypeRef::Delete => OpType::Delete,
+        };
+        KVOpertion {
+            id: op_ref.id,
+            key: KeyVec::from_vec(op_ref.key.as_ref().to_vec()),
+            op: op_type,
+        }
+    }
 
     pub fn encode_size(&self) -> usize {
-        // id (u64) + key_len (u64) + key_data
-        let mut size = size_of::<u64>() + size_of::<u64>() + self.key.len();
-        // op_type (u8)
-        size += size_of::<u8>();
-        if let OpType::Write(v) = &self.op {
-            // value_len (u64) + value_data
-            size += size_of::<u64>() + v.len();
-        }
-        size
+        KVOpertionRef::from_op(self).encode_size()
     }
     pub fn decode(r: &mut Buffer) -> Self {
-        let id = r.read_u64::<LittleEndian>().unwrap();
-        let key_len = r.read_u64::<LittleEndian>().unwrap();
-        let mut tmp = vec![0; key_len as usize];
-        r.read_exact(&mut tmp);
-        let key = KeyVec::from_vec(tmp);
-        let op_type = r.read_u8().unwrap();
-        let op = match op_type {
-            0 => OpType::Delete,
-            _ => {
-                let value_len = r.read_u64::<LittleEndian>().unwrap();
-                let mut tmp = vec![0; value_len as usize];
-                r.read_exact(&mut tmp);
-                OpType::Write(ValueVec::from_vec(tmp))
-            }
-        };
-        KVOpertion { id, key, op }
+        let current_pos = r.position() as usize;
+        let remaining_data = &r.get_ref()[current_pos..];
+        let op_ref = KVOpertionRef::decode(remaining_data);
+        let size = op_ref.encode_size();
+        let res = KVOpertion::from_ref(op_ref);
+        r.set_position((current_pos + size) as u64);
+        res
     }
     pub fn encode(&self, w: &mut Buffer) {
-        w.write_u64::<LittleEndian>(self.id).unwrap();
-        let key_len = self.key.len() as u64;
-        w.write_u64::<LittleEndian>(key_len).unwrap();
-        w.write_all(self.key.as_ref()).unwrap();
-        match &self.op {
-            OpType::Delete => {
-                w.write_u8(0).unwrap();
-            }
-            OpType::Write(v) => {
-                w.write_u8(1).unwrap();
-                let v_len = v.len() as u64;
-                w.write_u64::<LittleEndian>(v_len).unwrap();
-                w.write_all(v.as_ref()).unwrap();
-            }
-        }
+        KVOpertionRef::from_op(self).encode(w);
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -95,6 +144,19 @@ pub type OpId = u64;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)] // Added Clone
 pub enum OpType {
     Write(ValueVec),
+    Delete,
+}
+impl OpType {
+    pub fn from_ref(op_ref: OpTypeRef) -> Self {
+        match op_ref {
+            OpTypeRef::Write(v) => OpType::Write(ValueVec::from_vec(v.as_ref().to_vec())),
+            OpTypeRef::Delete => OpType::Delete,
+        }
+    }
+}
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub enum OpTypeRef<'a> {
+    Write(ValueSlice<'a>),
     Delete,
 }
 
@@ -183,6 +245,8 @@ impl<'a> Iterator for KViterAgg<'a> {
     }
 }
 pub mod test {
+    use super::KVOpertionRef;
+    use super::OpTypeRef;
     use crate::db::common::{new_buffer, KVOpertion, KViterAgg};
 
     use super::OpType;
@@ -281,5 +345,38 @@ pub mod test {
         v.set_position(0);
         let op_res = KVOpertion::decode(&mut v);
         assert_eq!(op_res, op);
+    }
+
+    #[test]
+    fn test_kv_opertion_ref_from_op() {
+        // Test with Write operation
+        let write_op = KVOpertion {
+            id: 10,
+            key: "test_key".as_bytes().into(),
+            op: OpType::Write("test_value".as_bytes().into()),
+        };
+        let write_op_ref = KVOpertionRef::from_op(&write_op);
+
+        assert_eq!(write_op_ref.id, 10);
+        assert_eq!(write_op_ref.key.as_ref(), b"test_key");
+        match write_op_ref.op {
+            OpTypeRef::Write(v) => assert_eq!(v.as_ref(), b"test_value"),
+            OpTypeRef::Delete => panic!("Expected Write operation"),
+        }
+
+        // Test with Delete operation
+        let delete_op = KVOpertion {
+            id: 20,
+            key: "another_key".as_bytes().into(),
+            op: OpType::Delete,
+        };
+        let delete_op_ref = KVOpertionRef::from_op(&delete_op);
+
+        assert_eq!(delete_op_ref.id, 20);
+        assert_eq!(delete_op_ref.key.as_ref(), b"another_key");
+        match delete_op_ref.op {
+            OpTypeRef::Write(_) => panic!("Expected Delete operation"),
+            OpTypeRef::Delete => {} // Correct
+        }
     }
 }

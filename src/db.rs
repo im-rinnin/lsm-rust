@@ -1,5 +1,6 @@
 mod store;
 
+mod block;
 mod common;
 mod db_meta;
 mod key;
@@ -7,7 +8,6 @@ mod level;
 mod logfile;
 mod memtable;
 mod snapshot;
-mod block;
 mod table;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -16,10 +16,10 @@ use common::*;
 use logfile::LogFile;
 use memtable::Memtable;
 use snapshot::Snapshot;
-use table::TableReader;
 use store::Filestore;
 use store::Memstore;
 use store::Store;
+use table::TableReader;
 
 pub struct Config {
     block_size: usize,

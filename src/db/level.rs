@@ -1,8 +1,8 @@
 use super::{
     common::{KVOpertion, OpId},
     key::{KeySlice, KeyVec},
-    table::*,
     store::{Store, StoreId},
+    table::*,
 };
 struct StoreCreator<T: Store> {
     t: T,
@@ -44,7 +44,7 @@ mod test {
 
     use crate::db::table::test::create_test_table;
 
-    use crate::db::{table::TableReader, store::Memstore};
+    use crate::db::{store::Memstore, table::TableReader};
 
     #[test]
     fn test_search_in_level_n() {

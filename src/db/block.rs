@@ -4,6 +4,7 @@
 // block
 // [[entry],[entry],...[entry][count(u64)]]
 
+use crate::db::common::OpTypeRef;
 use std::io::BufRead;
 use std::iter::Peekable;
 use std::ops::Not;
@@ -28,44 +29,52 @@ pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
 use crate::db::key::KeyVec;
 use std::cell::RefCell;
 
+use super::common::KVOpertionRef;
+
 pub struct BlockReader {
-    data: RefCell<Buffer>,
+    data: Vec<u8>,
     first_key: KeyVec,
     count: usize,
 }
 
 impl BlockReader {
-    fn new(data: Vec<u8>) -> Self {
-        // read count from last u64 of data
-        let count_pos = data.len() - 8;
-        let mut cursor = Cursor::new(data);
-        cursor.set_position(count_pos as u64);
-        let count = cursor
-            .read_u64::<LittleEndian>()
-            .expect("Failed to read count from block");
+    pub fn new(data: Vec<u8>) -> Self {
+        let data_len = data.len();
+        // Read count from the last 8 bytes (u64)
+        let count_bytes_start = data_len - std::mem::size_of::<u64>();
+        let mut cursor = Cursor::new(&data[count_bytes_start..]);
+        let count = cursor.read_u64::<LittleEndian>().unwrap() as usize;
 
-        // read first key from data from data beginning
-        cursor.set_position(0);
-        let first_kv = KVOpertion::decode(&mut cursor);
-        let first_key = first_kv.key;
+        // The actual block data is everything before the count
+        let block_data_slice = &data[..count_bytes_start];
 
-        // return self
+        // Decode the first KV operation to get the first key
+        let first_kv = KVOpertionRef::decode(block_data_slice);
+        let first_key = first_kv.key.as_ref();
+        let t = KeyVec::from_vec(Vec::from(first_key));
+
         BlockReader {
-            data: RefCell::new(cursor),
-            first_key,
-            count: count as usize,
+            data,
+            first_key: t,
+            count,
         }
     }
 
-    pub fn search(&self, key: KeySlice, op_id: OpId) -> Option<OpType> {
-        // Reset buffer position to the beginning for search
-        self.data.borrow_mut().set_position(0);
-        let mut result: Option<OpType> = None;
+    pub fn search(&self, key: &KeySlice, op_id: OpId) -> Option<(OpTypeRef, OpId)> {
+        // The actual block data is everything before the last 8 bytes (count)
+        let data_slice = &self.data[..self.data.len() - std::mem::size_of::<u64>()];
+        let mut cursor = Cursor::new(data_slice);
+
+        let mut result: Option<(OpTypeRef, OpId)> = None;
         let mut last_matching_id: OpId = 0; // Keep track of the highest ID found for the key <= op_id
 
+        // Iterate through the KV operations in the block
         for _ in 0..self.count {
-            let mut t = self.data.borrow_mut();
-            let kv_op = KVOpertion::decode(&mut t);
+            // Decode the next KV operation from the cursor
+            let kv_op = KVOpertionRef::decode(&data_slice[cursor.position() as usize..]);
+
+            // Move the cursor past the decoded KV operation
+            cursor.set_position(cursor.position() + kv_op.encode_size() as u64);
 
             // Optimization: If the current key is greater than the target key,
             // we can stop searching as keys are sorted within the block.
@@ -77,16 +86,16 @@ impl BlockReader {
                 // Found the key, check if this operation's ID is relevant
                 if kv_op.id <= op_id && kv_op.id >= last_matching_id {
                     // This is the latest relevant operation found so far for this key
-                    result = Some(kv_op.op.clone()); // Update result with the operation type
+                    result = Some((kv_op.op, kv_op.id)); // Update result with the operation type and its ID
                     last_matching_id = kv_op.id; // Update the latest ID found
                 }
             }
         }
-        result // Return the OpType of the latest relevant operation found, if any
+        result // Return the OpType and OpId of the latest relevant operation found, if any
     }
     pub fn to_iter(self) -> BlockIter {
         // Create a BlockIter, transferring ownership of the buffer and count.
-        let buffer = self.data.into_inner();
+        let buffer = Cursor::new(self.data);
         let count = self.count;
         BlockIter::new(buffer, count)
     }
@@ -100,24 +109,70 @@ impl BlockReader {
     }
 
     pub fn inner(self) -> Vec<u8> {
-        self.data.take().into_inner()
+        self.data
     }
 }
 
 pub struct BlockBuilder {
     buffer: Buffer,
+    last_key_positon: Option<u64>,
     count: u64,
 }
 
 impl BlockBuilder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         BlockBuilder {
             buffer: new_buffer(DATA_BLOCK_SIZE),
+            last_key_positon: None,
             count: 0,
         }
     }
 
-    fn fill<'a, T: Iterator<Item = &'a KVOpertion>>(
+    pub fn last_key(&self) -> Option<KeyVec> {
+        if let Some(pos) = self.last_key_positon {
+            // Create a slice from the buffer starting at the last_key_positon
+            let buffer_ref = self.buffer.get_ref();
+            let slice_from_last_key = &buffer_ref[pos as usize..];
+
+            // Decode the KV operation from this slice to get the key
+            let kv_op = KVOpertionRef::decode(slice_from_last_key);
+            Some(KeyVec::from(kv_op.key.as_ref())) // Convert KeySlice to KeyVec
+        } else {
+            None
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.buffer.position() == 0
+    }
+
+    pub fn add(&mut self, op: &KVOpertionRef) -> bool {
+        let op_size = op.encode_size();
+        // Check if adding the current operation would exceed the block size limit,
+        // considering space for the final count (u64).
+        if self.buffer.position() as usize + op_size + std::mem::size_of::<u64>() > DATA_BLOCK_SIZE
+        {
+            return false;
+        }
+        self.last_key_positon = Some(self.buffer.position());
+        op.encode(&mut self.buffer);
+        self.count += 1;
+        true
+    }
+
+    pub fn take(&self) -> &[u8] {
+        self.buffer.get_ref().as_ref()
+    }
+    pub fn finish(mut self) -> Result<Buffer> {
+        // Write count to the last 8 bytes of the block.
+        // The total size of the block is DATA_BLOCK_SIZE.
+        let count_pos = DATA_BLOCK_SIZE - std::mem::size_of::<u64>();
+        self.buffer.set_position(count_pos as u64);
+        self.buffer.write_u64::<LittleEndian>(self.count)?;
+
+        Ok(self.buffer)
+    }
+
+    pub fn fill<'a, T: Iterator<Item = &'a KVOpertion>>(
         mut self,
         it: &mut Peekable<T>,
     ) -> Result<Buffer> {
@@ -135,18 +190,12 @@ impl BlockBuilder {
             if current_size + size + 8 > DATA_BLOCK_SIZE {
                 break; // Block is full
             }
-            item.encode(&mut self.buffer);
+            self.add(&KVOpertionRef::from_op(&item));
             current_size += size;
-            self.count += 1;
+            //
             it.next(); // Consume the item
         }
-        // Write count to the last 8 bytes of the block.
-        // The total size of the block is DATA_BLOCK_SIZE.
-        let count_pos = DATA_BLOCK_SIZE - std::mem::size_of::<u64>();
-        self.buffer.set_position(count_pos as u64);
-        self.buffer.write_u64::<LittleEndian>(self.count)?;
-
-        Ok(self.buffer)
+        self.finish()
     }
 }
 
@@ -193,8 +242,10 @@ pub mod test {
     use byteorder::WriteBytesExt;
     use std::io::Cursor;
     use std::ops::Range;
+    use std::usize;
 
     use super::BlockIter;
+    use crate::db::common::OpTypeRef;
     // pad zero at begin to length 6
     // panic if len of i is eq or more than 6
     // e.g. 11 ->"000011" 123456->"123456"
@@ -256,18 +307,18 @@ pub mod test {
 
         // Test search for key "50" with op_id 10000
         let key50_slice = KeySlice::from(key50_str.as_bytes());
-        let result50_high_id = br.search(key50_slice.clone(), 10000);
+        let result50_high_id = br.search(&key50_slice.clone(), 10000);
         assert_eq!(
             result50_high_id,
-            Some(OpType::Write("51".as_bytes().into())),
+            Some((OpTypeRef::Write("51".as_bytes().into()), 10000)),
             "Should find key '50' with value '51' for op_id 10000"
         );
 
         // Test search for key "50" with op_id 50 (should find the original entry)
-        let result50_low_id = br.search(key50_slice, 50);
+        let result50_low_id = br.search(&key50_slice, 50);
         assert_eq!(
             result50_low_id,
-            Some(OpType::Write(50.to_string().as_bytes().into())),
+            Some((OpTypeRef::Write(50.to_string().as_bytes().into()), 50)),
             "Should find key '50' with value '50' for op_id 50"
         );
 
@@ -275,19 +326,19 @@ pub mod test {
         let key10_str = pad_zero(10);
         let key10_slice = KeySlice::from(key10_str.as_bytes());
         // Assuming op_id for key "10" is 10, as per create_kv_data_in_range_zero_to
-        let result10 = br.search(key10_slice, 10);
+        let result10 = br.search(&key10_slice, 10);
         assert_eq!(
             result10,
-            Some(OpType::Write(10.to_string().as_bytes().into())),
+            Some((OpTypeRef::Write(10.to_string().as_bytes().into()), 10)),
             "Should find key '10'"
         );
 
         let key0_str = pad_zero(0);
         let key0_slice = KeySlice::from(key0_str.as_bytes());
-        let result0 = br.search(key0_slice, 0); // op_id for key "0" is 0
+        let result0 = br.search(&key0_slice, 0); // op_id for key "0" is 0
         assert_eq!(
             result0,
-            Some(OpType::Write(0.to_string().as_bytes().into())),
+            Some((OpTypeRef::Write(0.to_string().as_bytes().into()), 0)),
             "Should find key '0'"
         );
 
@@ -295,7 +346,7 @@ pub mod test {
         let key100_str = pad_zero(100); // This key is not in the 0..100 range
         let key100_slice = KeySlice::from(key100_str.as_bytes());
         // Use a relevant op_id, e.g., 100, though it shouldn't matter if the key isn't present.
-        let result100 = br.search(key100_slice, 100);
+        let result100 = br.search(&key100_slice, 100);
         assert!(result100.is_none(), "Should not find key '100'");
     }
 
@@ -343,12 +394,12 @@ pub mod test {
         let f = 5.to_string();
         let search_key = KeySlice::from(f.as_bytes());
         let search_op_id = 20; // Ensure all versions are considered
-        let result = block_reader.search(search_key, search_op_id);
+        let result = block_reader.search(&search_key, search_op_id);
 
         // Assert that the latest version ("duplicate_15") is found
         assert_eq!(
             result,
-            Some(OpType::Write("duplicate_15".as_bytes().into()))
+            Some((OpTypeRef::Write("duplicate_15".as_bytes().into()), 15))
         );
     }
 
@@ -436,6 +487,41 @@ pub mod test {
     }
 
     #[test]
+    fn test_block_builder_add_and_finish() {
+        let num_kvs = 5;
+        let kvs = create_kv_data_in_range_zero_to(num_kvs);
+
+        let mut builder = BlockBuilder::new();
+        for kv in &kvs {
+            builder.add(&KVOpertionRef::from_op(&kv));
+        }
+
+        let buffer = builder.finish().expect("Failed to finish block");
+        let block_reader = BlockReader::new(buffer.into_inner());
+
+        // Verify count
+        assert_eq!(block_reader.count(), num_kvs, "BlockReader count mismatch");
+
+        // Verify contents by iterating
+        let mut block_iter = block_reader.to_iter();
+        for (i, kv_read) in block_iter.enumerate() {
+            let original_kv = &kvs[i];
+            assert_eq!(kv_read.id, original_kv.id, "KV id mismatch at index {}", i);
+            assert_eq!(
+                kv_read.key.as_ref(),
+                original_kv.key.as_ref(),
+                "KV key mismatch at index {}",
+                i
+            );
+            assert_eq!(
+                kv_read.op, original_kv.op,
+                "KV operation mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
     fn test_block_reader_new() {
         // Create some KV operations
         let kvs = create_kv_data_in_range_zero_to(5); // Use 5 KVs
@@ -444,7 +530,9 @@ pub mod test {
         let mut kv_iter = kvs.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let block_builder = BlockBuilder::new();
-        let buffer = block_builder.fill(&mut kv_iter_agg).expect("Failed to build block");
+        let buffer = block_builder
+            .fill(&mut kv_iter_agg)
+            .expect("Failed to build block");
         let block_data = buffer.into_inner();
 
         // Create a BlockReader from the raw block data
@@ -452,9 +540,12 @@ pub mod test {
 
         // Assert that the count and first key are correctly read
         assert_eq!(block_reader.count(), 5, "BlockReader should have 5 items");
-        assert_eq!(block_reader.first_key(), &kvs[0].key, "BlockReader first key should match the first KV's key");
+        assert_eq!(
+            block_reader.first_key(),
+            &kvs[0].key,
+            "BlockReader first key should match the first KV's key"
+        );
     }
-
 
     #[test]
     fn test_block_builder_empty_iterator() {
@@ -499,15 +590,6 @@ pub mod test {
             "Block should contain fewer items than the total"
         );
 
-        // Verify the block's size is within DATA_BLOCK_SIZE
-        let block_size = br.data.borrow().position() as usize;
-        assert!(
-            block_size <= DATA_BLOCK_SIZE,
-            "Block size ({}) should not exceed DATA_BLOCK_SIZE ({})",
-            block_size,
-            DATA_BLOCK_SIZE
-        );
-
         // Verify the first key matches
         assert_eq!(br.first_key(), &kvs[0].key, "First key should match");
 
@@ -520,5 +602,99 @@ pub mod test {
         }
         assert_eq!(count, br_count, "Iterator count should match block count");
     }
+    use crate::db::common::KVOpertionRef;
 
+    #[test]
+    fn test_block_builder_last_key() {
+        let mut builder = BlockBuilder::new();
+
+        // Initially, last_key should be None
+        assert!(builder.last_key().is_none(), "last_key should be None for an empty builder");
+
+        // Add first KV
+        let kv1 = KVOpertion::new(1, "key1".as_bytes().into(), OpType::Write("value1".as_bytes().into()));
+        builder.add(&KVOpertionRef::from_op(&kv1));
+        assert_eq!(builder.last_key().unwrap().as_ref(), "key1".as_bytes(), "last_key should be 'key1'");
+
+        // Add second KV
+        let kv2 = KVOpertion::new(2, "key2".as_bytes().into(), OpType::Write("value2".as_bytes().into()));
+        builder.add(&KVOpertionRef::from_op(&kv2));
+        assert_eq!(builder.last_key().unwrap().as_ref(), "key2".as_bytes(), "last_key should be 'key2'");
+
+        // Add third KV
+        let kv3 = KVOpertion::new(3, "key3".as_bytes().into(), OpType::Write("value3".as_bytes().into()));
+        builder.add(&KVOpertionRef::from_op(&kv3));
+        assert_eq!(builder.last_key().unwrap().as_ref(), "key3".as_bytes(), "last_key should be 'key3'");
+
+        // Test with a block that becomes full
+        let mut full_builder = BlockBuilder::new();
+        let mut last_added_key: Option<KeyVec> = None;
+        for i in 0.. {
+            let key_str = format!("key_{:0>6}", i);
+            let value_str = format!("value_{}", i);
+            let kv_op = KVOpertion::new(
+                i as u64,
+                key_str.as_bytes().into(),
+                OpType::Write(value_str.as_bytes().into()),
+            );
+
+            if !full_builder.add(&KVOpertionRef::from_op(&kv_op)) {
+                break; // Block is full
+            }
+            last_added_key = Some(kv_op.key);
+        }
+        assert_eq!(full_builder.last_key().unwrap().as_ref(), last_added_key.unwrap().as_ref(), "last_key should be the last key added before full");
+    }
+
+    #[test]
+    fn test_block_builder_add_buffer_size_check() {
+        let mut builder = BlockBuilder::new();
+        let mut added_count = 0;
+
+        // Create KV operations until `add` returns false
+        for i in 0.. {
+            let kv_op = KVOpertion::new(
+                i as u64,
+                pad_zero(i as u64).as_bytes().into(),
+                OpType::Write(format!("value_{}", i).as_bytes().into()),
+            );
+
+            if !builder.add(&KVOpertionRef::from_op(&kv_op)) {
+                // If add returns false, the block is full
+                break;
+            }
+            added_count += 1;
+        }
+
+        // Assert that at least one item was added
+        assert!(added_count > 0, "Should have added at least one item");
+
+        // Try to add one more item, it should fail
+        let last_kv_op = KVOpertion::new(
+            added_count as u64,
+            pad_zero(added_count as u64).as_bytes().into(),
+            OpType::Write(format!("value_{}", added_count).as_bytes().into()),
+        );
+        assert!(
+            !builder.add(&KVOpertionRef::from_op(&last_kv_op)),
+            "Adding an item after block is full should return false"
+        );
+
+        // Finish the block and verify its properties
+        let buffer = builder.finish().expect("Failed to finish block");
+        let block_reader = BlockReader::new(buffer.into_inner());
+
+        assert_eq!(
+            block_reader.count(),
+            added_count as usize,
+            "BlockReader count should match the number of successfully added KVs"
+        );
+
+        // The final size of the block should be DATA_BLOCK_SIZE
+        assert_eq!(
+            block_reader.inner().len(),
+            DATA_BLOCK_SIZE,
+            "Final block size should be DATA_BLOCK_SIZE"
+        );
+    }
 }

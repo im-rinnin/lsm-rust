@@ -1,5 +1,5 @@
-use super::table::SStableId;
 use super::store::Store;
+use super::table::SStableId;
 use super::OpId;
 
 const META_FILE_NAME: &str = "db_meta";
