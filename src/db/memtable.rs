@@ -1,82 +1,49 @@
-use std::collections::btree_map::Iter;
-use std::collections::linked_list::Iter as ListIter;
-use std::collections::{BTreeMap, LinkedList};
 use std::fmt::Result;
 
+use super::common::OpTypeRef;
 use super::key::KeyVec;
 use super::{KVOpertion, KeyQuery, OpId, OpType};
-struct MemtableItem {
-    op_id: OpId,
-    op: OpType,
-}
-// todo! update  to high perf and thread safe map
+use crate::db::key::KeySlice;
+use crossbeam_skiplist::map::Entry;
+use crossbeam_skiplist::SkipMap;
+
 pub struct Memtable {
-    table: BTreeMap<KeyVec, LinkedList<MemtableItem>>,
+    table: SkipMap<(KeyVec, OpId), OpType>,
     max_op_id: Option<OpId>,
 }
-use crate::db::key::KeySlice;
 
-struct MemtableIterator<'a> {
-    table_iter: Iter<'a, KeyVec, LinkedList<MemtableItem>>,
-    list_iter: Option<ListIter<'a, MemtableItem>>,
-    current_key: Option<KeySlice<'a>>,
-}
-
-impl MemtableItem {
-    pub fn new(op: KVOpertion) -> Self {
-        MemtableItem {
-            op_id: op.id,
-            op: op.op,
-        }
-    }
+pub struct MemtableIterator<'a> {
+    inner_iter: crossbeam_skiplist::map::Iter<'a, (KeyVec, OpId), OpType>,
 }
 
 impl Memtable {
     fn new() -> Self {
         Memtable {
-            table: BTreeMap::new(),
+            table: SkipMap::new(),
             max_op_id: None,
         }
     }
-    pub fn get(&self, q: KeyQuery) -> Option<(OpId, &[u8])> {
-        // find key match MemtableItem retrun none if not found
-        let table_found = self.table.get(&q.key);
-        let found = match table_found {
-            None => None,
-            Some(list) => Self::find_item_in_item_list(list, q.op_id),
-        };
-        if found.is_none() {
-            return None;
-        }
-        let res = found.unwrap();
 
-        match &res.op {
-            OpType::Delete => None,
-            OpType::Write(v) => Some((res.op_id, v.as_ref())),
-        }
-    }
-    // find first item whose id <= opid
-    fn find_item_in_item_list(
-        list: &LinkedList<MemtableItem>,
-        op_id: OpId,
-    ) -> Option<&MemtableItem> {
-        let mut i = list.iter();
-        let mut last = i.next().expect("should have at least one item");
-        if last.op_id > op_id {
-            return None;
-        } else {
-            for item in i {
-                if item.op_id > op_id {
-                    break;
-                }
-                last = item
+    pub fn get<'a>(&'a self, q: KeyQuery) -> Option<(OpId, KeyVec)> {
+        let key_for_range_start = q.key.clone();
+        let key_for_range_end = q.key.clone();
+
+        let range_start_bound = (key_for_range_start, 0);
+        let range_end_bound = (key_for_range_end, q.op_id + 1);
+
+        for entry in self.table.range(range_start_bound..range_end_bound).rev() {
+            let (_entry_key, entry_op_id) = entry.key();
+            let entry_op_type = entry.value();
+
+            match entry_op_type {
+                OpType::Write(v) => return Some((*entry_op_id, v.clone())),
+                OpType::Delete => return None,
             }
-            return Some(last);
         }
+        None
     }
 
     pub fn insert(&mut self, op: KVOpertion) -> Result {
-        // check op id is monotonically increasing
         if self.max_op_id.is_some() {
             let id = self.max_op_id.unwrap();
             if id >= op.id {
@@ -88,22 +55,9 @@ impl Memtable {
         }
 
         let op_id = op.id;
-        let item_found_op = self.table.get_mut(&op.key);
-        let key = op.key.clone();
-        let item = MemtableItem::new(op);
-
-        match item_found_op {
-            None => {
-                let list = LinkedList::from([item]);
-                self.table.insert(key, list);
-            }
-            Some(list) => {
-                list.push_back(item);
-            }
-        }
-        // update max id if insert success
+        self.table.insert((op.key, op.id), op.op);
         self.max_op_id = Some(op_id);
-        return Ok(());
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -111,46 +65,24 @@ impl Memtable {
     }
 
     fn to_iter<'a>(&'a self) -> MemtableIterator<'a> {
-        let i = self.table.iter();
         MemtableIterator {
-            table_iter: i,
-            list_iter: None,
-            current_key: None,
+            inner_iter: self.table.iter(),
         }
     }
 }
 
 impl<'a> Iterator for MemtableIterator<'a> {
-    type Item = (KeySlice<'a>, &'a MemtableItem);
+    type Item = Entry<'a, (KeyVec, OpId), OpType>;
+
     fn next(&mut self) -> Option<Self::Item> {
-        // get from list iter if list is some
-        if let Some(iter) = self.list_iter.as_mut() {
-            if let Some(item) = iter.next() {
-                return Some((self.current_key.clone().expect("should exits key"), item));
-            }
-        }
-        // get new list from table
-        if let Some((key, list)) = self.table_iter.next() {
-            self.current_key = Some(key.as_ref().into());
-            let mut iter = list.iter();
-            let res = Some((
-                key.as_ref().into(),
-                iter.next().expect("should have at least one item"),
-            ));
-            self.list_iter = Some(iter);
-            return res;
-        } else {
-            return None;
-        }
+        let next = self.inner_iter.next();
+        next
     }
 }
 
 #[cfg(test)]
 mod test {
-
-    use std::{env::vars, net::SocketAddr, os::unix::process};
-
-    use crate::db::{KVOpertion, KeyQuery, OpId, OpType};
+    use crate::db::{key::KeyVec, KVOpertion, KeyQuery, OpId, OpType};
 
     fn get_next_id(id: &mut OpId) -> OpId {
         let old = *id;
@@ -159,7 +91,6 @@ mod test {
     }
 
     use super::Memtable;
-    // test count
 
     #[test]
     fn test_empty_count() {
@@ -170,10 +101,91 @@ mod test {
             1.to_string().as_bytes().into(),
             OpType::Write(1.to_string().as_bytes().into()),
         );
-        m.insert(op);
+        m.insert(op).unwrap();
         assert_eq!(m.len(), 1);
     }
 
+    #[test]
+    fn test_get_with_duplicate_key() {
+        let mut m = Memtable::new();
+        let mut id = 0;
+        let key: KeyVec = "test_key".as_bytes().into();
+
+        // Insert multiple operations for the same key with increasing op_ids
+        // 1. Write "value1" with op_id 0
+        let op_id_0 = get_next_id(&mut id);
+        m.insert(KVOpertion::new(
+            op_id_0,
+            key.clone(),
+            OpType::Write("value1".as_bytes().into()),
+        ))
+        .unwrap();
+
+        // 2. Write "value2" with op_id 1
+        let op_id_1 = get_next_id(&mut id);
+        m.insert(KVOpertion::new(
+            op_id_1,
+            key.clone(),
+            OpType::Write("value2".as_bytes().into()),
+        ))
+        .unwrap();
+
+        // 3. Delete with op_id 2
+        let op_id_2 = get_next_id(&mut id);
+        m.insert(KVOpertion::new(op_id_2, key.clone(), OpType::Delete))
+            .unwrap();
+
+        // 4. Write "value3" with op_id 3
+        let op_id_3 = get_next_id(&mut id);
+        m.insert(KVOpertion::new(
+            op_id_3,
+            key.clone(),
+            OpType::Write("value3".as_bytes().into()),
+        ))
+        .unwrap();
+
+        let current_max_op_id = id;
+
+        // Test queries at different op_ids
+        // Query at op_id 0: Should see "value1"
+        let res = m.get(KeyQuery {
+            op_id: op_id_0,
+            key: key.clone(),
+        });
+        assert!(res.is_some());
+        assert_eq!(res.unwrap().1, "value1".as_bytes().into());
+
+        // Query at op_id 1: Should see "value2"
+        let res = m.get(KeyQuery {
+            op_id: op_id_1,
+            key: key.clone(),
+        });
+        assert!(res.is_some());
+        assert_eq!(res.unwrap().1, "value2".as_bytes().into());
+
+        // Query at op_id 2: Should see None (deleted)
+        let res = m.get(KeyQuery {
+            op_id: op_id_2,
+            key: key.clone(),
+        });
+        assert!(res.is_none());
+
+        // Query at op_id 3: Should see "value3"
+        let res = m.get(KeyQuery {
+            op_id: op_id_3,
+            key: key.clone(),
+        });
+        assert!(res.is_some());
+        assert_eq!(res.unwrap().1, "value3".as_bytes().into());
+
+        // Query at an op_id higher than any existing op: Should see "value3" (latest write)
+        let res = m.get(KeyQuery {
+            op_id: current_max_op_id,
+            key: key.clone(),
+        });
+        assert!(res.is_some());
+        assert_eq!(res.unwrap().1, "value3".as_bytes().into());
+    }
     #[test]
     fn test_insert_delete_and_get() {
         let mut m = Memtable::new();
@@ -186,115 +198,151 @@ mod test {
                 i.to_string().as_bytes().into(),
                 OpType::Write(i.to_string().as_bytes().into()),
             );
-            m.insert(op);
+            m.insert(op).unwrap();
         }
         // delete 10
-        let op_id = get_next_id(&mut id);
-        let op = KVOpertion::new(op_id, 10.to_string().as_bytes().into(), OpType::Delete);
-        m.insert(op);
-        // overwirte  12 to 100
-        let op_id = get_next_id(&mut id);
+        let op_id_delete_10 = get_next_id(&mut id);
         let op = KVOpertion::new(
-            op_id,
+            op_id_delete_10,
+            10.to_string().as_bytes().into(),
+            OpType::Delete,
+        );
+        m.insert(op).unwrap();
+        // overwirte  12 to 100
+        let op_id_overwrite_12 = get_next_id(&mut id);
+        let op = KVOpertion::new(
+            op_id_overwrite_12,
             12.to_string().as_bytes().into(),
             OpType::Write(100.to_string().as_bytes().into()),
         );
-        m.insert(op);
-        // check op id and key match in 0..10
+        m.insert(op).unwrap();
+
+        let current_max_op_id = id;
+
+        // check op id and key match in 0..10 (excluding 10)
         for i in 0..10 {
             let res = m.get(KeyQuery {
-                op_id: id,
+                op_id: current_max_op_id,
                 key: i.to_string().as_bytes().into(),
             });
-            assert!(res.is_some());
-            assert_eq!(res.unwrap().1, i.to_string().as_bytes());
+            assert!(res.is_some(), "Key {} should be found", i);
+            assert_eq!(
+                res.unwrap().1,
+                i.to_string().as_bytes().into(),
+                "Value for key {} should be {}",
+                i,
+                i
+            );
         }
+
         //check delete
         let res = m.get(KeyQuery {
-            op_id: id,
+            op_id: current_max_op_id,
             key: 10.to_string().as_bytes().into(),
         });
-        assert!(res.is_none());
-        // 10 is delete but still can be get by op id 10
+        assert!(
+            res.is_none(),
+            "Key 10 should be deleted at current_max_op_id"
+        );
+
+        // 10 is deleted but still can be get by op id before its delete
         let res = m.get(KeyQuery {
-            op_id: 10,
+            op_id: 10, // Query at the op_id when key '10' was inserted
             key: 10.to_string().as_bytes().into(),
         });
-        assert!(res.is_some());
-        assert_eq!(res.unwrap().1, 10.to_string().as_bytes());
+        assert!(res.is_some(), "Key 10 should be found at op_id 10");
+        assert_eq!(res.unwrap().1, 10.to_string().as_bytes().into());
+
+        // Check overwritten key 12
+        let res = m.get(KeyQuery {
+            op_id: current_max_op_id,
+            key: 12.to_string().as_bytes().into(),
+        });
+        assert!(res.is_some(), "Key 12 should be found at current_max_op_id");
+        assert_eq!(
+            res.unwrap().1,
+            100.to_string().as_bytes().into(),
+            "Value for key 12 should be 100"
+        );
+
         // check key not exit
         let res = m.get(KeyQuery {
-            op_id: id,
+            op_id: current_max_op_id,
             key: 100.to_string().as_bytes().into(),
         });
-        assert!(res.is_none());
+        assert!(res.is_none(), "Key 100 should not exist");
+
         // check op id not match
-        // key 5 op id is 5 so should not found if use op id 1
         let res = m.get(KeyQuery {
             op_id: 1,
             key: 5.to_string().as_bytes().into(),
         });
-        assert!(res.is_none());
+        assert!(res.is_none(), "Key 5 should not be found with op_id 1");
     }
 
-    // test iterator
     #[test]
     fn test_iterator() {
         let mut m = Memtable::new();
         let mut id = 0;
-        // put 0..5 out of order
-        let id_unorderd = [3, 2, 1, 4, 0];
-        for i in id_unorderd {
-            let op = KVOpertion::new(
-                get_next_id(&mut id),
-                i.to_string().as_bytes().into(),
-                OpType::Write(i.to_string().as_bytes().into()),
-            );
-            m.insert(op);
+
+        let ops_to_insert = vec![
+            (3, OpType::Write(3.to_string().as_bytes().into())),
+            (2, OpType::Write(2.to_string().as_bytes().into())),
+            (1, OpType::Write(1.to_string().as_bytes().into())),
+            (4, OpType::Write(4.to_string().as_bytes().into())),
+            (0, OpType::Write(0.to_string().as_bytes().into())),
+        ];
+
+        let mut expected_iter_data: Vec<(String, OpId, OpType)> = Vec::new();
+
+        for (key_val, op_type) in ops_to_insert {
+            let op_id = get_next_id(&mut id);
+            let op = KVOpertion::new(op_id, key_val.to_string().as_bytes().into(), op_type);
+            expected_iter_data.push((key_val.to_string(), op_id, op.op.clone()));
+            m.insert(op).unwrap();
         }
+
         // delete 2
+        let op_id_delete_2 = get_next_id(&mut id);
         let op = KVOpertion::new(
-            get_next_id(&mut id),
+            op_id_delete_2,
             2.to_string().as_bytes().into(),
             OpType::Delete,
         );
-        m.insert(op);
+        expected_iter_data.push((2.to_string(), op_id_delete_2, op.op.clone()));
+        m.insert(op).unwrap();
+
         // overwirte 3 to 100
+        let op_id_overwrite_3 = get_next_id(&mut id);
         let op = KVOpertion::new(
-            get_next_id(&mut id),
+            op_id_overwrite_3,
             3.to_string().as_bytes().into(),
             OpType::Write(100.to_string().as_bytes().into()),
         );
-        m.insert(op);
-        // do iter and check
-        let mut iter = m.to_iter();
-        let mut keys = Vec::new();
-        let mut ops = Vec::new();
-        let mut values = Vec::new();
-        let mut ids = Vec::new();
-        for i in iter {
-            keys.push(i.0);
-            ids.push(i.1.op_id);
-            let op = &i.1.op;
-            let v = match op {
-                OpType::Write(v) => Some((v).to_string().into_bytes()),
-                OpType::Delete => None,
-            };
-            values.push(v);
-            ops.push(&i.1.op);
+        expected_iter_data.push((3.to_string(), op_id_overwrite_3, op.op.clone()));
+        m.insert(op).unwrap();
+
+        // Sort expected data by (key, op_id) to match SkipMap iteration order
+        expected_iter_data.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut actual_iter_data: Vec<(String, OpId, OpType)> = Vec::new();
+        for entry in m.to_iter() {
+            let (key_vec, op_id) = entry.key();
+            let op_type = entry.value();
+            actual_iter_data.push((key_vec.to_string(), *op_id, op_type.clone()));
         }
-        // Convert KeySlice to String for comparison
-        let keys_as_strings: Vec<String> = keys.into_iter().map(|k| k.to_string()).collect();
-        assert_eq!(keys_as_strings, ["0", "1", "2", "2", "3", "3", "4"]);
-        assert_eq!(ids, [4, 2, 1, 5, 0, 6, 3]);
-        // Convert  value from u8 to String for comparison
-        let values_as_string: Vec<Option<String>> = values
-            .into_iter()
-            .map(|k| k.map(|v| String::from_utf8_lossy(&v).into_owned()))
-            .collect();
-        // assert_eq!(
-        // values_as_string,
-        // [Some(0), Some(1), Some(2), None, Some(3), Some(100), Some(4)]
-        // );
+
+        assert_eq!(actual_iter_data.len(), expected_iter_data.len());
+        for (actual, expected) in actual_iter_data.iter().zip(expected_iter_data.iter()) {
+            assert_eq!(actual.0, expected.0, "Key mismatch");
+            assert_eq!(actual.1, expected.1, "OpId mismatch for key {}", actual.0);
+            match (&actual.2, &expected.2) {
+                (OpType::Write(v1), OpType::Write(v2)) => {
+                    assert_eq!(v1, v2, "Value mismatch for key {}", actual.0)
+                }
+                (OpType::Delete, OpType::Delete) => {}
+                _ => panic!("OpType mismatch for key {}", actual.0),
+            }
+        }
     }
 }

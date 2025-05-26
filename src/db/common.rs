@@ -159,6 +159,14 @@ pub enum OpTypeRef<'a> {
     Write(ValueSlice<'a>),
     Delete,
 }
+impl<'a> OpTypeRef<'a> {
+    pub fn from_op_type(op: &'a OpType) -> Self {
+        match op {
+            OpType::Write(v) => OpTypeRef::Write(v.as_ref().into()),
+            OpType::Delete => OpTypeRef::Delete,
+        }
+    }
+}
 
 pub struct KViterAgg<'a> {
     iters: Vec<&'a mut dyn Iterator<Item = &'a KVOpertion>>,
