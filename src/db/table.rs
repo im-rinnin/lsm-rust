@@ -72,109 +72,159 @@ pub struct TableReader<T: Store> {
 }
 // for level 0,must consider multiple key with diff value/or delete
 impl<T: Store> TableReader<T> {
-    fn new(mut store: T) -> Self {
-        unimplemented!()
+    pub fn new(mut store: T) -> Self {
+        let store_len = store.len();
+        let mut buffer_for_meta_pointers = [0u8; 16]; // Buffer for offset and count (2 * u64)
+
+        // Read block_meta_offset and block_meta_count from the end of the store
+        store.read_at(&mut buffer_for_meta_pointers, store_len - 16);
+        let mut cursor = Cursor::new(buffer_for_meta_pointers);
+
+        let block_meta_start_offset = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+        let block_meta_count = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+
+        // Read all block metas
+        let block_metas_data_len = store_len - block_meta_start_offset - 16;
+        let mut block_metas_buffer = vec![0; block_metas_data_len];
+        store.read_at(&mut block_metas_buffer, block_meta_start_offset);
+
+        let mut block_metas_cursor = Cursor::new(block_metas_buffer);
+        let mut block_metas = Vec::with_capacity(block_meta_count);
+
+        for _ in 0..block_meta_count {
+            block_metas.push(BlockMeta::decode(&mut block_metas_cursor));
+        }
+
+        TableReader { store, block_metas }
     }
-    fn to_iter(&self) -> TableIter<T> {
+    pub fn to_iter(&self) -> TableIter<T> {
         TableIter::new(self)
     }
+    pub fn take(self) -> T {
+        self.store
+    }
 
-    fn find(&self, key: KeySlice, id: OpId) -> Option<OpType> {
-        unimplemented!()
-        //     // check table last_key return none if key is greater
-        //     let table_meta = self.read_table_meta();
-        //     if table_meta.last_key.as_ref().lt(key.as_ref()) {
-        //         return None;
-        //     }
-        //     let metas = self.read_block_meta(&table_meta);
-        //     // find block which is the first block whose last_key is greater or eq key
-        //     for (i, meta) in metas.iter().enumerate() {
-        //         if meta.last_key.as_ref().ge(key.as_ref()) {
-        //             let mut buffer = new_buffer(DATA_BLOCK_SIZE);
-        //             let mut v = buffer.get_mut().as_mut_slice();
-        //             // Read the block data
-        //             self.store.read_at(&mut v, DATA_BLOCK_SIZE * i);
-        //             // Create an iterator for the block and search within it
-        //             let mut block_iter = BlockIter::new(buffer, meta.count as usize);
-        //             let res = block_iter.search(key, id);
-        //             return res;
-        //         }
-        //     }
-        //     None
+    pub fn find(&self, key: &KeySlice, id: OpId) -> Option<OpType> {
+        if self.block_metas.is_empty() {
+            return None; // Table is empty, key cannot be found
+        }
+
+        // Check if the key is less than the first key of the first block.
+        // If so, the key cannot be in this table.
+        if let Some(first_meta) = self.block_metas.first() {
+            if key.as_ref().lt(first_meta.first_key.as_ref()) {
+                return None;
+            }
+        }
+        // This branch should ideally not be reached if block_metas.is_empty() is checked first,
+
+        // Check if the key is greater than the last key of the last block.
+        // If so, the key cannot be in this table.
+        if let Some(last_meta) = self.block_metas.last() {
+            if key.as_ref().gt(last_meta.last_key.as_ref()) {
+                return None;
+            }
+        }
+
+        let mut best_op: Option<(OpType, OpId)> = None;
+
+        // Find the index of the first block whose first_key is <= search key.
+        // `partition_point` returns the index of the first element for which the predicate is false.
+        // So, `idx` will be the first index where `meta.first_key > key`.
+        // We want to start from the block *before* that, if it exists.
+        let start_idx = self
+            .block_metas
+            .partition_point(|meta| meta.first_key.as_ref().le(key.as_ref()))
+            .saturating_sub(1); // saturating_sub(1) handles the case where partition_point returns 0
+
+        // Iterate through blocks from the determined starting point.
+        for i in start_idx..self.block_metas.len() {
+            let block_meta = &self.block_metas[i];
+
+            // Optimization: If the current block's first key is already greater than the search key,
+            // then the key cannot be in this block or any subsequent blocks (since block_metas are sorted by first_key).
+            if key.as_ref().lt(block_meta.first_key.as_ref()) {
+                break;
+            }
+
+            // Optimization: If the search key is greater than the last key of the current block,
+            // then the key cannot be in this block. Continue to the next.
+            if key.as_ref().gt(block_meta.last_key.as_ref()) {
+                continue;
+            }
+
+            // If we reach here, the block's key range [first_key, last_key] potentially contains the search key.
+            let offset = i * DATA_BLOCK_SIZE;
+            let mut block_buffer_data = vec![0; DATA_BLOCK_SIZE];
+            self.store.read_at(&mut block_buffer_data, offset);
+            let block_reader = BlockReader::new(block_buffer_data);
+
+            if let Some((op_type_ref, op_id_found)) = block_reader.search(&key, id) {
+                let current_op_type = match op_type_ref {
+                    OpTypeRef::Write(v) => OpType::Write(KeyVec::from(v.as_ref())),
+                    OpTypeRef::Delete => OpType::Delete,
+                };
+                match best_op {
+                    Some((_, current_best_id)) => {
+                        if op_id_found > current_best_id {
+                            best_op = Some((current_op_type, op_id_found));
+                        }
+                    }
+                    None => {
+                        best_op = Some((current_op_type, op_id_found));
+                    }
+                }
+            }
+        }
+
+        best_op.map(|(op_type, _)| op_type)
     }
 }
-struct TableIter<'a, T: Store> {
+pub struct TableIter<'a, T: Store> {
     table: &'a TableReader<T>,
+    current_block_num: usize,
 }
 impl<'a, T: Store> TableIter<'a, T> {
-    fn new(table: &'a TableReader<T>) -> Self {
-        unimplemented!()
-        // let table_meta = table.read_table_meta();
-        // let metas = table.read_block_meta(&table_meta);
-        // TableIter {
-        //     table,
-        //     table_meta,
-        //     current_block_num: 0,
-        // }
+    pub fn new(table: &'a TableReader<T>) -> Self {
+        TableIter {
+            table,
+            current_block_num: 0,
+        }
     }
 }
 impl<'a, T: Store> Iterator for TableIter<'a, T> {
-    type Item = BlockReader; // The iterator yields SStableBlock
+    type Item = BlockReader;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unimplemented!()
+        // Check if we have processed all data blocks according to the table metadata
+        if self.current_block_num >= self.table.block_metas.len() {
+            return None; // Iteration finished
+        }
+
+        // Calculate the file offset for the current data block
+        let offset = self.current_block_num * DATA_BLOCK_SIZE;
+
+        // Create a new buffer for this block's data
+        let mut block_buffer_data = vec![0; DATA_BLOCK_SIZE];
+
+        // Read exactly DATA_BLOCK_SIZE bytes from the store into the new buffer's Vec
+        self.table.store.read_at(&mut block_buffer_data, offset);
+
+        // Increment the block number for the *next* call to next()
+        self.current_block_num += 1;
+
+        // Return the BlockReader
+        Some(BlockReader::new(block_buffer_data))
     }
-    // fn next(&mut self) -> Option<Self::Item> {
-    //     // Check if we have processed all data blocks according to the table metadata
-    //     if self.current_block_num >= self.table_meta.data_block_count as usize {
-    //         return None; // Iteration finished
-    //     }
-    //
-    //     // Calculate the file offset for the current data block
-    //     let offset = self.current_block_num * DATA_BLOCK_SIZE;
-    //
-    //     // Create a new buffer for this block's data
-    //     let mut block_buffer = new_buffer(DATA_BLOCK_SIZE);
-    //
-    //     // Read exactly DATA_BLOCK_SIZE bytes from the store into the new buffer's Vec
-    //     self.table.store.read_at(block_buffer.get_mut(), offset);
-    //
-    //     // Reset the buffer's position so the consumer can read from the start
-    //     block_buffer.set_position(0);
-    //
-    //     // Get the metadata for the current block
-    //     let block_meta = self.block_metas[self.current_block_num].clone(); // Assuming DataBlockMeta is Clone
-    //
-    //     // Create a BlockIter to read KVOpertions from the buffer
-    //     let block_iter = BlockIter::new(block_buffer, block_meta.count); // Pass ownership
-    //
-    //     // Collect all KVOpertions into a Vec
-    //     let data: Vec<KVOpertion> = block_iter.collect();
-    //
-    //     // Increment the block number for the *next* call to next()
-    //     self.current_block_num += 1;
-    //
-    //     // Return the SStableBlock containing the data and metadata
-    //     Some(SStableBlock {
-    //         data,
-    //         meta: block_meta,
-    //     })
-    // }
 }
 
-fn block_data_start_offset(block_count: usize) -> usize {
-    block_count * DATA_BLOCK_SIZE
-}
-
-fn next_block_start_postion(current_postion: usize) -> usize {
-    (current_postion / DATA_BLOCK_SIZE + 1) * DATA_BLOCK_SIZE
-}
-
+use crate::db::block::BlockBuilder;
 struct TableBuilder<T: Store> {
     store: T,
     block_metas: Vec<BlockMeta>,
     block_num_limit: usize,
-    buffer: Buffer,
+    current_block_first_key: Option<KeyVec>,
+    block_builder: BlockBuilder,
 }
 impl<T: Store> TableBuilder<T> {
     pub fn new_with_block_count(store: T, block_count: usize) -> Self {
@@ -182,43 +232,134 @@ impl<T: Store> TableBuilder<T> {
             store,
             block_metas: Vec::new(),
             block_num_limit: block_count,
-            buffer: new_buffer(DATA_BLOCK_SIZE),
+            current_block_first_key: None,
+            block_builder: BlockBuilder::new(),
         }
     }
     pub fn new(store: T) -> Self {
-        TableBuilder {
-            store,
-            block_metas: Vec::new(),
-            block_num_limit: BLOCK_COUNT_LIMIT,
-            buffer: new_buffer(DATA_BLOCK_SIZE),
-        }
+        Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
     }
 
-    // implement add ai
     pub fn add(&mut self, op: KVOpertionRef) -> bool {
-        // add op to current buffer
-        // if buffer add fail write buffer  content to store
-        // if block_num_limit return false
-        // create new buffer add op to it
-        unimplemented!()
+        // If the current block is empty, this operation's key is the first key of the block.
+        if self.block_builder.is_empty() {
+            self.current_block_first_key = Some(op.key.as_ref().into());
+        }
+
+        // Try to add the operation to the current block builder.
+        if !self.block_builder.add(&op) {
+            // If adding fails, the current block is full. Flush it.
+            let last_key = self
+                .block_builder
+                .last_key()
+                .expect("Block should have a last key if it's full and add failed");
+            self.flush_current_block(last_key);
+
+            // Check if we've reached the overall block limit for the table.
+            if self.block_metas.len() >= self.block_num_limit {
+                return false; // Cannot add more blocks to this table.
+            }
+
+            // Create a new block builder and add the operation to it.
+            self.block_builder = BlockBuilder::new();
+            self.current_block_first_key = Some(op.key.as_ref().into());
+            self.block_builder.add(&op); // This add should succeed as it's a new empty block.
+        }
+        true
     }
+
+    fn flush_current_block(&mut self, last_key: KeyVec) {
+        if self.block_builder.is_empty() {
+            return; // Nothing to flush
+        }
+
+        let first_key = self
+            .current_block_first_key
+            .take()
+            .expect("First key must be set when flushing a non-empty block");
+
+        self.block_builder.finish().expect("block finishi error");
+        let block_buffer = self.block_builder.get_ref();
+
+        // Append the block data to the store
+        self.store.append(block_buffer);
+
+        // Add block metadata
+        self.block_metas.push(BlockMeta {
+            first_key,
+            last_key,
+        });
+        self.block_builder.reset();
+
+        // Reset the buffer for the next block (already done if `add` created a new one)
+        // or prepare for the next operation if this was the last flush.
+    }
+
     pub fn flush(mut self) -> TableReader<T> {
-        unimplemented!()
+        // Flush any remaining data in the current buffer
+        if !self.block_builder.is_empty() {
+            let last_key = self
+                .block_builder
+                .last_key()
+                .expect("Block should have a last key if it's not empty");
+            self.flush_current_block(last_key);
+        }
+
+        // Calculate the offset where block metadata will start
+        let block_meta_start_offset = self.store.len();
+
+        // Encode and append all block metadata to the store
+        let block_meta_count = self.block_metas.len() as u64;
+        let mut temp_buffer = new_buffer(1024); // Use a temporary buffer for encoding each meta
+        for meta in &self.block_metas {
+            meta.encode(&mut temp_buffer);
+        }
+
+        temp_buffer.seek(std::io::SeekFrom::End(16));
+
+        temp_buffer
+            .write_u64::<LittleEndian>(block_meta_start_offset as u64)
+            .unwrap();
+        temp_buffer
+            .write_u64::<LittleEndian>(block_meta_count)
+            .unwrap();
+        self.store.append(temp_buffer.get_ref());
+
+        // Flush the store to ensure all data is written to disk
+        self.store.flush();
+
+        // Create and return a TableReader
+        TableReader {
+            store: self.store,
+            block_metas: self.block_metas,
+        }
     }
     pub fn fill_with_op<'a, IT: Iterator<Item = &'a KVOpertion>>(&mut self, it: IT) {
         let op_ref_iter = it.map(|op| KVOpertionRef::from_op(op));
         self.fill_with_op_ref(op_ref_iter);
     }
     pub fn fill_with_op_ref<'a, IT: Iterator<Item = KVOpertionRef<'a>>>(&mut self, it: IT) {
-        unimplemented!()
+        for op_ref in it {
+            if !self.add(op_ref) {
+                // If add returns false, it means the table is full (block_num_limit reached)
+                // and we cannot add more operations.
+                break;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 pub mod test {
     use bincode::serialize_into;
+    use byteorder::LittleEndian;
+    use byteorder::WriteBytesExt;
 
+    use super::BlockBuilder;
+    use super::BlockMeta;
     use super::{TableBuilder, DATA_BLOCK_SIZE};
+    use crate::db::key::KeySlice;
+    use crate::db::key::KeyVec;
     use core::panic;
     use std::{
         hash::BuildHasher, io::Cursor, iter::Peekable, ops::Range, os::unix::fs::MetadataExt,
@@ -228,7 +369,7 @@ pub mod test {
     use super::super::block::test::pad_zero;
     use crate::db::{
         block::{test::create_kv_data_with_range, BlockIter},
-        common::{KVOpertion, OpType},
+        common::{new_buffer, KVOpertion, OpType},
         store::{Memstore, Store},
     };
 
@@ -267,6 +408,44 @@ pub mod test {
                 OpType::Write("valueC".as_bytes().into()),
             ),
         ]
+    }
+
+    #[test]
+    fn test_table_reader_new() {
+        let num_kvs = 1000;
+        let kvs = create_kv_data_in_range_zero_to(num_kvs);
+
+        let id = "test_table_reader_new_store".to_string();
+        let store = Memstore::new(&id);
+        let mut table_builder = TableBuilder::new(store);
+
+        table_builder.fill_with_op(kvs.iter());
+        let table_reader = table_builder.flush();
+        let store = table_reader.take();
+        let table_reader = TableReader::new(store);
+
+        // Verify that keys can be found in the new table reader
+        for i in 0..num_kvs {
+            let key_str = pad_zero(i as u64);
+            let key_slice = &KeySlice::from(key_str.as_bytes());
+            let result = table_reader.find(key_slice, i as u64);
+            assert_eq!(
+                result,
+                Some(OpType::Write(i.to_string().as_bytes().into())),
+                "Should find key '{}'",
+                i
+            );
+        }
+
+        // Test a key that should not be found (outside the range)
+        let key_not_found_str = pad_zero(num_kvs as u64);
+        let key_not_found_slice = &KeySlice::from(key_not_found_str.as_bytes());
+        let result_not_found = table_reader.find(key_not_found_slice, num_kvs as u64);
+        assert!(
+            result_not_found.is_none(),
+            "Should not find key '{}'",
+            num_kvs
+        );
     }
 
     #[test]
@@ -380,55 +559,122 @@ pub mod test {
         let lasy_key_string = lasy_key.to_string();
         assert_eq!(kv_index, lasy_key_string.parse::<usize>().unwrap() + 1);
     }
-    // #[test]
-    // fn text_next_block_position() {
-    //     assert_eq!(next_block_start_postion(1), DATA_BLOCK_SIZE);
-    //     assert_eq!(
-    //         next_block_start_postion(DATA_BLOCK_SIZE + 10),
-    //         (DATA_BLOCK_SIZE * 2)
-    //     );
-    //     assert_eq!(
-    //         next_block_start_postion(5 * DATA_BLOCK_SIZE + 10),
-    //         (DATA_BLOCK_SIZE * 6)
-    //     );
-    // }
 
     #[test]
-    fn test_table_reader() {
+    fn test_table_reader_find_with_duplicate_key() {
+        // Create initial kv data list [0..10)
+        let mut kvs = create_kv_data_in_range_zero_to(10);
+
+        // Add duplicate key KVs for key "000005" with different OpIds and values
+        let key_to_duplicate = pad_zero(5);
+
+        // Version 1: id 5 (original from create_kv_data_in_range_zero_to)
+        // Version 2: id 15, value "duplicate_15"
+        kvs.push(KVOpertion::new(
+            15,
+            key_to_duplicate.as_bytes().into(),
+            OpType::Write("duplicate_15".as_bytes().into()),
+        ));
+
+        // Version 3: id 11, value "duplicate_11"
+        kvs.push(KVOpertion::new(
+            11,
+            key_to_duplicate.as_bytes().into(),
+            OpType::Write("duplicate_11".as_bytes().into()),
+        ));
+
+        // Sort kvs by key, then by OpId (important for block building and search logic)
+        kvs.sort_by(|a, b| {
+            if a.key == b.key {
+                a.id.cmp(&b.id)
+            } else {
+                a.key.cmp(&b.key)
+            }
+        });
+
+        let id = "test_table_reader_find_duplicate_store".to_string();
+        let store = Memstore::new(&id);
+        let mut tb = TableBuilder::new(store);
+        tb.fill_with_op(kvs.iter());
+        let table_reader = tb.flush();
+
+        // Search for the duplicated key with an OpId that should pick the latest version (id 15)
+        let search_key = KeySlice::from(key_to_duplicate.as_bytes());
+        let search_op_id = 20; // An OpId higher than all versions
+
+        let result = table_reader.find(&search_key, search_op_id);
+
+        // Assert that the latest version ("duplicate_15") is found
+        assert_eq!(
+            result,
+            Some(OpType::Write("duplicate_15".as_bytes().into())),
+            "Should find the latest version of the duplicate key"
+        );
+
+        // Search for the duplicated key with an OpId that should pick the middle version (id 11)
+        let search_op_id_middle = 12; // An OpId between 5 and 15, but higher than 11
+        let result_middle = table_reader.find(&search_key, search_op_id_middle);
+        assert_eq!(
+            result_middle,
+            Some(OpType::Write("duplicate_11".as_bytes().into())),
+            "Should find the middle version of the duplicate key"
+        );
+
+        // Search for the duplicated key with an OpId that should pick the original version (id 5)
+        let search_op_id_original = 5; // An OpId equal to the original version
+        let result_original = table_reader.find(&search_key, search_op_id_original);
+        assert_eq!(
+            result_original,
+            Some(OpType::Write(5.to_string().as_bytes().into())),
+            "Should find the original version of the duplicate key"
+        );
+
+        // Test a key that was not duplicated
+        let key_non_duplicate = pad_zero(1);
+        let search_key_non_duplicate = KeySlice::from(key_non_duplicate.as_bytes());
+        let result_non_duplicate = table_reader.find(&search_key_non_duplicate, 100);
+        assert_eq!(
+            result_non_duplicate,
+            Some(OpType::Write(1.to_string().as_bytes().into())),
+            "Should find the non-duplicated key"
+        );
+    }
+    #[test]
+    fn test_table_reader_find() {
         let len = 100;
         let table = create_test_table_with_size(len);
 
         for i in 0..len {
             let res = table
-                .find(pad_zero(i as u64).as_bytes().into(), i as u64)
+                .find(&KeySlice::from(pad_zero(i as u64).as_bytes()), i as u64)
                 .expect(&format!("{} should in table", i));
             assert_eq!(res, OpType::Write(i.to_string().as_bytes().into()));
         }
 
-        let res = table.find("100".as_bytes().into(), 0);
+        let res = table.find(&KeySlice::from("100".as_bytes()), 0);
         assert!(res.is_none());
 
         // Test finding key at the beginning of the range
         let res_start = table
-            .find(pad_zero(0 as u64).as_bytes().into(), 0 as u64)
+            .find(&KeySlice::from(pad_zero(0 as u64).as_bytes()), 0 as u64)
             .expect("0 should in table");
         assert_eq!(res_start, OpType::Write(0.to_string().as_bytes().into()));
 
         // Test finding key at the end of the range
         let res_end = table
-            .find(pad_zero(99 as u64).as_bytes().into(), 99 as u64)
+            .find(&KeySlice::from(pad_zero(99 as u64).as_bytes()), 99 as u64)
             .expect("99 should in table");
         assert_eq!(res_end, OpType::Write(99.to_string().as_bytes().into()));
 
         // Test finding key in the middle of the range
         let res_middle = table
-            .find(pad_zero(50 as u64).as_bytes().into(), 50 as u64)
+            .find(&KeySlice::from(pad_zero(50 as u64).as_bytes()), 50 as u64)
             .expect("50 should in table");
         assert_eq!(res_middle, OpType::Write(50.to_string().as_bytes().into()));
 
         // Test searching for a key with a higher OpId (should still find the existing one)
         let res_higher_id = table
-            .find(pad_zero(10 as u64).as_bytes().into(), 100 as u64) // Use a higher ID
+            .find(&KeySlice::from(pad_zero(10 as u64).as_bytes()), 100 as u64) // Use a higher ID
             .expect("10 should still be in table with higher ID");
         assert_eq!(
             res_higher_id,
@@ -436,7 +682,7 @@ pub mod test {
         );
 
         // Test searching for a key below the range
-        let res_below = table.find("-1".as_bytes().into(), 0);
+        let res_below = table.find(&KeySlice::from("-1".as_bytes()), 0);
         assert!(res_below.is_none());
     }
 

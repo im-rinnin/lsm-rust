@@ -145,6 +145,12 @@ impl BlockBuilder {
         self.buffer.position() == 0
     }
 
+    pub fn reset(&mut self) {
+        self.last_key_positon = None;
+        self.count = 0;
+        self.buffer.set_position(0);
+    }
+
     pub fn add(&mut self, op: &KVOpertionRef) -> bool {
         let op_size = op.encode_size();
         // Check if adding the current operation would exceed the block size limit,
@@ -159,23 +165,26 @@ impl BlockBuilder {
         true
     }
 
-    pub fn take(&self) -> &[u8] {
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buffer.into_inner()
+    }
+    pub fn get_ref(&self) -> &[u8] {
         self.buffer.get_ref().as_ref()
     }
-    pub fn finish(mut self) -> Result<Buffer> {
+    pub fn finish(&mut self) -> Result<&[u8]> {
         // Write count to the last 8 bytes of the block.
         // The total size of the block is DATA_BLOCK_SIZE.
         let count_pos = DATA_BLOCK_SIZE - std::mem::size_of::<u64>();
         self.buffer.set_position(count_pos as u64);
         self.buffer.write_u64::<LittleEndian>(self.count)?;
 
-        Ok(self.buffer)
+        Ok(self.buffer.get_ref().as_ref())
     }
 
     pub fn fill<'a, T: Iterator<Item = &'a KVOpertion>>(
-        mut self,
+        &mut self,
         it: &mut Peekable<T>,
-    ) -> Result<Buffer> {
+    ) -> Result<&[u8]> {
         // Iterate through the peekable iterator and fill the block until it's full or the iterator is exhausted.
         // get first key by peek() if pit is empty return error with message "at least one kv"
         let first_kv = it
@@ -280,9 +289,9 @@ pub mod test {
     ) -> BlockReader {
         let mut kv_iter = kvs.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
-        let block_builder = BlockBuilder::new();
-        let buffer = block_builder.fill(&mut kv_iter_agg).expect("fill error");
-        BlockReader::new(buffer.into_inner())
+        let mut block_builder = BlockBuilder::new();
+        block_builder.fill(&mut kv_iter_agg).expect("fill error");
+        BlockReader::new(block_builder.into_inner())
     }
     pub fn create_kv_data_in_range_zero_to(size: usize) -> Vec<KVOpertion> {
         create_kv_data_with_range(0..size)
@@ -382,13 +391,9 @@ pub mod test {
         let count = kvs.len();
 
         // Build buffer
-        let block_builder = BlockBuilder::new();
-        let block_reader = BlockReader::new(
-            block_builder
-                .fill(&mut kvs.iter().peekable())
-                .unwrap()
-                .into_inner(),
-        );
+        let mut block_builder = BlockBuilder::new();
+        block_builder.fill(&mut kvs.iter().peekable()).unwrap();
+        let block_reader = BlockReader::new(block_builder.into_inner());
 
         // Check search result for key "5" with a high enough op_id
         let f = 5.to_string();
@@ -475,8 +480,9 @@ pub mod test {
         let iter = create_kv_data_in_range_zero_to(100);
         let mut kv_iter = iter.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
-        let block_builder = BlockBuilder::new();
-        let br = BlockReader::new(block_builder.fill(&mut kv_iter_agg).unwrap().into_inner());
+        let mut block_builder = BlockBuilder::new();
+        block_builder.fill(&mut kv_iter_agg).unwrap();
+        let br = BlockReader::new(block_builder.into_inner());
         let block_iter = br.to_iter(); // Pass ownership
         let mut count = 0;
         for (i, kv) in block_iter.enumerate() {
@@ -496,8 +502,8 @@ pub mod test {
             builder.add(&KVOpertionRef::from_op(&kv));
         }
 
-        let buffer = builder.finish().expect("Failed to finish block");
-        let block_reader = BlockReader::new(buffer.into_inner());
+        builder.finish().expect("Failed to finish block");
+        let block_reader = BlockReader::new(builder.into_inner());
 
         // Verify count
         assert_eq!(block_reader.count(), num_kvs, "BlockReader count mismatch");
@@ -529,11 +535,11 @@ pub mod test {
         // Build a block from these KVs
         let mut kv_iter = kvs.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
-        let block_builder = BlockBuilder::new();
-        let buffer = block_builder
+        let mut block_builder = BlockBuilder::new();
+        block_builder
             .fill(&mut kv_iter_agg)
             .expect("Failed to build block");
-        let block_data = buffer.into_inner();
+        let block_data = block_builder.into_inner();
 
         // Create a BlockReader from the raw block data
         let block_reader = BlockReader::new(block_data);
@@ -555,7 +561,7 @@ pub mod test {
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
 
         // Build a block with the empty iterator - should result in an error
-        let block_builder = BlockBuilder::new();
+        let mut block_builder = BlockBuilder::new();
         let result = block_builder.fill(&mut kv_iter_agg);
 
         // Assert that the result is an error and contains the expected message
@@ -575,8 +581,9 @@ pub mod test {
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
 
         // Build a block with the oversized data
-        let block_builder = BlockBuilder::new();
-        let br = BlockReader::new(block_builder.fill(&mut kv_iter_agg).unwrap().into_inner());
+        let mut block_builder = BlockBuilder::new();
+        block_builder.fill(&mut kv_iter_agg).unwrap();
+        let br = BlockReader::new(block_builder.into_inner());
 
         // Verify that not all items were consumed (some remained in the iterator)
         assert!(
@@ -609,22 +616,49 @@ pub mod test {
         let mut builder = BlockBuilder::new();
 
         // Initially, last_key should be None
-        assert!(builder.last_key().is_none(), "last_key should be None for an empty builder");
+        assert!(
+            builder.last_key().is_none(),
+            "last_key should be None for an empty builder"
+        );
 
         // Add first KV
-        let kv1 = KVOpertion::new(1, "key1".as_bytes().into(), OpType::Write("value1".as_bytes().into()));
+        let kv1 = KVOpertion::new(
+            1,
+            "key1".as_bytes().into(),
+            OpType::Write("value1".as_bytes().into()),
+        );
         builder.add(&KVOpertionRef::from_op(&kv1));
-        assert_eq!(builder.last_key().unwrap().as_ref(), "key1".as_bytes(), "last_key should be 'key1'");
+        assert_eq!(
+            builder.last_key().unwrap().as_ref(),
+            "key1".as_bytes(),
+            "last_key should be 'key1'"
+        );
 
         // Add second KV
-        let kv2 = KVOpertion::new(2, "key2".as_bytes().into(), OpType::Write("value2".as_bytes().into()));
+        let kv2 = KVOpertion::new(
+            2,
+            "key2".as_bytes().into(),
+            OpType::Write("value2".as_bytes().into()),
+        );
         builder.add(&KVOpertionRef::from_op(&kv2));
-        assert_eq!(builder.last_key().unwrap().as_ref(), "key2".as_bytes(), "last_key should be 'key2'");
+        assert_eq!(
+            builder.last_key().unwrap().as_ref(),
+            "key2".as_bytes(),
+            "last_key should be 'key2'"
+        );
 
         // Add third KV
-        let kv3 = KVOpertion::new(3, "key3".as_bytes().into(), OpType::Write("value3".as_bytes().into()));
+        let kv3 = KVOpertion::new(
+            3,
+            "key3".as_bytes().into(),
+            OpType::Write("value3".as_bytes().into()),
+        );
         builder.add(&KVOpertionRef::from_op(&kv3));
-        assert_eq!(builder.last_key().unwrap().as_ref(), "key3".as_bytes(), "last_key should be 'key3'");
+        assert_eq!(
+            builder.last_key().unwrap().as_ref(),
+            "key3".as_bytes(),
+            "last_key should be 'key3'"
+        );
 
         // Test with a block that becomes full
         let mut full_builder = BlockBuilder::new();
@@ -643,7 +677,72 @@ pub mod test {
             }
             last_added_key = Some(kv_op.key);
         }
-        assert_eq!(full_builder.last_key().unwrap().as_ref(), last_added_key.unwrap().as_ref(), "last_key should be the last key added before full");
+        assert_eq!(
+            full_builder.last_key().unwrap().as_ref(),
+            last_added_key.unwrap().as_ref(),
+            "last_key should be the last key added before full"
+        );
+    }
+
+    #[test]
+    fn test_block_builder_reset() {
+        let mut builder = BlockBuilder::new();
+
+        // Add some data to the builder
+        let kv1 = KVOpertion::new(
+            1,
+            "key1".as_bytes().into(),
+            OpType::Write("value1".as_bytes().into()),
+        );
+        builder.add(&KVOpertionRef::from_op(&kv1));
+
+        // Verify state before reset
+        assert!(
+            !builder.is_empty(),
+            "Builder should not be empty before reset"
+        );
+        assert_eq!(builder.count, 1, "Count should be 1 before reset");
+        assert!(
+            builder.last_key().is_some(),
+            "last_key should be Some before reset"
+        );
+        assert!(
+            builder.buffer.position() > 0,
+            "Buffer position should be greater than 0 before reset"
+        );
+
+        // Call reset
+        builder.reset();
+
+        // Verify state after reset
+        assert!(builder.is_empty(), "Builder should be empty after reset");
+        assert_eq!(builder.count, 0, "Count should be 0 after reset");
+        assert!(
+            builder.last_key().is_none(),
+            "last_key should be None after reset"
+        );
+        assert_eq!(
+            builder.buffer.position(),
+            0,
+            "Buffer position should be 0 after reset"
+        );
+
+        // Try adding data again to ensure it's usable
+        let kv2 = KVOpertion::new(
+            2,
+            "key2".as_bytes().into(),
+            OpType::Write("value2".as_bytes().into()),
+        );
+        assert!(
+            builder.add(&KVOpertionRef::from_op(&kv2)),
+            "Should be able to add after reset"
+        );
+        assert_eq!(builder.count, 1, "Count should be 1 after adding again");
+        assert_eq!(
+            builder.last_key().unwrap().as_ref(),
+            "key2".as_bytes(),
+            "last_key should be 'key2' after adding again"
+        );
     }
 
     #[test]
@@ -681,8 +780,8 @@ pub mod test {
         );
 
         // Finish the block and verify its properties
-        let buffer = builder.finish().expect("Failed to finish block");
-        let block_reader = BlockReader::new(buffer.into_inner());
+        builder.finish().expect("Failed to finish block");
+        let block_reader = BlockReader::new(builder.into_inner());
 
         assert_eq!(
             block_reader.count(),
