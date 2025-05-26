@@ -1,6 +1,5 @@
 use std::fmt::Result;
 
-use super::common::OpTypeRef;
 use super::key::KeyVec;
 use super::{KVOpertion, KeyQuery, OpId, OpType};
 use crate::db::key::KeySlice;
@@ -10,6 +9,8 @@ use crossbeam_skiplist::SkipMap;
 pub struct Memtable {
     table: SkipMap<(KeyVec, OpId), OpType>,
     max_op_id: Option<OpId>,
+    capacity_bytes: usize,
+    current_size_bytes: usize,
 }
 
 pub struct MemtableIterator<'a> {
@@ -17,19 +18,18 @@ pub struct MemtableIterator<'a> {
 }
 
 impl Memtable {
-    fn new() -> Self {
+    pub fn new(capacity_bytes: usize) -> Self {
         Memtable {
             table: SkipMap::new(),
             max_op_id: None,
+            capacity_bytes,
+            current_size_bytes: 0,
         }
     }
 
     pub fn get<'a>(&'a self, q: KeyQuery) -> Option<(OpId, KeyVec)> {
-        let key_for_range_start = q.key.clone();
-        let key_for_range_end = q.key.clone();
-
-        let range_start_bound = (key_for_range_start, 0);
-        let range_end_bound = (key_for_range_end, q.op_id + 1);
+        let range_start_bound = (q.key.clone(), 0);
+        let range_end_bound = (q.key.clone(), q.op_id + 1);
 
         for entry in self.table.range(range_start_bound..range_end_bound).rev() {
             let (_entry_key, entry_op_id) = entry.key();
@@ -54,9 +54,11 @@ impl Memtable {
             }
         }
 
+        let op_size = op.encode_size();
         let op_id = op.id;
         self.table.insert((op.key, op.id), op.op);
         self.max_op_id = Some(op_id);
+        self.current_size_bytes += op_size;
         Ok(())
     }
 
@@ -68,6 +70,14 @@ impl Memtable {
         MemtableIterator {
             inner_iter: self.table.iter(),
         }
+    }
+
+    pub fn estimated_size_bytes(&self) -> usize {
+        self.current_size_bytes
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.current_size_bytes >= self.capacity_bytes
     }
 }
 
@@ -92,9 +102,11 @@ mod test {
 
     use super::Memtable;
 
+    const TEST_MEMTABLE_CAPACITY: usize = 1024 * 1024; // 1MB for tests
+
     #[test]
     fn test_empty_count() {
-        let mut m = Memtable::new();
+        let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         assert_eq!(m.len(), 0);
         let op = KVOpertion::new(
             1,
@@ -107,7 +119,7 @@ mod test {
 
     #[test]
     fn test_get_with_duplicate_key() {
-        let mut m = Memtable::new();
+        let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         let mut id = 0;
         let key: KeyVec = "test_key".as_bytes().into();
 
@@ -188,7 +200,7 @@ mod test {
     }
     #[test]
     fn test_insert_delete_and_get() {
-        let mut m = Memtable::new();
+        let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         let mut id = 0;
         // put 1..20
         for i in 0..20 {
@@ -282,7 +294,7 @@ mod test {
 
     #[test]
     fn test_iterator() {
-        let mut m = Memtable::new();
+        let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         let mut id = 0;
 
         let ops_to_insert = vec![
@@ -344,5 +356,53 @@ mod test {
                 _ => panic!("OpType mismatch for key {}", actual.0),
             }
         }
+    }
+
+    #[test]
+    fn test_memtable_capacity() {
+        let small_capacity = 100; // A small capacity for testing
+        let mut m = Memtable::new(small_capacity);
+        let mut id = 0;
+
+        // Insert operations until full
+        let mut current_size = 0;
+
+        while !m.is_full() {
+            let op_id = get_next_id(&mut id);
+            let key_str = format!("key_{}", op_id);
+            let value_str = format!("value_{}", op_id);
+            let op = KVOpertion::new(
+                op_id,
+                key_str.as_bytes().into(),
+                OpType::Write(value_str.as_bytes().into()),
+            );
+            let op_size = op.encode_size();
+            if current_size + op_size > small_capacity && !m.is_full() {
+                // If the next op would exceed capacity, and we're not already full,
+                // we expect it to become full after this insert.
+                m.insert(op).unwrap();
+                current_size += op_size;
+                assert!(m.is_full());
+                break; // Stop inserting once full
+            }
+            m.insert(op).unwrap();
+            current_size += op_size;
+            assert!(!m.is_full());
+        }
+
+        assert!(m.estimated_size_bytes() >= small_capacity);
+        assert!(m.is_full());
+
+        // Try to insert one more operation, it should still be full or exceed capacity
+        let op_id = get_next_id(&mut id);
+        let key_str = format!("key_final_{}", op_id);
+        let value_str = format!("value_final_{}", op_id);
+        let op = KVOpertion::new(
+            op_id,
+            key_str.as_bytes().into(),
+            OpType::Write(value_str.as_bytes().into()),
+        );
+        m.insert(op).unwrap();
+        assert!(m.is_full()); // It should remain full or exceed capacity
     }
 }
