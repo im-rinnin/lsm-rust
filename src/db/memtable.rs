@@ -2,7 +2,7 @@ use std::fmt::Result;
 
 use super::common::SearchResult;
 use super::key::KeyVec;
-use super::{KVOpertion, KeyQuery, OpId, OpType};
+use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
@@ -92,7 +92,8 @@ impl<'a> Iterator for MemtableIterator<'a> {
 
 #[cfg(test)]
 mod test {
-    use crate::db::{key::KeyVec, KVOpertion, KeyQuery, OpId, OpType};
+    use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
+    use crate::db::key::KeyVec;
 
     fn get_next_id(id: &mut OpId) -> OpId {
         let old = *id;

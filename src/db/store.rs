@@ -18,7 +18,7 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
-    fn create() -> Self;
+    fn create(id: StoreId) -> Self;
 }
 
 pub struct Memstore {
@@ -38,7 +38,7 @@ impl Memstore {
 
 impl Store for Memstore {
     fn close(self) {}
-    fn create() -> Self {
+    fn create(id: StoreId) -> Self {
         unimplemented!()
     }
 
@@ -79,7 +79,7 @@ impl Store for Filestore {
     fn flush(&mut self) {
         self.f.sync_data();
     }
-    fn create() -> Self {
+    fn create(id: StoreId) -> Self {
         unimplemented!()
     }
     fn len(&self) -> usize {

@@ -2,10 +2,21 @@ use std::{sync::Arc, usize};
 
 use super::{
     common::{KVOpertion, OpId, SearchResult},
+    db_meta::{DBMeta, ThreadDbMeta},
     key::{KeySlice, KeyVec},
     store::{Store, StoreId},
     table::*,
 };
+
+pub struct SStablePositon {
+    level: usize,
+    // table position from level left(table contains mini key in level)
+    index: usize,
+}
+struct LevelChange {
+    delete_tables: Vec<SStablePositon>,
+    insert_tables: Vec<(SStablePositon, StoreId)>,
+}
 
 struct Level<T: Store> {
     // sstable sorted  by (key,op id)
@@ -28,11 +39,11 @@ impl<T: Store> LevelStorege<T> {
     }
     // compact table to next level tables which key range overlay
     // table=self.sstables[index]
-    pub fn compact(&self, index: usize) -> Vec<TableReader<T>> {
+    pub fn compact(&self, index: usize, meta: ThreadDbMeta<T>) -> Vec<TableReader<T>> {
         unimplemented!()
     }
     // return level index and table index which need to be compacted
-    pub fn check_level_size(&self) -> Option<(usize, usize)> {
+    fn check_level_size(&self) -> Option<(usize, usize)> {
         unimplemented!()
     }
 }

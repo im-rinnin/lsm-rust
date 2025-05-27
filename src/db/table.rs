@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
     common::{KVOpertionRef, OpTypeRef},
+    db_meta::{self, DBMeta},
 };
-pub type SStableId = u64;
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 #[derive(PartialEq, Debug)]
@@ -236,10 +236,6 @@ impl<T: Store> TableBuilder<T> {
             block_builder: BlockBuilder::new(),
         }
     }
-    pub fn new() -> Self {
-        let t = T::create();
-        Self::new_with_block_count(t, BLOCK_COUNT_LIMIT)
-    }
     pub fn new_with_store(store: T) -> Self {
         Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
     }
@@ -371,6 +367,7 @@ pub mod test {
     };
 
     use super::super::block::test::pad_zero;
+    use crate::db::common::KVOpertionRef;
     use crate::db::{
         block::{test::create_kv_data_with_range, BlockIter},
         common::{new_buffer, KVOpertion, OpType},
@@ -379,7 +376,6 @@ pub mod test {
 
     use super::super::block::test::create_kv_data_in_range_zero_to;
     use super::{KViterAgg, TableReader};
-    use crate::db::KVOpertionRef;
     pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> {
         let v = create_kv_data_with_range(range);
         let id = "1".to_string();
@@ -460,6 +456,7 @@ pub mod test {
         let store = Memstore::new(&id);
         let mut tb = TableBuilder::new_with_store(store);
 
+        use crate::db::common::KVOpertionRef;
         for kv_op in &kvs {
             tb.add(KVOpertionRef::from_op(kv_op));
         }

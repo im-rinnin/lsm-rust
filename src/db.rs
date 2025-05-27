@@ -1,3 +1,11 @@
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    usize,
+};
+
+use key::{KeySlice, ValueSlice};
+
 mod store;
 
 mod block;
@@ -6,60 +14,34 @@ mod db_meta;
 mod key;
 mod level;
 mod logfile;
+mod lsm_storage;
 mod memtable;
 mod snapshot;
 mod table;
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
-
-use common::*;
-use level::LevelStorege;
-use logfile::LogFile;
-use memtable::Memtable;
-use store::Filestore;
-use store::Memstore;
+use db_meta::{DBMeta, ThreadDbMeta};
+use lsm_storage::LsmStorage;
 use store::Store;
-use table::TableReader;
 
-pub struct Config {
-    block_size: usize,
-    sstable_size: usize,
-    level_factor: usize,
-    first_level_sstable_num: usize,
+struct LsmDB<T: Store> {
+    meta: ThreadDbMeta<T>,
+    current: lsm_storage::LsmStorage<T>,
 }
 
-pub struct DB<T: Store> {
-    m: Memtable,
-    // todo! immutable memtable
-    //vec[n]: level n
-    levels: LevelStorege<T>,
-    // sstable not need by db, but maybe other snapshot need it, delete it if reference count is 1  (no snapshot need it)
-    unactive_sstables: Sender<Arc<TableReader<T>>>,
-    logfile: LogFile<T>,
-    meta: db_meta::DBMeta<T>,
+impl<T: Store> LsmDB<T> {
+    pub fn new(dir: PathBuf) -> Self {
+        unimplemented!()
+    }
+    pub fn open(dir: PathBuf) -> Self {
+        unimplemented!()
+    }
+    pub fn write_batch(&mut self, kvs: Vec<(&KeySlice, &ValueSlice)>) {}
+    pub fn get_snapshot(&self) -> LsmStorage<T> {
+        unimplemented!()
+    }
+    fn compact_thread(meta: Arc<Mutex<DBMeta<T>>>, level: level::LevelStorege<T>) {}
+
+    fn start_compact_thread() {}
 }
 
-impl<T: Store> DB<T> {
-    pub fn new_memstore() -> DB<Memstore> {
-        unimplemented!()
-    }
-    pub fn new_filestore(dir_path: String) -> DB<Filestore> {
-        unimplemented!()
-    }
-    pub fn open_filestore(path: String) -> DB<Filestore> {
-        unimplemented!()
-    }
-
-    pub fn insert(&mut self, k: &str, v: &str) -> Result<()> {
-        // todo check key valuse size
-        unimplemented!()
-    }
-
-    // pub fn snapshot(&self) -> Snapshot<T> {
-    // unimplemented!()
-    // }
-
-    pub fn close(self) -> T {
-        unimplemented!()
-    }
-}
+#[cfg(test)]
+mod test {}
