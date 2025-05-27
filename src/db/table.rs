@@ -236,7 +236,11 @@ impl<T: Store> TableBuilder<T> {
             block_builder: BlockBuilder::new(),
         }
     }
-    pub fn new(store: T) -> Self {
+    pub fn new() -> Self {
+        let t = T::create();
+        Self::new_with_block_count(t, BLOCK_COUNT_LIMIT)
+    }
+    pub fn new_with_store(store: T) -> Self {
         Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
     }
 
@@ -381,7 +385,7 @@ pub mod test {
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
         let mut it = v.iter();
-        let mut table = TableBuilder::new(store);
+        let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(it);
         let res = table.flush();
         res
@@ -417,7 +421,7 @@ pub mod test {
 
         let id = "test_table_reader_new_store".to_string();
         let store = Memstore::new(&id);
-        let mut table_builder = TableBuilder::new(store);
+        let mut table_builder = TableBuilder::new_with_store(store);
 
         table_builder.fill_with_op(kvs.iter());
         let table_reader = table_builder.flush();
@@ -454,7 +458,7 @@ pub mod test {
 
         let id = "test_table_build_add_store".to_string();
         let store = Memstore::new(&id);
-        let mut tb = TableBuilder::new(store);
+        let mut tb = TableBuilder::new_with_store(store);
 
         for kv_op in &kvs {
             tb.add(KVOpertionRef::from_op(kv_op));
@@ -490,7 +494,7 @@ pub mod test {
 
         let id = "test_table_build_store".to_string();
         let store = Memstore::new(&id);
-        let mut tb = TableBuilder::new(store);
+        let mut tb = TableBuilder::new_with_store(store);
 
         let mut kvs_iter = kvs.iter();
         tb.fill_with_op(&mut kvs_iter);
@@ -529,7 +533,7 @@ pub mod test {
         let mut kvs_ref = kvs.iter();
         let id = "1".to_string();
         let mut store = Memstore::new(&id);
-        let mut tb = TableBuilder::new(store);
+        let mut tb = TableBuilder::new_with_store(store);
         tb.fill_with_op(&mut kvs_ref);
         let table = tb.flush();
 
@@ -594,7 +598,7 @@ pub mod test {
 
         let id = "test_table_reader_find_duplicate_store".to_string();
         let store = Memstore::new(&id);
-        let mut tb = TableBuilder::new(store);
+        let mut tb = TableBuilder::new_with_store(store);
         tb.fill_with_op(kvs.iter());
         let table_reader = tb.flush();
 

@@ -20,6 +20,7 @@ pub struct KeyQuery {
     pub key: KeyVec,
     pub op_id: OpId,
 }
+pub type SearchResult = Option<(KeyVec, OpId)>;
 
 pub type Buffer = Cursor<Vec<u8>>;
 pub fn new_buffer(size: usize) -> Buffer {

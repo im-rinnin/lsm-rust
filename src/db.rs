@@ -13,9 +13,9 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use common::*;
+use level::LevelStorege;
 use logfile::LogFile;
 use memtable::Memtable;
-use snapshot::Snapshot;
 use store::Filestore;
 use store::Memstore;
 use store::Store;
@@ -32,7 +32,7 @@ pub struct DB<T: Store> {
     m: Memtable,
     // todo! immutable memtable
     //vec[n]: level n
-    levels: Vec<level::Level<T>>,
+    levels: LevelStorege<T>,
     // sstable not need by db, but maybe other snapshot need it, delete it if reference count is 1  (no snapshot need it)
     unactive_sstables: Sender<Arc<TableReader<T>>>,
     logfile: LogFile<T>,
@@ -55,9 +55,9 @@ impl<T: Store> DB<T> {
         unimplemented!()
     }
 
-    pub fn snapshot(&self) -> Snapshot<T> {
-        unimplemented!()
-    }
+    // pub fn snapshot(&self) -> Snapshot<T> {
+    // unimplemented!()
+    // }
 
     pub fn close(self) -> T {
         unimplemented!()

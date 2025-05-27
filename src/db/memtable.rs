@@ -1,8 +1,8 @@
 use std::fmt::Result;
 
+use super::common::SearchResult;
 use super::key::KeyVec;
 use super::{KVOpertion, KeyQuery, OpId, OpType};
-use crate::db::key::KeySlice;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
@@ -27,7 +27,7 @@ impl Memtable {
         }
     }
 
-    pub fn get<'a>(&'a self, q: KeyQuery) -> Option<(OpId, KeyVec)> {
+    pub fn get<'a>(&'a self, q: KeyQuery) -> SearchResult {
         let range_start_bound = (q.key.clone(), 0);
         let range_end_bound = (q.key.clone(), q.op_id + 1);
 
@@ -36,7 +36,7 @@ impl Memtable {
             let entry_op_type = entry.value();
 
             match entry_op_type {
-                OpType::Write(v) => return Some((*entry_op_id, v.clone())),
+                OpType::Write(v) => return Some((v.clone(), *entry_op_id)),
                 OpType::Delete => return None,
             }
         }
@@ -165,7 +165,7 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().1, "value1".as_bytes().into());
+        assert_eq!(res.unwrap().0.as_ref(), "value1".as_bytes());
 
         // Query at op_id 1: Should see "value2"
         let res = m.get(KeyQuery {
@@ -173,7 +173,7 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().1, "value2".as_bytes().into());
+        assert_eq!(res.unwrap().0.as_ref(), "value2".as_bytes());
 
         // Query at op_id 2: Should see None (deleted)
         let res = m.get(KeyQuery {
@@ -188,7 +188,7 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().1, "value3".as_bytes().into());
+        assert_eq!(res.unwrap().0.as_ref(), "value3".as_bytes());
 
         // Query at an op_id higher than any existing op: Should see "value3" (latest write)
         let res = m.get(KeyQuery {
@@ -196,7 +196,7 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().1, "value3".as_bytes().into());
+        assert_eq!(res.unwrap().0.as_ref(), "value3".as_bytes());
     }
     #[test]
     fn test_insert_delete_and_get() {
@@ -239,8 +239,8 @@ mod test {
             });
             assert!(res.is_some(), "Key {} should be found", i);
             assert_eq!(
-                res.unwrap().1,
-                i.to_string().as_bytes().into(),
+                res.unwrap().0.as_ref(),
+                i.to_string().as_bytes(),
                 "Value for key {} should be {}",
                 i,
                 i
@@ -263,7 +263,7 @@ mod test {
             key: 10.to_string().as_bytes().into(),
         });
         assert!(res.is_some(), "Key 10 should be found at op_id 10");
-        assert_eq!(res.unwrap().1, 10.to_string().as_bytes().into());
+        assert_eq!(res.unwrap().0.as_ref(), 10.to_string().as_bytes());
 
         // Check overwritten key 12
         let res = m.get(KeyQuery {
@@ -272,8 +272,8 @@ mod test {
         });
         assert!(res.is_some(), "Key 12 should be found at current_max_op_id");
         assert_eq!(
-            res.unwrap().1,
-            100.to_string().as_bytes().into(),
+            res.unwrap().0.as_ref(),
+            100.to_string().as_bytes(),
             "Value for key 12 should be 100"
         );
 

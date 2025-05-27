@@ -18,11 +18,11 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
+    fn create() -> Self;
 }
 
 pub struct Memstore {
     store: RefCell<Cursor<Vec<u8>>>,
-    id: StoreId,
 }
 pub struct Filestore {
     f: File,
@@ -32,13 +32,15 @@ impl Memstore {
     pub fn new(id: &StoreId) -> Self {
         Memstore {
             store: RefCell::new(Cursor::new(Vec::new())),
-            id: id.clone(),
         }
     }
 }
 
 impl Store for Memstore {
     fn close(self) {}
+    fn create() -> Self {
+        unimplemented!()
+    }
 
     fn len(&self) -> usize {
         self.store.borrow().position() as usize
@@ -76,6 +78,9 @@ impl Filestore {
 impl Store for Filestore {
     fn flush(&mut self) {
         self.f.sync_data();
+    }
+    fn create() -> Self {
+        unimplemented!()
     }
     fn len(&self) -> usize {
         let meta = self.f.metadata().unwrap();
