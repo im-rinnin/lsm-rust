@@ -9,7 +9,7 @@ impl<T: Store> LogFile<T> {
     pub fn new(store: T) -> Self {
         unimplemented!()
     }
-    pub fn from(store_id: StoreId, store: T) -> Self {
+    pub fn open(store_id: StoreId, store: T) -> Self {
         unimplemented!()
     }
     pub fn append(&mut self, op: KVOpertion) {
