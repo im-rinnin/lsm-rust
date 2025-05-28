@@ -34,11 +34,7 @@ impl Memtable {
         for entry in self.table.range(range_start_bound..range_end_bound).rev() {
             let (_entry_key, entry_op_id) = entry.key();
             let entry_op_type = entry.value();
-
-            match entry_op_type {
-                OpType::Write(v) => return Some((v.clone(), *entry_op_id)),
-                OpType::Delete => return None,
-            }
+            return Some((entry_op_type.clone(), *entry_op_id));
         }
         None
     }
@@ -166,7 +162,14 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().0.as_ref(), "value1".as_bytes());
+        assert_eq!(
+            match res.unwrap().0 {
+                OpType::Write(ref v) => v.as_ref(),
+                OpType::Delete =>
+                    panic!("Expected a Write operation, found Delete for key test_key"),
+            },
+            "value1".as_bytes()
+        );
 
         // Query at op_id 1: Should see "value2"
         let res = m.get(KeyQuery {
@@ -174,14 +177,21 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().0.as_ref(), "value2".as_bytes());
+        assert_eq!(
+            match res.unwrap().0 {
+                OpType::Write(ref v) => v.as_ref(),
+                OpType::Delete =>
+                    panic!("Expected a Write operation, found Delete for key test_key"),
+            },
+            "value2".as_bytes()
+        );
 
         // Query at op_id 2: Should see None (deleted)
         let res = m.get(KeyQuery {
             op_id: op_id_2,
             key: key.clone(),
         });
-        assert!(res.is_none());
+        assert!(matches!(res.unwrap().0, OpType::Delete));
 
         // Query at op_id 3: Should see "value3"
         let res = m.get(KeyQuery {
@@ -189,7 +199,14 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().0.as_ref(), "value3".as_bytes());
+        assert_eq!(
+            match res.unwrap().0 {
+                OpType::Write(ref v) => v.as_ref(),
+                OpType::Delete =>
+                    panic!("Expected a Write operation, found Delete for key test_key"),
+            },
+            "value3".as_bytes()
+        );
 
         // Query at an op_id higher than any existing op: Should see "value3" (latest write)
         let res = m.get(KeyQuery {
@@ -197,7 +214,14 @@ mod test {
             key: key.clone(),
         });
         assert!(res.is_some());
-        assert_eq!(res.unwrap().0.as_ref(), "value3".as_bytes());
+        assert_eq!(
+            match res.unwrap().0 {
+                OpType::Write(ref v) => v.as_ref(),
+                OpType::Delete =>
+                    panic!("Expected a Write operation, found Delete for key test_key"),
+            },
+            "value3".as_bytes()
+        );
     }
     #[test]
     fn test_insert_delete_and_get() {
@@ -240,7 +264,10 @@ mod test {
             });
             assert!(res.is_some(), "Key {} should be found", i);
             assert_eq!(
-                res.unwrap().0.as_ref(),
+                match res.unwrap().0 {
+                    OpType::Write(ref v) => v.as_ref(),
+                    OpType::Delete => panic!("Expected a Write operation, found Delete"),
+                },
                 i.to_string().as_bytes(),
                 "Value for key {} should be {}",
                 i,
@@ -254,8 +281,12 @@ mod test {
             key: 10.to_string().as_bytes().into(),
         });
         assert!(
-            res.is_none(),
-            "Key 10 should be deleted at current_max_op_id"
+            res.is_some(),
+            "Key 10 should be found as deleted at current_max_op_id"
+        );
+        assert!(
+            matches!(res.unwrap().0, OpType::Delete),
+            "Key 10 should be marked as deleted"
         );
 
         // 10 is deleted but still can be get by op id before its delete
@@ -264,7 +295,13 @@ mod test {
             key: 10.to_string().as_bytes().into(),
         });
         assert!(res.is_some(), "Key 10 should be found at op_id 10");
-        assert_eq!(res.unwrap().0.as_ref(), 10.to_string().as_bytes());
+        assert_eq!(
+            match res.unwrap().0 {
+                OpType::Write(ref v) => v.as_ref(),
+                OpType::Delete => panic!("Expected a Write operation, found Delete for key 10"),
+            },
+            10.to_string().as_bytes()
+        );
 
         // Check overwritten key 12
         let res = m.get(KeyQuery {
@@ -273,7 +310,10 @@ mod test {
         });
         assert!(res.is_some(), "Key 12 should be found at current_max_op_id");
         assert_eq!(
-            res.unwrap().0.as_ref(),
+            match res.unwrap().0 {
+                OpType::Write(ref v) => v.as_ref(),
+                OpType::Delete => panic!("Expected a Write operation, found Delete for key 12"),
+            },
             100.to_string().as_bytes(),
             "Value for key 12 should be 100"
         );

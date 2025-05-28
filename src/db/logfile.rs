@@ -1,4 +1,4 @@
-use super::{store::*};
+use super::store::*;
 use crate::db::common::KVOpertion;
 const LOG_FILE_NAME: &str = "logfile";
 pub struct LogFile<T: Store> {

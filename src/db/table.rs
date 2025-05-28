@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
-    common::{KVOpertionRef, OpTypeRef},
+    common::{KVOpertionRef, OpTypeRef, SearchResult},
     db_meta::{self, DBMeta},
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -97,6 +97,16 @@ impl<T: Store> TableReader<T> {
 
         TableReader { store, block_metas }
     }
+    // min and max key in table
+    pub fn key_range(&self) -> (KeyVec, KeyVec) {
+        if self.block_metas.is_empty() {
+            // Return empty KeyVecs if the table has no blocks
+            return (KeyVec::new(), KeyVec::new());
+        }
+        let first_key = self.block_metas.first().unwrap().first_key.clone();
+        let last_key = self.block_metas.last().unwrap().last_key.clone();
+        (first_key, last_key)
+    }
     pub fn to_iter(&self) -> TableIter<T> {
         TableIter::new(self)
     }
@@ -104,7 +114,7 @@ impl<T: Store> TableReader<T> {
         self.store
     }
 
-    pub fn find(&self, key: &KeySlice, id: OpId) -> Option<OpType> {
+    pub fn find(&self, key: &KeySlice, id: OpId) -> SearchResult {
         if self.block_metas.is_empty() {
             return None; // Table is empty, key cannot be found
         }
@@ -176,8 +186,7 @@ impl<T: Store> TableReader<T> {
                 }
             }
         }
-
-        best_op.map(|(op_type, _)| op_type)
+        best_op
     }
 }
 pub struct TableIter<'a, T: Store> {
@@ -219,7 +228,7 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
 }
 
 use crate::db::block::BlockBuilder;
-struct TableBuilder<T: Store> {
+pub struct TableBuilder<T: Store> {
     store: T,
     block_metas: Vec<BlockMeta>,
     block_num_limit: usize,
@@ -358,6 +367,8 @@ pub mod test {
     use super::BlockBuilder;
     use super::BlockMeta;
     use super::{TableBuilder, DATA_BLOCK_SIZE};
+    use crate::db::block::test::create_kv_data_with_range_id_offset;
+    use crate::db::common::OpId;
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
     use core::panic;
@@ -377,9 +388,15 @@ pub mod test {
     use super::super::block::test::create_kv_data_in_range_zero_to;
     use super::{KViterAgg, TableReader};
     pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> {
-        let v = create_kv_data_with_range(range);
+        create_test_table_with_id_offset(range, 0)
+    }
+    pub fn create_test_table_with_id_offset(
+        range: Range<usize>,
+        id: OpId,
+    ) -> TableReader<Memstore> {
+        let v = create_kv_data_with_range_id_offset(range, id);
         let id = "1".to_string();
-        let mut store = Memstore::new(&id);
+        let mut store = Memstore::create(&id);
         let mut it = v.iter();
         let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(it);
@@ -416,7 +433,7 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(num_kvs);
 
         let id = "test_table_reader_new_store".to_string();
-        let store = Memstore::new(&id);
+        let store = Memstore::create(&id);
         let mut table_builder = TableBuilder::new_with_store(store);
 
         table_builder.fill_with_op(kvs.iter());
@@ -431,7 +448,7 @@ pub mod test {
             let result = table_reader.find(key_slice, i as u64);
             assert_eq!(
                 result,
-                Some(OpType::Write(i.to_string().as_bytes().into())),
+                Some((OpType::Write(i.to_string().as_bytes().into()), i as u64)),
                 "Should find key '{}'",
                 i
             );
@@ -449,11 +466,24 @@ pub mod test {
     }
 
     #[test]
+    fn test_key_range() {
+        // Test case 1: Non-empty table
+        let num_kvs = 100;
+        let table = create_test_table(0..num_kvs);
+        let (min_key, max_key) = table.key_range();
+        assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
+        assert_eq!(
+            max_key,
+            KeyVec::from(pad_zero((num_kvs - 1) as u64).as_bytes())
+        );
+    }
+
+    #[test]
     fn test_table_build_add() {
         let kvs = create_test_kvs_for_add_test();
 
         let id = "test_table_build_add_store".to_string();
-        let store = Memstore::new(&id);
+        let store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
 
         use crate::db::common::KVOpertionRef;
@@ -490,7 +520,7 @@ pub mod test {
         let kvs = create_test_kvs_for_add_test();
 
         let id = "test_table_build_store".to_string();
-        let store = Memstore::new(&id);
+        let store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
 
         let mut kvs_iter = kvs.iter();
@@ -529,7 +559,7 @@ pub mod test {
 
         let mut kvs_ref = kvs.iter();
         let id = "1".to_string();
-        let mut store = Memstore::new(&id);
+        let mut store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
         tb.fill_with_op(&mut kvs_ref);
         let table = tb.flush();
@@ -594,7 +624,7 @@ pub mod test {
         });
 
         let id = "test_table_reader_find_duplicate_store".to_string();
-        let store = Memstore::new(&id);
+        let store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
         tb.fill_with_op(kvs.iter());
         let table_reader = tb.flush();
@@ -608,7 +638,7 @@ pub mod test {
         // Assert that the latest version ("duplicate_15") is found
         assert_eq!(
             result,
-            Some(OpType::Write("duplicate_15".as_bytes().into())),
+            Some((OpType::Write("duplicate_15".as_bytes().into()), 15)),
             "Should find the latest version of the duplicate key"
         );
 
@@ -617,7 +647,7 @@ pub mod test {
         let result_middle = table_reader.find(&search_key, search_op_id_middle);
         assert_eq!(
             result_middle,
-            Some(OpType::Write("duplicate_11".as_bytes().into())),
+            Some((OpType::Write("duplicate_11".as_bytes().into()), 11)),
             "Should find the middle version of the duplicate key"
         );
 
@@ -626,7 +656,7 @@ pub mod test {
         let result_original = table_reader.find(&search_key, search_op_id_original);
         assert_eq!(
             result_original,
-            Some(OpType::Write(5.to_string().as_bytes().into())),
+            Some((OpType::Write(5.to_string().as_bytes().into()), 5)),
             "Should find the original version of the duplicate key"
         );
 
@@ -636,7 +666,7 @@ pub mod test {
         let result_non_duplicate = table_reader.find(&search_key_non_duplicate, 100);
         assert_eq!(
             result_non_duplicate,
-            Some(OpType::Write(1.to_string().as_bytes().into())),
+            Some((OpType::Write(1.to_string().as_bytes().into()), 1)),
             "Should find the non-duplicated key"
         );
     }
@@ -646,41 +676,55 @@ pub mod test {
         let table = create_test_table_with_size(len);
 
         for i in 0..len {
-            let res = table
+            let (op_type_found, op_id_found) = table
                 .find(&KeySlice::from(pad_zero(i as u64).as_bytes()), i as u64)
                 .expect(&format!("{} should in table", i));
-            assert_eq!(res, OpType::Write(i.to_string().as_bytes().into()));
+            assert_eq!(
+                op_type_found,
+                OpType::Write(i.to_string().as_bytes().into())
+            );
+            assert_eq!(op_id_found, i as u64);
         }
 
         let res = table.find(&KeySlice::from("100".as_bytes()), 0);
         assert!(res.is_none());
 
         // Test finding key at the beginning of the range
-        let res_start = table
+        let (op_type_start, op_id_start) = table
             .find(&KeySlice::from(pad_zero(0 as u64).as_bytes()), 0 as u64)
             .expect("0 should in table");
-        assert_eq!(res_start, OpType::Write(0.to_string().as_bytes().into()));
+        assert_eq!(
+            op_type_start,
+            OpType::Write(0.to_string().as_bytes().into())
+        );
+        assert_eq!(op_id_start, 0 as u64);
 
         // Test finding key at the end of the range
-        let res_end = table
+        let (op_type_end, op_id_end) = table
             .find(&KeySlice::from(pad_zero(99 as u64).as_bytes()), 99 as u64)
             .expect("99 should in table");
-        assert_eq!(res_end, OpType::Write(99.to_string().as_bytes().into()));
+        assert_eq!(op_type_end, OpType::Write(99.to_string().as_bytes().into()));
+        assert_eq!(op_id_end, 99 as u64);
 
         // Test finding key in the middle of the range
-        let res_middle = table
+        let (op_type_middle, op_id_middle) = table
             .find(&KeySlice::from(pad_zero(50 as u64).as_bytes()), 50 as u64)
             .expect("50 should in table");
-        assert_eq!(res_middle, OpType::Write(50.to_string().as_bytes().into()));
+        assert_eq!(
+            op_type_middle,
+            OpType::Write(50.to_string().as_bytes().into())
+        );
+        assert_eq!(op_id_middle, 50 as u64);
 
         // Test searching for a key with a higher OpId (should still find the existing one)
-        let res_higher_id = table
+        let (op_type_higher_id, op_id_higher_id) = table
             .find(&KeySlice::from(pad_zero(10 as u64).as_bytes()), 100 as u64) // Use a higher ID
             .expect("10 should still be in table with higher ID");
         assert_eq!(
-            res_higher_id,
+            op_type_higher_id,
             OpType::Write(10.to_string().as_bytes().into())
         );
+        assert_eq!(op_id_higher_id, 10 as u64); // The op_id found should be the original 10, not the queried 100
 
         // Test searching for a key below the range
         let res_below = table.find(&KeySlice::from("-1".as_bytes()), 0);

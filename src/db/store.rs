@@ -18,7 +18,7 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
-    fn create(id: StoreId) -> Self;
+    fn create(id: &StoreId) -> Self;
 }
 
 pub struct Memstore {
@@ -29,17 +29,14 @@ pub struct Filestore {
 }
 
 impl Memstore {
-    pub fn new(id: &StoreId) -> Self {
-        Memstore {
-            store: RefCell::new(Cursor::new(Vec::new())),
-        }
-    }
 }
 
 impl Store for Memstore {
     fn close(self) {}
-    fn create(id: StoreId) -> Self {
-        unimplemented!()
+    fn create(id: &StoreId) -> Self {
+        Memstore {
+            store: RefCell::new(Cursor::new(Vec::new())),
+        }
     }
 
     fn len(&self) -> usize {
@@ -79,7 +76,7 @@ impl Store for Filestore {
     fn flush(&mut self) {
         self.f.sync_data();
     }
-    fn create(id: StoreId) -> Self {
+    fn create(id: &StoreId) -> Self {
         unimplemented!()
     }
     fn len(&self) -> usize {
@@ -150,7 +147,7 @@ mod test {
     #[test]
     fn test_read_write_memsotre() {
         let id = "1".to_string();
-        let mut m = Memstore::new(&id);
+        let mut m = Memstore::create(&id);
         let id = String::from("1");
         let t = TestSerde {
             a: 1,
@@ -171,7 +168,7 @@ mod test {
     #[test]
     fn test_read_at_memstore() {
         let id = "test_read_at".to_string();
-        let mut m = Memstore::new(&id);
+        let mut m = Memstore::create(&id);
         let data = b"0123456789abcdef";
         m.append(data);
         let original_pos = m.store.borrow().position();
@@ -193,7 +190,7 @@ mod test {
     #[test]
     fn test_write_at_memstore() {
         let id = "test_write_at".to_string();
-        let mut m = Memstore::new(&id);
+        let mut m = Memstore::create(&id);
         let initial_data = b"initial";
         m.append(initial_data);
         let initial_pos = m.store.borrow().position();
@@ -212,7 +209,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_write_at_memstore_panic() {
-        let mut m = Memstore::new(&"panic_test".to_string());
+        let mut m = Memstore::create(&"panic_test".to_string());
         m.append(b"some data");
         m.seek(1); // Seek backwards, should panic due to assert
     }
@@ -361,7 +358,7 @@ mod test {
     #[test]
     fn test_memstore_pad_in_write() {
         let id = "test_pad".to_string();
-        let mut m = Memstore::new(&id);
+        let mut m = Memstore::create(&id);
 
         // Write initial data
         m.append(b"initial");

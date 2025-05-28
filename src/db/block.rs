@@ -244,6 +244,7 @@ pub mod test {
     use crate::db::block::DATA_BLOCK_SIZE;
     use crate::db::common::new_buffer;
     use crate::db::common::KViterAgg;
+    use crate::db::common::OpId;
     use crate::db::common::{KVOpertion, OpType};
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
@@ -268,11 +269,14 @@ pub mod test {
         format!("{:0>6}", s)
     }
     pub fn create_kv_data_with_range(r: Range<usize>) -> Vec<KVOpertion> {
+        create_kv_data_with_range_id_offset(r, 0)
+    }
+    pub fn create_kv_data_with_range_id_offset(r: Range<usize>, id: OpId) -> Vec<KVOpertion> {
         let mut v = Vec::new();
 
         for i in r {
             let tmp = KVOpertion::new(
-                i as u64,
+                i as u64 + id,
                 pad_zero(i as u64).as_bytes().into(),
                 OpType::Write(i.to_string().as_bytes().into()),
             );
