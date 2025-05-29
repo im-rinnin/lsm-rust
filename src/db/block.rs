@@ -20,6 +20,7 @@ use anyhow::Error;
 use anyhow::Result;
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
@@ -32,7 +33,7 @@ use std::cell::RefCell;
 use super::common::KVOpertionRef;
 
 pub struct BlockReader {
-    data: Vec<u8>,
+    data: Bytes,
     first_key: KeyVec,
     count: usize,
 }
@@ -54,7 +55,7 @@ impl BlockReader {
         let t = KeyVec::from_vec(Vec::from(first_key));
 
         BlockReader {
-            data,
+            data: Bytes::from(data),
             first_key: t,
             count,
         }
@@ -95,9 +96,9 @@ impl BlockReader {
     }
     pub fn to_iter(self) -> BlockIter {
         // Create a BlockIter, transferring ownership of the buffer and count.
-        let buffer = Cursor::new(self.data);
+        let bytes = Bytes::from(self.data);
         let count = self.count;
-        BlockIter::new(buffer, count)
+        BlockIter::new(bytes, count)
     }
 
     pub fn first_key(&self) -> &KeyVec {
@@ -109,7 +110,7 @@ impl BlockReader {
     }
 
     pub fn inner(self) -> Vec<u8> {
-        self.data
+        self.data.to_vec()
     }
 }
 
@@ -210,29 +211,30 @@ impl BlockBuilder {
 
 // may contains same key but diff id
 pub struct BlockIter {
-    buffer: Buffer, // Owns the buffer now
+    data: Bytes, // Owns the buffer now
+    num: usize,
     count: usize,
-    current: usize,
 }
 impl Iterator for BlockIter {
     type Item = KVOpertion;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.count {
+        if self.count == self.num {
             return None;
         }
-        let res = KVOpertion::decode(&mut self.buffer);
-        self.current += 1;
-        return Some(res);
+        let (res, offset) = KVOpertion::decode(self.data.clone());
+        println!("offset is {}",offset);
+        self.count += 1;
+        self.data = self.data.slice(offset..);
+        Some(res)
     }
 }
 impl BlockIter {
-    pub fn new(mut buffer: Buffer, count: usize) -> Self {
+    pub fn new(mut data: Bytes, num: usize) -> Self {
         // Takes ownership of buffer
-        buffer.set_position(0);
         BlockIter {
-            buffer,
-            count,
-            current: 0,
+            data,
+            num,
+            count: 0,
         }
     }
 }
@@ -473,8 +475,8 @@ pub mod test {
 
         // Assert that the first_key method returns the correct first key
         assert_eq!(
-            br.first_key(),
-            expected_first_key,
+            br.first_key().as_ref(),
+            expected_first_key.as_ref(),
             "BlockReader first_key should match the first key used to build it"
         );
     }
@@ -551,8 +553,8 @@ pub mod test {
         // Assert that the count and first key are correctly read
         assert_eq!(block_reader.count(), 5, "BlockReader should have 5 items");
         assert_eq!(
-            block_reader.first_key(),
-            &kvs[0].key,
+            block_reader.first_key().as_ref(),
+            kvs[0].key.as_ref(),
             "BlockReader first key should match the first KV's key"
         );
     }
@@ -602,7 +604,11 @@ pub mod test {
         );
 
         // Verify the first key matches
-        assert_eq!(br.first_key(), &kvs[0].key, "First key should match");
+        assert_eq!(
+            br.first_key().as_ref(),
+            kvs[0].key.as_ref(),
+            "First key should match"
+        );
 
         // Verify we can iterate through all items in the block
         let br_count = br.count();
@@ -679,7 +685,7 @@ pub mod test {
             if !full_builder.add(&KVOpertionRef::from_op(&kv_op)) {
                 break; // Block is full
             }
-            last_added_key = Some(kv_op.key);
+            last_added_key = Some(KeyVec::from(kv_op.key.as_ref()));
         }
         assert_eq!(
             full_builder.last_key().unwrap().as_ref(),

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::Deserialize;
 use serde::Serialize;
 use std::usize;
@@ -7,8 +8,21 @@ pub struct Key<T: AsRef<[u8]>> {
 }
 pub type KeySlice<'a> = Key<&'a [u8]>;
 pub type ValueSlice<'a> = Key<&'a [u8]>;
+pub type KeyBytes = Key<Bytes>;
 pub type KeyVec = Key<Vec<u8>>;
 pub type ValueVec = Key<Vec<u8>>;
+pub type ValueByte = Key<Bytes>;
+
+impl KeyBytes {
+    pub fn from_bytes(data: Bytes) -> Self {
+        KeyBytes { data }
+    }
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        KeyBytes {
+            data: Bytes::from(data),
+        }
+    }
+}
 
 impl<T: AsRef<[u8]>> Key<T> {
     pub fn as_ref(&self) -> &[u8] {
@@ -17,11 +31,21 @@ impl<T: AsRef<[u8]>> Key<T> {
     pub fn inner(&self) -> &T {
         &self.data
     }
+    pub fn into_inner(self) -> T {
+        self.data
+    }
     pub fn len(&self) -> usize {
         self.data.as_ref().len()
     }
     pub fn to_string(&self) -> String {
         String::from_utf8_lossy(self.data.as_ref()).into_owned()
+    }
+
+}
+
+impl From<&'_ [u8]> for KeyBytes {
+    fn from(data: &'_ [u8]) -> Self {
+        KeyBytes { data: bytes::Bytes::copy_from_slice(data) }
     }
 }
 

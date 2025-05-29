@@ -12,4 +12,5 @@ serde = {version ="1.0.217",features = ["derive"]}
 byteorder = "1.5.0"
 tempfile = "3.3.0"
 crossbeam-skiplist = "0.1"
+bytes = "1.0"
 

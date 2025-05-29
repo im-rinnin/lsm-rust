@@ -10,14 +10,16 @@ use std::{
 
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
+use bytes::Bytes;
 use std::mem::size_of;
 
+use super::key::KeyBytes;
 use super::key::{KeyVec, ValueVec}; // Added for kv_opertion_len // Added for kv_opertion_len
 
 pub type Value<'a> = &'a [u8];
 
 pub struct KeyQuery {
-    pub key: KeyVec,
+    pub key: KeyBytes,
     pub op_id: OpId,
 }
 pub type SearchResult = Option<(OpType, OpId)>;
@@ -100,14 +102,14 @@ impl<'a> KVOpertionRef<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct KVOpertion {
     pub id: OpId,
-    pub key: KeyVec,
+    pub key: KeyBytes,
     pub op: OpType,
 }
 impl KVOpertion {
     pub fn new(id: OpId, key: KeyVec, op: OpType) -> Self {
         KVOpertion {
             id: id,
-            key: key,
+            key: KeyBytes::from_vec(key.into_inner()),
             op: op,
         }
     }
@@ -118,7 +120,7 @@ impl KVOpertion {
         };
         KVOpertion {
             id: op_ref.id,
-            key: KeyVec::from_vec(op_ref.key.as_ref().to_vec()),
+            key: KeyBytes::from_vec(op_ref.key.as_ref().to_vec()),
             op: op_type,
         }
     }
@@ -126,14 +128,33 @@ impl KVOpertion {
     pub fn encode_size(&self) -> usize {
         KVOpertionRef::from_op(self).encode_size()
     }
-    pub fn decode(r: &mut Buffer) -> Self {
-        let current_pos = r.position() as usize;
-        let remaining_data = &r.get_ref()[current_pos..];
-        let op_ref = KVOpertionRef::decode(remaining_data);
-        let size = op_ref.encode_size();
-        let res = KVOpertion::from_ref(op_ref);
-        r.set_position((current_pos + size) as u64);
-        res
+    pub fn decode(r: Bytes) -> (Self, usize) {
+        let mut cursor = Cursor::new(r.as_ref());
+
+        let id = cursor.read_u64::<LittleEndian>().unwrap();
+        let key_len = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+        let key_start_offset = cursor.position() as usize;
+        let key_end_offset = key_start_offset + key_len;
+        let key_data_bytes = r.slice(key_start_offset..key_end_offset);
+        let key = KeyBytes::from_bytes(key_data_bytes);
+
+        cursor.set_position(key_end_offset as u64);
+
+        let op_type_byte = cursor.read_u8().unwrap();
+        let op = match op_type_byte {
+            0 => OpType::Delete,
+            1 => {
+                let value_len = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+                let value_start_offset = cursor.position() as usize;
+                let value_end_offset = value_start_offset + value_len;
+                let value_data_bytes = r.slice(value_start_offset..value_end_offset);
+                cursor.set_position(value_end_offset as u64);
+                OpType::Write(ValueVec::from_vec(value_data_bytes.to_vec()))
+            }
+            _ => panic!("Unknown OpType byte: {}", op_type_byte),
+        };
+        let end_offset = cursor.position() as usize;
+        (KVOpertion { id, key, op }, end_offset)
     }
     pub fn encode(&self, w: &mut Buffer) {
         KVOpertionRef::from_op(self).encode(w);
@@ -314,56 +335,49 @@ pub mod test {
 
     #[test]
     fn test_kv_operation_size() {
-        let op = KVOpertion {
-            id: 1,
-            key: "123".as_bytes().into(),
-            op: OpType::Delete,
-        };
+        let op = KVOpertion::new(1, "123".as_bytes().into(), OpType::Delete);
 
         assert_eq!(20, op.encode_size());
 
-        let op = KVOpertion {
-            id: 1,
-            key: "123".as_bytes().into(),
-            op: OpType::Write("234".as_bytes().into()),
-        };
+        let op = KVOpertion::new(
+            1,
+            "123".as_bytes().into(),
+            OpType::Write("234".as_bytes().into()),
+        );
         assert_eq!(31, op.encode_size());
     }
     #[test]
     fn test_kv_operation_encode() {
-        let op = KVOpertion {
-            id: 1,
-            key: "123".to_string().as_bytes().into(),
-            op: OpType::Delete,
-        };
+        let op = KVOpertion::new(1, "123".to_string().as_bytes().into(), OpType::Delete);
         let mut v = new_buffer(1024);
         op.encode(&mut v);
         assert_eq!(v.position() as usize, op.encode_size());
         v.set_position(0);
-        let op_res = KVOpertion::decode(&mut v);
+        let (op_res, offset) = KVOpertion::decode(v.into_inner().into());
+        assert_eq!(offset, op_res.encode_size());
         assert_eq!(op_res, op);
 
-        let op = KVOpertion {
-            id: 1,
-            key: "123".to_string().as_bytes().into(),
-            op: OpType::Write("234".as_bytes().into()),
-        };
+        let op = KVOpertion::new(
+            1,
+            "123".to_string().as_bytes().into(),
+            OpType::Write("234".as_bytes().into()),
+        );
         let mut v = new_buffer(1024);
         op.encode(&mut v);
         assert_eq!(v.position() as usize, op.encode_size());
-        v.set_position(0);
-        let op_res = KVOpertion::decode(&mut v);
+        let (op_res, offset) = KVOpertion::decode(v.into_inner().into());
+        assert_eq!(offset, op_res.encode_size());
         assert_eq!(op_res, op);
     }
 
     #[test]
     fn test_kv_opertion_ref_from_op() {
         // Test with Write operation
-        let write_op = KVOpertion {
-            id: 10,
-            key: "test_key".as_bytes().into(),
-            op: OpType::Write("test_value".as_bytes().into()),
-        };
+        let write_op = KVOpertion::new(
+            10,
+            "test_key".as_bytes().into(),
+            OpType::Write("test_value".as_bytes().into()),
+        );
         let write_op_ref = KVOpertionRef::from_op(&write_op);
 
         assert_eq!(write_op_ref.id, 10);
@@ -374,11 +388,7 @@ pub mod test {
         }
 
         // Test with Delete operation
-        let delete_op = KVOpertion {
-            id: 20,
-            key: "another_key".as_bytes().into(),
-            op: OpType::Delete,
-        };
+        let delete_op = KVOpertion::new(20, "another_key".as_bytes().into(), OpType::Delete);
         let delete_op_ref = KVOpertionRef::from_op(&delete_op);
 
         assert_eq!(delete_op_ref.id, 20);

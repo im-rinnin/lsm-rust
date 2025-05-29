@@ -1,20 +1,20 @@
 use std::fmt::Result;
 
 use super::common::SearchResult;
-use super::key::KeyVec;
+use super::key::{KeyBytes, KeyVec};
 use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 pub struct Memtable {
-    table: SkipMap<(KeyVec, OpId), OpType>,
+    table: SkipMap<(KeyBytes, OpId), OpType>,
     max_op_id: Option<OpId>,
     capacity_bytes: usize,
     current_size_bytes: usize,
 }
 
 pub struct MemtableIterator<'a> {
-    inner_iter: crossbeam_skiplist::map::Iter<'a, (KeyVec, OpId), OpType>,
+    inner_iter: crossbeam_skiplist::map::Iter<'a, (KeyBytes, OpId), OpType>,
 }
 
 impl Memtable {
@@ -78,7 +78,7 @@ impl Memtable {
 }
 
 impl<'a> Iterator for MemtableIterator<'a> {
-    type Item = Entry<'a, (KeyVec, OpId), OpType>;
+    type Item = Entry<'a, (KeyBytes, OpId), OpType>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.inner_iter.next();
@@ -89,7 +89,7 @@ impl<'a> Iterator for MemtableIterator<'a> {
 #[cfg(test)]
 mod test {
     use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
-    use crate::db::key::KeyVec;
+    use crate::db::key::{KeyBytes, KeyVec};
 
     fn get_next_id(id: &mut OpId) -> OpId {
         let old = *id;
@@ -159,7 +159,7 @@ mod test {
         // Query at op_id 0: Should see "value1"
         let res = m.get(KeyQuery {
             op_id: op_id_0,
-            key: key.clone(),
+            key: key.as_ref().into(),
         });
         assert!(res.is_some());
         assert_eq!(
@@ -174,7 +174,7 @@ mod test {
         // Query at op_id 1: Should see "value2"
         let res = m.get(KeyQuery {
             op_id: op_id_1,
-            key: key.clone(),
+            key: key.as_ref().into()
         });
         assert!(res.is_some());
         assert_eq!(
@@ -189,14 +189,14 @@ mod test {
         // Query at op_id 2: Should see None (deleted)
         let res = m.get(KeyQuery {
             op_id: op_id_2,
-            key: key.clone(),
+            key: key.as_ref().into()
         });
         assert!(matches!(res.unwrap().0, OpType::Delete));
 
         // Query at op_id 3: Should see "value3"
         let res = m.get(KeyQuery {
             op_id: op_id_3,
-            key: key.clone(),
+            key: KeyBytes::from(key.as_ref()),
         });
         assert!(res.is_some());
         assert_eq!(
@@ -211,7 +211,7 @@ mod test {
         // Query at an op_id higher than any existing op: Should see "value3" (latest write)
         let res = m.get(KeyQuery {
             op_id: current_max_op_id,
-            key: key.clone(),
+            key: KeyBytes::from(key.as_ref()),
         });
         assert!(res.is_some());
         assert_eq!(
@@ -439,10 +439,10 @@ mod test {
         let key_str = format!("key_final_{}", op_id);
         let value_str = format!("value_final_{}", op_id);
         let op = KVOpertion::new(
-            op_id,
-            key_str.as_bytes().into(),
-            OpType::Write(value_str.as_bytes().into()),
-        );
+                op_id,
+                key_str.as_bytes().into(),
+                OpType::Write(value_str.as_bytes().into()),
+            );
         m.insert(op).unwrap();
         assert!(m.is_full()); // It should remain full or exceed capacity
     }

@@ -107,7 +107,8 @@ mod test {
     use std::sync::Arc; // Moved from test functions
 
     use crate::db::common::{KVOpertion, OpId, OpType}; // OpType moved from helper
-    use crate::db::key::{KeySlice, KeyVec}; // KeyVec moved from helper
+    use crate::db::key::{KeySlice, KeyVec}; use crate::db::store::Store;
+    // KeyVec moved from helper
     use crate::db::table::test::create_test_table;
     use crate::db::table::TableBuilder; // Moved from helper
 
