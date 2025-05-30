@@ -28,8 +28,7 @@ pub struct Filestore {
     f: File,
 }
 
-impl Memstore {
-}
+impl Memstore {}
 
 impl Store for Memstore {
     fn close(self) {}

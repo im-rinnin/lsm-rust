@@ -40,12 +40,13 @@ impl<T: AsRef<[u8]>> Key<T> {
     pub fn to_string(&self) -> String {
         String::from_utf8_lossy(self.data.as_ref()).into_owned()
     }
-
 }
 
 impl From<&'_ [u8]> for KeyBytes {
     fn from(data: &'_ [u8]) -> Self {
-        KeyBytes { data: bytes::Bytes::copy_from_slice(data) }
+        KeyBytes {
+            data: bytes::Bytes::copy_from_slice(data),
+        }
     }
 }
 

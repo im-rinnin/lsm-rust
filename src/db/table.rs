@@ -192,38 +192,54 @@ impl<T: Store> TableReader<T> {
 pub struct TableIter<'a, T: Store> {
     table: &'a TableReader<T>,
     current_block_num: usize,
+    current_block_iter: Option<BlockIter>,
+    // Reusable buffer for reading block data
+    block_read_buffer: Option<Vec<u8>>,
 }
 impl<'a, T: Store> TableIter<'a, T> {
     pub fn new(table: &'a TableReader<T>) -> Self {
         TableIter {
             table,
             current_block_num: 0,
+            current_block_iter: None,
+            block_read_buffer: Some(vec![0; DATA_BLOCK_SIZE]), // Initialize reusable buffer
         }
     }
 }
 impl<'a, T: Store> Iterator for TableIter<'a, T> {
-    type Item = BlockReader;
+    type Item = KVOpertion;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Check if we have processed all data blocks according to the table metadata
-        if self.current_block_num >= self.table.block_metas.len() {
-            return None; // Iteration finished
+        loop {
+            // If we have a current block iterator, try to get the next item from it
+            if let Some(block_iter) = &mut self.current_block_iter {
+                if let Some(kv_op) = block_iter.next() {
+                    return Some(kv_op);
+                } else {
+                    // Block iterator is exhausted, take its buffer back for reuse
+                    let mut res = self.current_block_iter.take().unwrap().into();
+                    self.block_read_buffer = Some(res);
+                }
+            }
+
+            // Current block iterator is exhausted or not yet initialized, move to the next block
+            if self.current_block_num >= self.table.block_metas.len() {
+                return None; // No more blocks to process
+            }
+
+            let mut data = self.block_read_buffer.take().unwrap();
+
+            // Load the next block into the reusable buffer
+            let offset = self.current_block_num * DATA_BLOCK_SIZE;
+            self.table.store.read_at(&mut data, offset);
+            let block_reader = BlockReader::new(data); // Clone to pass ownership to BlockReader
+
+            // Increment block number for the next iteration
+            self.current_block_num += 1;
+
+            // Set the new block iterator and loop to try getting an item from it
+            self.current_block_iter = Some(block_reader.to_iter());
         }
-
-        // Calculate the file offset for the current data block
-        let offset = self.current_block_num * DATA_BLOCK_SIZE;
-
-        // Create a new buffer for this block's data
-        let mut block_buffer_data = vec![0; DATA_BLOCK_SIZE];
-
-        // Read exactly DATA_BLOCK_SIZE bytes from the store into the new buffer's Vec
-        self.table.store.read_at(&mut block_buffer_data, offset);
-
-        // Increment the block number for the *next* call to next()
-        self.current_block_num += 1;
-
-        // Return the BlockReader
-        Some(BlockReader::new(block_buffer_data))
     }
 }
 
@@ -501,11 +517,8 @@ pub mod test {
         // Check table contents by iterating
         let mut collected_kvs = Vec::new();
         let table_iter = table_reader.to_iter();
-        for block_reader in table_iter {
-            let block_iter = block_reader.to_iter();
-            for kv_op_read in block_iter {
-                collected_kvs.push(kv_op_read);
-            }
+        for kv_op_read in table_iter {
+            collected_kvs.push(kv_op_read);
         }
 
         assert_eq!(collected_kvs.len(), kvs.len());
@@ -536,11 +549,8 @@ pub mod test {
         // Check table contents by iterating
         let mut collected_kvs = Vec::new();
         let table_iter = table_reader.to_iter();
-        for block_reader in table_iter {
-            let block_iter = block_reader.to_iter();
-            for kv_op in block_iter {
-                collected_kvs.push(kv_op);
-            }
+        for kv_op in table_iter {
+            collected_kvs.push(kv_op);
         }
 
         assert_eq!(collected_kvs.len(), kvs.len());
@@ -570,19 +580,17 @@ pub mod test {
         let table_iter = table.to_iter();
         let mut kv_index = 0; // Track index in the original kvs Vec
 
-        for sstable_block in table_iter {
-            let iter = sstable_block.to_iter();
-            for kv in iter {
-                // Find the corresponding original kv operation
-                // This assumes the order is preserved, which should be the case
-                // if KViterAgg sorts correctly.
-                let original_kv = &kvs[kv_index];
+        for kv in table_iter {
+            println!("hi");
+            // Find the corresponding original kv operation
+            // This assumes the order is preserved, which should be the case
+            // if KViterAgg sorts correctly.
+            let original_kv = &kvs[kv_index];
 
-                assert_eq!(kv.id, original_kv.id);
-                assert_eq!(kv.key, original_kv.key);
-                assert_eq!(kv.op, original_kv.op);
-                kv_index += 1;
-            }
+            assert_eq!(kv.id, original_kv.id);
+            assert_eq!(kv.key, original_kv.key);
+            assert_eq!(kv.op, original_kv.op);
+            kv_index += 1;
         }
         // table has not enough space to save all kv
         assert!(kv_index < num);

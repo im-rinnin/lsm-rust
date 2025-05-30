@@ -21,6 +21,7 @@ use anyhow::Result;
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::Bytes;
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
@@ -214,6 +215,7 @@ pub struct BlockIter {
     data: Bytes, // Owns the buffer now
     num: usize,
     count: usize,
+    offset: usize,
 }
 impl Iterator for BlockIter {
     type Item = KVOpertion;
@@ -221,10 +223,9 @@ impl Iterator for BlockIter {
         if self.count == self.num {
             return None;
         }
-        let (res, offset) = KVOpertion::decode(self.data.clone());
-        println!("offset is {}",offset);
+        let (res, offset) = KVOpertion::decode(self.data.slice(self.offset..));
         self.count += 1;
-        self.data = self.data.slice(offset..);
+        self.offset += offset;
         Some(res)
     }
 }
@@ -235,7 +236,12 @@ impl BlockIter {
             data,
             num,
             count: 0,
+            offset: 0,
         }
+    }
+
+    pub fn into(self) -> Vec<u8> {
+        self.data.to_vec()
     }
 }
 

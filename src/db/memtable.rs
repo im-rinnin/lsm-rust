@@ -174,7 +174,7 @@ mod test {
         // Query at op_id 1: Should see "value2"
         let res = m.get(KeyQuery {
             op_id: op_id_1,
-            key: key.as_ref().into()
+            key: key.as_ref().into(),
         });
         assert!(res.is_some());
         assert_eq!(
@@ -189,7 +189,7 @@ mod test {
         // Query at op_id 2: Should see None (deleted)
         let res = m.get(KeyQuery {
             op_id: op_id_2,
-            key: key.as_ref().into()
+            key: key.as_ref().into(),
         });
         assert!(matches!(res.unwrap().0, OpType::Delete));
 
@@ -439,10 +439,10 @@ mod test {
         let key_str = format!("key_final_{}", op_id);
         let value_str = format!("value_final_{}", op_id);
         let op = KVOpertion::new(
-                op_id,
-                key_str.as_bytes().into(),
-                OpType::Write(value_str.as_bytes().into()),
-            );
+            op_id,
+            key_str.as_bytes().into(),
+            OpType::Write(value_str.as_bytes().into()),
+        );
         m.insert(op).unwrap();
         assert!(m.is_full()); // It should remain full or exceed capacity
     }
