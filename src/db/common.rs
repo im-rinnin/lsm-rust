@@ -173,11 +173,12 @@ impl<'a> OpTypeRef<'a> {
 }
 
 pub struct KViterAgg<'a> {
-    iters: Vec<&'a mut dyn Iterator<Item = &'a KVOpertion>>,
-    iters_next: Vec<Option<&'a KVOpertion>>,
+    iters: Vec<&'a mut dyn Iterator<Item = KVOpertion>>,
+    iters_next: Vec<Option<KVOpertion>>,
 }
+
 impl<'a> KViterAgg<'a> {
-    pub fn new(iters: Vec<&'a mut dyn Iterator<Item = &'a KVOpertion>>) -> Self {
+    pub fn new(iters: Vec<&'a mut dyn Iterator<Item = KVOpertion>>) -> Self {
         let mut res = KViterAgg {
             iters,
             iters_next: Vec::new(),
@@ -190,72 +191,69 @@ impl<'a> KViterAgg<'a> {
 }
 
 impl<'a> Iterator for KViterAgg<'a> {
-    type Item = &'a KVOpertion;
+    type Item = KVOpertion;
     fn next(&mut self) -> Option<Self::Item> {
         let mut has_next = false;
         for (i, n) in self.iters_next.iter_mut().enumerate() {
-            if n.is_none() {
-                *n = self.iters.get_mut(i).unwrap().next();
-            }
             if n.is_some() {
                 has_next = true;
+            } else {
+                *n = self.iters.get_mut(i).unwrap().next();
+                if n.is_some() {
+                    has_next = true;
+                }
             }
         }
-        // at least one iter in iters_next so we can just unwrap
-        if has_next == false {
+
+        if !has_next {
             return None;
         }
 
-        let mut kv_smallest_key: Option<&KVOpertion> = None;
-        let mut position = Vec::new();
-        for (index, current_kv) in self.iters_next.iter_mut().enumerate() {
-            if let Some(v) = current_kv {
-                match kv_smallest_key {
+        let mut smallest_key_index: Option<usize> = None;
+
+        for (index, current_kv_option) in self.iters_next.iter().enumerate() {
+            if let Some(current_kv) = current_kv_option {
+                match smallest_key_index {
                     None => {
-                        kv_smallest_key = current_kv.clone();
-                        assert_eq!(position.len(), 0);
-                        position.push(index);
+                        smallest_key_index = Some(index);
                     }
-                    Some(ref kv_res) => {
-                        let cmp_res = kv_res.key.cmp(&v.key);
+                    Some(s_idx) => {
+                        let smallest_kv = self.iters_next[s_idx].as_ref().unwrap();
+                        let cmp_res = current_kv.key.cmp(&smallest_kv.key);
                         match cmp_res {
-                            Ordering::Less => { //nothing
+                            Ordering::Less => {
+                                smallest_key_index = Some(index);
                             }
                             Ordering::Equal => {
-                                let id_cmp = kv_res.id.cmp(&v.id);
-                                match id_cmp {
-                                    Ordering::Greater => {
-                                        position.push(index);
-                                    }
-                                    Ordering::Equal => {
-                                        panic!("should not be same id ")
-                                    }
-                                    Ordering::Less => {
-                                        kv_smallest_key = current_kv.clone();
-                                        position.push(index);
-                                    }
+                                if current_kv.id > smallest_kv.id {
+                                    smallest_key_index = Some(index);
                                 }
-                                assert!(position.len() > 1);
                             }
-                            Ordering::Greater => {
-                                kv_smallest_key = current_kv.clone();
-                                position.clear();
-                                position.push(index);
-                            }
+                            Ordering::Greater => {}
                         }
                     }
                 }
             }
         }
-        assert!(kv_smallest_key.is_some());
-        // remove all other kv same key but id is less
-        for position in &position {
-            let t = self.iters_next.get_mut(*position).unwrap();
-            *t = None;
+
+        if let Some(s_idx) = smallest_key_index {
+            let result_kv = self.iters_next[s_idx].take(); // Take the value out
+            for (index, current_kv_option) in self.iters_next.iter_mut().enumerate() {
+                if index != s_idx {
+                    if let Some(current_kv) = current_kv_option {
+                        if current_kv.key == result_kv.as_ref().unwrap().key {
+                            *current_kv_option = None; // Invalidate other KVs with the same key
+                        }
+                    }
+                }
+            }
+            result_kv
+        } else {
+            None
         }
-        kv_smallest_key
     }
 }
+
 pub mod test {
     use super::KVOpertionRef;
     use super::OpTypeRef;
@@ -282,12 +280,12 @@ pub mod test {
             )
         };
 
-        let a_ops: Vec<KVOpertion> = a.iter().map(f).collect();
-        let mut a_iter_ref = a_ops.iter();
-        let b_ops: Vec<_> = b.iter().map(f).collect();
-        let mut b_iter_ref = b_ops.iter();
-        let c_ops: Vec<_> = c.iter().map(f).collect();
-        let mut c_iter_ref = c_ops.iter();
+        let a_ops: Vec<KVOpertion> = a.iter().map(|x| f(x)).collect();
+        let mut a_iter_ref = a_ops.into_iter();
+        let b_ops: Vec<_> = b.iter().map(|x| f(x)).collect();
+        let mut b_iter_ref = b_ops.into_iter();
+        let c_ops: Vec<_> = c.iter().map(|x| f(x)).collect();
+        let mut c_iter_ref = c_ops.into_iter();
 
         let kv_iter = KViterAgg::new(vec![&mut a_iter_ref, &mut b_iter_ref, &mut c_iter_ref]);
         let expect = vec![

@@ -184,7 +184,7 @@ impl BlockBuilder {
         Ok(self.buffer.get_ref().as_ref())
     }
 
-    pub fn fill<'a, T: Iterator<Item = &'a KVOpertion>>(
+    pub fn fill<T: Iterator<Item = KVOpertion>>(
         &mut self,
         it: &mut Peekable<T>,
     ) -> Result<&[u8]> {
@@ -202,7 +202,7 @@ impl BlockBuilder {
             if current_size + size + 8 > DATA_BLOCK_SIZE {
                 break; // Block is full
             }
-            self.add((*item).clone());
+            self.add(item.clone());
             current_size += size;
             //
             it.next(); // Consume the item
@@ -296,10 +296,8 @@ pub mod test {
 
         v
     }
-    fn build_block_from_kvs_iter(
-        kvs: &[KVOpertion], // Take a slice to create an iterator
-    ) -> BlockReader {
-        let mut kv_iter = kvs.iter();
+    fn build_block_from_kvs_iter(kvs: Vec<KVOpertion>) -> BlockReader {
+        let mut kv_iter = kvs.into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder.fill(&mut kv_iter_agg).expect("fill error");
@@ -324,7 +322,7 @@ pub mod test {
         // sort kvs by key
         kvs.sort_by(|a, b| a.key.cmp(&b.key));
 
-        let mut br = build_block_from_kvs_iter(&kvs); // Make br mutable
+        let mut br = build_block_from_kvs_iter(kvs); // Make br mutable
 
         // Test search for key "50" with op_id 10000
         let key50_slice = KeySlice::from(key50_str.as_bytes());
@@ -404,7 +402,7 @@ pub mod test {
 
         // Build buffer
         let mut block_builder = BlockBuilder::new();
-        block_builder.fill(&mut kvs.iter().peekable()).unwrap();
+        block_builder.fill(&mut kvs.into_iter().peekable()).unwrap();
         let block_reader = BlockReader::new(block_builder.into_inner());
 
         // Check search result for key "5" with a high enough op_id
@@ -424,7 +422,7 @@ pub mod test {
     fn test_block_builder() {
         // write kv, key range from string 0 to string 100 ,value is same as key, to BlockBuilder
         let iter = create_kv_data_in_range_zero_to(100);
-        let br = build_block_from_kvs_iter(&iter);
+        let br = build_block_from_kvs_iter(iter);
         let mut block_it = br.to_iter();
 
         let mut count = 0;
@@ -460,7 +458,7 @@ pub mod test {
     fn test_block_reader_count() {
         let num_kvs = 100;
         let kvs = create_kv_data_in_range_zero_to(num_kvs);
-        let br = build_block_from_kvs_iter(&kvs);
+        let br = build_block_from_kvs_iter(kvs);
 
         // Assert that the count method returns the correct number of key-value pairs
         assert_eq!(
@@ -474,7 +472,7 @@ pub mod test {
     fn test_block_reader_first_key() {
         let num_kvs = 100;
         let kvs = create_kv_data_in_range_zero_to(num_kvs);
-        let br = build_block_from_kvs_iter(&kvs);
+        let br = build_block_from_kvs_iter(kvs.clone());
 
         // The first key should be the key from the first KV operation
         let expected_first_key = &kvs[0].key;
@@ -490,7 +488,7 @@ pub mod test {
     #[test]
     fn test_block_iter() {
         let iter = create_kv_data_in_range_zero_to(100);
-        let mut kv_iter = iter.iter();
+        let mut kv_iter = iter.into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder.fill(&mut kv_iter_agg).unwrap();
@@ -545,7 +543,7 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(5); // Use 5 KVs
 
         // Build a block from these KVs
-        let mut kv_iter = kvs.iter();
+        let mut kv_iter = kvs.clone().into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder
@@ -569,7 +567,7 @@ pub mod test {
     fn test_block_builder_empty_iterator() {
         // Create an empty iterator
         let kvs: Vec<KVOpertion> = Vec::new();
-        let mut kv_iter = kvs.iter();
+        let mut kv_iter = kvs.into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
 
         // Build a block with the empty iterator - should result in an error
@@ -589,7 +587,7 @@ pub mod test {
     fn test_block_builder_with_oversized_data() {
         // Create a large dataset that exceeds DATA_BLOCK_SIZE
         let kvs = create_kv_data_in_range_zero_to(200); // Create more data than can fit in one block
-        let mut kv_iter = kvs.iter();
+        let mut kv_iter = kvs.clone().into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
 
         // Build a block with the oversized data
