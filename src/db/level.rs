@@ -1,9 +1,12 @@
 use std::{sync::Arc, usize};
 
+use bincode::Options;
+
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
     db_meta::{DBMeta, ThreadDbMeta},
     key::{KeySlice, KeyVec},
+    lsm_storage::LsmStorage,
     store::{Store, StoreId},
     table::*,
 };
@@ -18,13 +21,14 @@ struct LevelChange {
     insert_tables: Vec<(SStablePositon, StoreId)>,
 }
 
+#[derive(Clone)]
 pub struct Level<T: Store> {
     // sstable sorted  by (key,op id)
-    sstables: Vec<Arc<TableReader<T>>>,
+    sstables: Vec<ThreadSafeTableReader<T>>,
     is_level_zero: bool,
 }
 impl<T: Store> Level<T> {
-    pub fn new(sstables: Vec<Arc<TableReader<T>>>, is_level_zero: bool) -> Self {
+    pub fn new(sstables: Vec<ThreadSafeTableReader<T>>, is_level_zero: bool) -> Self {
         Level {
             sstables,
             is_level_zero,
@@ -71,6 +75,7 @@ pub struct LevelStorege<T: Store> {
     levels: Vec<Level<T>>,
     //level table increase ratio betweent two level.
     //level n+1 table len =level n table len *ratio
+    level_zeor_num_limit: usize,
     level_ratio: usize,
 }
 
@@ -78,6 +83,7 @@ impl<T: Store> LevelStorege<T> {
     pub fn new(tables: Vec<Level<T>>, r: usize) -> Self {
         LevelStorege {
             levels: tables,
+            level_zeor_num_limit: 4, // This should ideally come from configuration
             level_ratio: r,
         }
     }
@@ -92,11 +98,99 @@ impl<T: Store> LevelStorege<T> {
     }
     // compact table to next level tables which key range overlay
     // table=self.sstables[index]
-    pub fn compact(&self, index: usize, meta: ThreadDbMeta<T>) -> Vec<TableReader<T>> {
+    pub fn compact<F: Fn() -> usize>(
+        &self,
+        index: usize,
+        store_id_builder: F,
+    ) -> Vec<TableReader<T>> {
         unimplemented!()
     }
+    fn compact_storage(&self, meta: ThreadDbMeta<T>) -> Option<LsmStorage<T>> {
+        // check level zero if len <=level_zeor_num_limit return
+        // others need compact
+        // create lsm_storage result
+        // compact zero and one level , set output as  lsm_storage level one
+        // set currnt level to one, name it as l
+        // loop begin
+        // check l table len, if > limit  do compacte others break
+        // take table which has min key in l compact with l+1 level  set output as lsm_storage
+        // level l+1
+        // loop end
+        // copy  l,l+1.. level max  to lsm_storage result
+        // return lsm_storage result
+
+        unimplemented!()
+    }
+
+    // input_tables is sorted by (key ,op id)
+    fn compact_level(
+        store_id_start: usize,
+        input_tables: Vec<ThreadSafeTableReader<T>>,
+        level: Level<T>,
+    ) -> Level<T> {
+        // get key range in input_tables()
+        // find table which key range overlay with key range in level
+        // compact  these table with input, get output tables
+        // find all table in level not involed in compact, merge them with compact output table and
+        // these is level output
+        unimplemented!()
+    }
+
+    // return table need to be compact
+    fn table_to_compact(&self, level_depth: usize) -> Vec<ThreadSafeTableReader<T>> {
+        let level = self.levels.get(level_depth).expect("wrong level depth");
+        if level.is_level_zero {
+            // If it's level zero, return all tables
+            level.sstables.clone()
+        } else {
+            // For other levels, return the table with the minimum store id
+            let min_table = level
+                .sstables
+                .iter()
+                .min_by_key(|table| table.store_id())
+                .cloned();
+            match min_table {
+                Some(table) => vec![table],
+                None => panic!("level {} can't be empty", level_depth), // No tables in this level
+            }
+        }
+    }
+    fn table_range_overlap(
+        &self,
+        start_key: &KeySlice,
+        end_key: &KeySlice,
+        level_depth: usize,
+        // return table index range in self.level none mean no overlap
+    ) -> Option<(usize, usize)> {
+        let level = self.levels.get(level_depth).expect("wrong level depth ");
+        let mut first_overlap_idx: Option<usize> = None;
+        let mut last_overlap_idx: Option<usize> = None;
+
+        for (i, table) in level.sstables.iter().enumerate() {
+            let (table_min_key, table_max_key) = table.key_range();
+
+            // Check for overlap between [start_key, end_key] and [table_min_key, table_max_key]
+            // Overlap occurs if (start_key <= table_max_key) AND (end_key >= table_min_key)
+            if start_key.as_ref().le(table_max_key.as_ref())
+                && end_key.as_ref().ge(table_min_key.as_ref())
+            {
+                if first_overlap_idx.is_none() {
+                    first_overlap_idx = Some(i);
+                }
+                last_overlap_idx = Some(i);
+            }
+        }
+
+        match (first_overlap_idx, last_overlap_idx) {
+            (Some(first), Some(last)) => Some((first, last)),
+            _ => None, // No overlap found
+        }
+    }
+
     // return level index and table index which need to be compacted
-    fn check_level_size(&self) -> Option<(usize, usize)> {
+    fn check_level(&self) -> Option<(usize, usize)> {
+        // start from level zero to last level
+        // if
         unimplemented!()
     }
 }
@@ -108,6 +202,7 @@ mod test {
 
     use crate::db::common::{KVOpertion, OpId, OpType}; // OpType moved from helper
     use crate::db::key::{KeySlice, KeyVec};
+    use crate::db::level::Level;
     use crate::db::store::Store;
     // KeyVec moved from helper
     use crate::db::table::test::create_test_table;
@@ -372,6 +467,186 @@ mod test {
         );
     }
 
+    // New helper to create test table with custom ID
+    fn create_test_table_with_id(range: Range<usize>, id: String) -> TableReader<Memstore> {
+        let mut v = Vec::new();
+        for i in range.clone() {
+            let tmp = KVOpertion::new(
+                i as u64,
+                crate::db::block::test::pad_zero(i as u64).as_bytes().into(),
+                OpType::Write(i.to_string().as_bytes().into()),
+            );
+            v.push(tmp);
+        }
+        let mut store = Memstore::create(&id);
+        let mut table = TableBuilder::new_with_store(store);
+        table.fill_with_op(v.iter());
+        let res = table.flush();
+        res
+    }
+
+    #[test]
+    fn test_table_to_compact() {
+        // Case 1: Level Zero (is_level_zero = true)
+        let table_a = Arc::new(create_test_table(0..10)); // id: "test_id_0_10"
+        let table_b = Arc::new(create_test_table(10..20)); // id: "test_id_10_20"
+        let table_c = Arc::new(create_test_table(20..30)); // id: "test_id_20_30"
+
+        let level_zero = super::Level::new(
+            vec![table_a.clone(), table_b.clone(), table_c.clone()],
+            true,
+        );
+        let level_storage_zero = super::LevelStorege::new(vec![level_zero], 2);
+
+        let compacted_tables_zero = level_storage_zero.table_to_compact(0);
+        assert_eq!(compacted_tables_zero.len(), 3);
+        let mut compacted_ids: Vec<String> = compacted_tables_zero
+            .iter()
+            .map(|table| table.store_id())
+            .collect();
+        compacted_ids.sort(); // Sort to ensure consistent order for comparison
+
+        let mut expected_ids = vec![table_a.store_id(), table_b.store_id(), table_c.store_id()];
+        expected_ids.sort(); // Sort expected IDs as well
+
+        assert_eq!(compacted_ids, expected_ids);
+
+        // Case 2: Non-Level Zero (is_level_zero = false)
+        // Create tables with specific IDs to control the min_by_key behavior
+        let table_x = Arc::new(create_test_table_with_id(0..10, "id_001".to_string()));
+        let table_y = Arc::new(create_test_table_with_id(10..20, "id_000".to_string())); // This should be the min
+        let table_z = Arc::new(create_test_table_with_id(20..30, "id_002".to_string()));
+
+        let level_n = super::Level::new(
+            vec![table_x.clone(), table_y.clone(), table_z.clone()],
+            false,
+        );
+        let level_storage_n = super::LevelStorege::new(vec![level_n], 2);
+
+        let compacted_tables_n = level_storage_n.table_to_compact(0);
+        assert_eq!(compacted_tables_n.len(), 1);
+        assert_eq!(compacted_tables_n[0].store_id(), "id_000".to_string());
+        assert_eq!(compacted_tables_n[0].key_range(), table_y.key_range()); // Ensure it's table_y
+    }
+
     #[test]
     fn test_compact() {}
+
+    #[test]
+    fn test_table_range_overlap() {
+        // Create tables for a non-level zero scenario (non-overlapping tables)
+        // Table 0: keys "000000" to "000099"
+        let table_0 = Arc::new(create_test_table(0..100));
+        // Table 1: keys "000100" to "000199"
+        let table_1 = Arc::new(create_test_table(100..200));
+        // Table 2: keys "000200" to "000299"
+        let table_2 = Arc::new(create_test_table(200..300));
+
+        let level_n = super::Level::new(
+            vec![table_0.clone(), table_1.clone(), table_2.clone()],
+            false, // Not level zero
+        );
+
+        let level_storage = super::LevelStorege::new(vec![level_n], 2); // Level 0 is the only level here
+
+        let level_depth = 0; // We are testing the first (and only) level
+
+        // Test Case 1: Range fully within one table (table_0)
+        let start_key = KeySlice::from("000020".as_bytes());
+        let end_key = KeySlice::from("000070".as_bytes());
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            Some((0, 0))
+        );
+
+        // Test Case 2: Range exactly matches one table (table_1)
+        let start_key = KeySlice::from("000100".as_bytes());
+        let end_key = KeySlice::from("000199".as_bytes());
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            Some((1, 1))
+        );
+
+        // Test Case 3: Range overlaps with the end of one table and start of another (table_0 and table_1)
+        let start_key = KeySlice::from("000050".as_bytes());
+        let end_key = KeySlice::from("000150".as_bytes());
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            Some((0, 1))
+        );
+
+        // Test Case 4: Range overlaps with the end of one table and start of another (table_1 and table_2)
+        let start_key = KeySlice::from("000150".as_bytes());
+        let end_key = KeySlice::from("000250".as_bytes());
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            Some((1, 2))
+        );
+
+        // Test Case 5: Range spans across all tables
+        let start_key = KeySlice::from("000000".as_bytes());
+        let end_key = KeySlice::from("000299".as_bytes());
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            Some((0, 2))
+        );
+
+        // Test Case 7: Range completely after all tables
+        let start_key = KeySlice::from("000300".as_bytes());
+        let end_key = KeySlice::from("000350".as_bytes());
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            None
+        );
+
+        // Test Case 8: Range between two tables (no overlap)
+        let start_key = KeySlice::from("000099X".as_bytes()); // Just after table 0
+        let end_key = KeySlice::from("000099Z".as_bytes()); // Just before table 1
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            None
+        );
+
+        // Test Case 9: Empty level
+        let empty_level: Level<Memstore> = super::Level::new(vec![], false);
+        let empty_level_storage = super::LevelStorege::new(vec![empty_level], 2);
+        let start_key = KeySlice::from("key_start".as_bytes());
+        let end_key = KeySlice::from("key_end".as_bytes());
+        assert_eq!(
+            empty_level_storage.table_range_overlap(&start_key, &end_key, 0),
+            None
+        );
+
+        // Test Case 10: Overlap at exact boundaries
+        let start_key = KeySlice::from("000099".as_bytes()); // Ends exactly at Table 0 max key
+        let end_key = KeySlice::from("000100".as_bytes()); // Starts exactly at Table 1 min key
+        assert_eq!(
+            level_storage.table_range_overlap(&start_key, &end_key, level_depth),
+            Some((0, 1))
+        );
+
+        // Test Case 11: Single table in level
+        let single_table_level = super::Level::new(vec![table_1.clone()], false);
+        let single_table_level_storage = super::LevelStorege::new(vec![single_table_level], 2);
+        let start_key = KeySlice::from("000120".as_bytes());
+        let end_key = KeySlice::from("000180".as_bytes());
+        assert_eq!(
+            single_table_level_storage.table_range_overlap(&start_key, &end_key, 0),
+            Some((0, 0))
+        );
+
+        let start_key = KeySlice::from("000090".as_bytes()); // Before
+        let end_key = KeySlice::from("000095".as_bytes());
+        assert_eq!(
+            single_table_level_storage.table_range_overlap(&start_key, &end_key, 0),
+            None
+        );
+
+        let start_key = KeySlice::from("000200".as_bytes()); // After
+        let end_key = KeySlice::from("000210".as_bytes());
+        assert_eq!(
+            single_table_level_storage.table_range_overlap(&start_key, &end_key, 0),
+            None
+        );
+    }
 }

@@ -19,13 +19,16 @@ pub trait Store {
     fn len(&self) -> usize;
     fn close(self);
     fn create(id: &StoreId) -> Self;
+    fn id(&self) -> StoreId;
 }
 
 pub struct Memstore {
     store: RefCell<Cursor<Vec<u8>>>,
+    id: StoreId,
 }
 pub struct Filestore {
     f: File,
+    id: StoreId,
 }
 
 impl Memstore {}
@@ -35,7 +38,11 @@ impl Store for Memstore {
     fn create(id: &StoreId) -> Self {
         Memstore {
             store: RefCell::new(Cursor::new(Vec::new())),
+            id: id.clone(),
         }
+    }
+    fn id(&self) -> StoreId {
+        self.id.clone()
     }
 
     fn len(&self) -> usize {
@@ -67,13 +74,19 @@ impl Store for Memstore {
 
 impl Filestore {
     fn open(dir_path: String) -> Self {
-        let res = File::open(dir_path);
-        Filestore { f: res.unwrap() }
+        let res = File::open(&dir_path);
+        Filestore {
+            f: res.unwrap(),
+            id: dir_path.clone(),
+        }
     }
 }
 impl Store for Filestore {
     fn flush(&mut self) {
         self.f.sync_data();
+    }
+    fn id(&self) -> StoreId {
+        self.id.clone()
     }
     fn create(id: &StoreId) -> Self {
         unimplemented!()
@@ -223,6 +236,7 @@ mod test {
         // Test empty file
         let filestore = Filestore {
             f: File::open(path).unwrap(),
+            id: path.to_str().unwrap().to_string(),
         };
         assert_eq!(filestore.len(), 0);
 
@@ -230,6 +244,7 @@ mod test {
         fs::write(path, b"test data").unwrap();
         let filestore = Filestore {
             f: File::open(path).unwrap(),
+            id: path.to_str().unwrap().to_string(),
         };
         assert_eq!(filestore.len(), 9);
     }
@@ -249,7 +264,10 @@ mod test {
             .open(&path)
             .unwrap();
 
-        let mut filestore = Filestore { f: file };
+        let mut filestore = Filestore {
+            f: file,
+            id: path.to_str().unwrap().to_string(),
+        };
 
         // Append first part
         let data1 = b"hello";
@@ -285,7 +303,10 @@ mod test {
             .open(&path)
             .unwrap();
 
-        let mut filestore = Filestore { f: file };
+        let mut filestore = Filestore {
+            f: file,
+            id: path.to_str().unwrap().to_string(),
+        };
 
         // Write 10 bytes
         let initial_data = b"0123456789";
@@ -333,7 +354,10 @@ mod test {
             .open(&path)
             .unwrap();
 
-        let mut filestore = Filestore { f: file };
+        let mut filestore = Filestore {
+            f: file,
+            id: path.to_str().unwrap().to_string(),
+        };
 
         // Append 10 bytes
         let data = b"0123456789";

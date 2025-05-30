@@ -8,6 +8,7 @@ use std::{
     io::{Cursor, Read, Seek, Write},
     iter::Peekable,
     ops::Not,
+    sync::Arc,
     u64, usize,
 };
 
@@ -28,7 +29,10 @@ use super::{
     db_meta::{self, DBMeta},
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
+pub type ThreadSafeTableReader<T> = Arc<TableReader<T>>;
+
 #[derive(PartialEq, Debug)]
 struct BlockMeta {
     first_key: KeyVec,
@@ -96,6 +100,9 @@ impl<T: Store> TableReader<T> {
         }
 
         TableReader { store, block_metas }
+    }
+    pub fn store_id(&self) -> StoreId {
+        self.store.id()
     }
     // min and max key in table
     pub fn key_range(&self) -> (KeyVec, KeyVec) {
