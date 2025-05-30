@@ -4,7 +4,6 @@
 // block
 // [[entry],[entry],...[entry][count(u64)]]
 
-use crate::db::common::OpTypeRef;
 use std::io::BufRead;
 use std::iter::Peekable;
 use std::ops::Not;
@@ -25,7 +24,7 @@ use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
-use crate::db::common::{new_buffer, Buffer, KVOpertion, KViterAgg}; // Removed write_kv_operion
+use crate::db::common::{new_buffer, Buffer, KVOpertion, KViterAgg};
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
 use crate::db::key::KeyVec;
@@ -62,18 +61,20 @@ impl BlockReader {
         }
     }
 
-    pub fn search(&self, key: &KeySlice, op_id: OpId) -> Option<(OpTypeRef, OpId)> {
+    pub fn search(&self, key: &KeySlice, op_id: OpId) -> Option<(OpType, OpId)> {
         // The actual block data is everything before the last 8 bytes (count)
-        let data_slice = &self.data[..self.data.len() - std::mem::size_of::<u64>()];
+        let data_slice = &self
+            .data
+            .slice(..self.data.len() - std::mem::size_of::<u64>());
         let mut cursor = Cursor::new(data_slice);
 
-        let mut result: Option<(OpTypeRef, OpId)> = None;
+        let mut result: Option<(OpType, OpId)> = None;
         let mut last_matching_id: OpId = 0; // Keep track of the highest ID found for the key <= op_id
 
         // Iterate through the KV operations in the block
         for _ in 0..self.count {
             // Decode the next KV operation from the cursor
-            let kv_op = KVOpertionRef::decode(&data_slice[cursor.position() as usize..]);
+            let (kv_op, _) = KVOpertion::decode(data_slice.slice(cursor.position() as usize..));
 
             // Move the cursor past the decoded KV operation
             cursor.set_position(cursor.position() + kv_op.encode_size() as u64);
@@ -93,7 +94,7 @@ impl BlockReader {
                 }
             }
         }
-        result // Return the OpType and OpId of the latest relevant operation found, if any
+        result
     }
     pub fn to_iter(self) -> BlockIter {
         // Create a BlockIter, transferring ownership of the buffer and count.
@@ -153,7 +154,7 @@ impl BlockBuilder {
         self.buffer.set_position(0);
     }
 
-    pub fn add(&mut self, op: &KVOpertionRef) -> bool {
+    pub fn add(&mut self, op: KVOpertion) -> bool {
         let op_size = op.encode_size();
         // Check if adding the current operation would exceed the block size limit,
         // considering space for the final count (u64).
@@ -201,7 +202,7 @@ impl BlockBuilder {
             if current_size + size + 8 > DATA_BLOCK_SIZE {
                 break; // Block is full
             }
-            self.add(&KVOpertionRef::from_op(&item));
+            self.add((*item).clone());
             current_size += size;
             //
             it.next(); // Consume the item
@@ -263,7 +264,6 @@ pub mod test {
     use std::usize;
 
     use super::BlockIter;
-    use crate::db::common::OpTypeRef;
     // pad zero at begin to length 6
     // panic if len of i is eq or more than 6
     // e.g. 11 ->"000011" 123456->"123456"
@@ -296,8 +296,8 @@ pub mod test {
 
         v
     }
-    fn build_block_from_kvs_iter<'a>(
-        kvs: &'a [KVOpertion], // Take a slice to create an iterator
+    fn build_block_from_kvs_iter(
+        kvs: &[KVOpertion], // Take a slice to create an iterator
     ) -> BlockReader {
         let mut kv_iter = kvs.iter();
         let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
@@ -331,7 +331,7 @@ pub mod test {
         let result50_high_id = br.search(&key50_slice.clone(), 10000);
         assert_eq!(
             result50_high_id,
-            Some((OpTypeRef::Write("51".as_bytes().into()), 10000)),
+            Some((OpType::Write("51".as_bytes().into()), 10000)),
             "Should find key '50' with value '51' for op_id 10000"
         );
 
@@ -339,7 +339,7 @@ pub mod test {
         let result50_low_id = br.search(&key50_slice, 50);
         assert_eq!(
             result50_low_id,
-            Some((OpTypeRef::Write(50.to_string().as_bytes().into()), 50)),
+            Some((OpType::Write(50.to_string().as_bytes().into()), 50)),
             "Should find key '50' with value '50' for op_id 50"
         );
 
@@ -350,7 +350,7 @@ pub mod test {
         let result10 = br.search(&key10_slice, 10);
         assert_eq!(
             result10,
-            Some((OpTypeRef::Write(10.to_string().as_bytes().into()), 10)),
+            Some((OpType::Write(10.to_string().as_bytes().into()), 10)),
             "Should find key '10'"
         );
 
@@ -359,7 +359,7 @@ pub mod test {
         let result0 = br.search(&key0_slice, 0); // op_id for key "0" is 0
         assert_eq!(
             result0,
-            Some((OpTypeRef::Write(0.to_string().as_bytes().into()), 0)),
+            Some((OpType::Write(0.to_string().as_bytes().into()), 0)),
             "Should find key '0'"
         );
 
@@ -416,7 +416,7 @@ pub mod test {
         // Assert that the latest version ("duplicate_15") is found
         assert_eq!(
             result,
-            Some((OpTypeRef::Write("duplicate_15".as_bytes().into()), 15))
+            Some((OpType::Write("duplicate_15".as_bytes().into()), 15))
         );
     }
 
@@ -510,8 +510,8 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(num_kvs);
 
         let mut builder = BlockBuilder::new();
-        for kv in &kvs {
-            builder.add(&KVOpertionRef::from_op(&kv));
+        for kv in kvs.iter() {
+            builder.add(kv.clone());
         }
 
         builder.finish().expect("Failed to finish block");
@@ -643,7 +643,7 @@ pub mod test {
             "key1".as_bytes().into(),
             OpType::Write("value1".as_bytes().into()),
         );
-        builder.add(&KVOpertionRef::from_op(&kv1));
+        builder.add(kv1.clone());
         assert_eq!(
             builder.last_key().unwrap().as_ref(),
             "key1".as_bytes(),
@@ -656,7 +656,7 @@ pub mod test {
             "key2".as_bytes().into(),
             OpType::Write("value2".as_bytes().into()),
         );
-        builder.add(&KVOpertionRef::from_op(&kv2));
+        builder.add(kv2.clone());
         assert_eq!(
             builder.last_key().unwrap().as_ref(),
             "key2".as_bytes(),
@@ -669,7 +669,7 @@ pub mod test {
             "key3".as_bytes().into(),
             OpType::Write("value3".as_bytes().into()),
         );
-        builder.add(&KVOpertionRef::from_op(&kv3));
+        builder.add(kv3.clone());
         assert_eq!(
             builder.last_key().unwrap().as_ref(),
             "key3".as_bytes(),
@@ -688,7 +688,7 @@ pub mod test {
                 OpType::Write(value_str.as_bytes().into()),
             );
 
-            if !full_builder.add(&KVOpertionRef::from_op(&kv_op)) {
+            if !full_builder.add(kv_op.clone()) {
                 break; // Block is full
             }
             last_added_key = Some(KeyVec::from(kv_op.key.as_ref()));
@@ -710,7 +710,7 @@ pub mod test {
             "key1".as_bytes().into(),
             OpType::Write("value1".as_bytes().into()),
         );
-        builder.add(&KVOpertionRef::from_op(&kv1));
+        builder.add(kv1.clone());
 
         // Verify state before reset
         assert!(
@@ -750,7 +750,7 @@ pub mod test {
             OpType::Write("value2".as_bytes().into()),
         );
         assert!(
-            builder.add(&KVOpertionRef::from_op(&kv2)),
+            builder.add(kv2.clone()),
             "Should be able to add after reset"
         );
         assert_eq!(builder.count, 1, "Count should be 1 after adding again");
@@ -774,7 +774,7 @@ pub mod test {
                 OpType::Write(format!("value_{}", i).as_bytes().into()),
             );
 
-            if !builder.add(&KVOpertionRef::from_op(&kv_op)) {
+            if !builder.add(kv_op.clone()) {
                 // If add returns false, the block is full
                 break;
             }
@@ -791,7 +791,7 @@ pub mod test {
             OpType::Write(format!("value_{}", added_count).as_bytes().into()),
         );
         assert!(
-            !builder.add(&KVOpertionRef::from_op(&last_kv_op)),
+            !builder.add(last_kv_op.clone()),
             "Adding an item after block is full should return false"
         );
 

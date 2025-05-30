@@ -14,6 +14,7 @@ use bytes::Bytes;
 use std::mem::size_of;
 
 use super::key::KeyBytes;
+use super::key::ValueByte;
 use super::key::{KeyVec, ValueVec}; // Added for kv_opertion_len // Added for kv_opertion_len
 
 pub type Value<'a> = &'a [u8];
@@ -99,7 +100,7 @@ impl<'a> KVOpertionRef<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct KVOpertion {
     pub id: OpId,
     pub key: KeyBytes,
@@ -111,17 +112,6 @@ impl KVOpertion {
             id: id,
             key: KeyBytes::from_vec(key.into_inner()),
             op: op,
-        }
-    }
-    pub fn from_ref(op_ref: KVOpertionRef) -> Self {
-        let op_type = match op_ref.op {
-            OpTypeRef::Write(v) => OpType::Write(ValueVec::from_vec(v.as_ref().to_vec())),
-            OpTypeRef::Delete => OpType::Delete,
-        };
-        KVOpertion {
-            id: op_ref.id,
-            key: KeyBytes::from_vec(op_ref.key.as_ref().to_vec()),
-            op: op_type,
         }
     }
 
@@ -149,7 +139,7 @@ impl KVOpertion {
                 let value_end_offset = value_start_offset + value_len;
                 let value_data_bytes = r.slice(value_start_offset..value_end_offset);
                 cursor.set_position(value_end_offset as u64);
-                OpType::Write(ValueVec::from_vec(value_data_bytes.to_vec()))
+                OpType::Write(ValueByte::from_bytes(value_data_bytes))
             }
             _ => panic!("Unknown OpType byte: {}", op_type_byte),
         };
@@ -165,16 +155,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type OpId = u64;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)] // Added Clone
 pub enum OpType {
-    Write(ValueVec),
+    Write(ValueByte),
     Delete,
-}
-impl OpType {
-    pub fn from_ref(op_ref: OpTypeRef) -> Self {
-        match op_ref {
-            OpTypeRef::Write(v) => OpType::Write(ValueVec::from_vec(v.as_ref().to_vec())),
-            OpTypeRef::Delete => OpType::Delete,
-        }
-    }
 }
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum OpTypeRef<'a> {

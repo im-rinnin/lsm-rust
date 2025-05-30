@@ -14,7 +14,7 @@ use std::{
 
 use crate::db::{
     common::{new_buffer, Buffer, KVOpertion, KViterAgg, OpId, OpType, Result, Value},
-    key::{KeySlice, KeyVec},
+    key::{KeySlice, KeyVec, ValueByte},
     memtable::Memtable,
     store::{Store, StoreId},
 };
@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
-    common::{KVOpertionRef, OpTypeRef, SearchResult},
+    common::{OpTypeRef, SearchResult},
     db_meta::{self, DBMeta},
+    key::KeyBytes,
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -35,8 +36,8 @@ pub type ThreadSafeTableReader<T> = Arc<TableReader<T>>;
 
 #[derive(PartialEq, Debug)]
 struct BlockMeta {
-    first_key: KeyVec,
-    last_key: KeyVec,
+    first_key: KeyBytes,
+    last_key: KeyBytes,
 }
 
 impl BlockMeta {
@@ -55,13 +56,13 @@ impl BlockMeta {
         let first_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
         let mut first_key_data = vec![0u8; first_key_len];
         r.read_exact(&mut first_key_data).unwrap();
-        let first_key = KeyVec::from_vec(first_key_data);
+        let first_key = KeyBytes::from_vec(first_key_data);
 
         // Decode last_key
         let last_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
         let mut last_key_data = vec![0u8; last_key_len];
         r.read_exact(&mut last_key_data).unwrap();
-        let last_key = KeyVec::from_vec(last_key_data);
+        let last_key = KeyBytes::from_vec(last_key_data);
 
         BlockMeta {
             first_key,
@@ -105,10 +106,9 @@ impl<T: Store> TableReader<T> {
         self.store.id()
     }
     // min and max key in table
-    pub fn key_range(&self) -> (KeyVec, KeyVec) {
+    pub fn key_range(&self) -> (KeyBytes, KeyBytes) {
         if self.block_metas.is_empty() {
-            // Return empty KeyVecs if the table has no blocks
-            return (KeyVec::new(), KeyVec::new());
+            panic!("table can't be empty")
         }
         let first_key = self.block_metas.first().unwrap().first_key.clone();
         let last_key = self.block_metas.last().unwrap().last_key.clone();
@@ -176,11 +176,8 @@ impl<T: Store> TableReader<T> {
             self.store.read_at(&mut block_buffer_data, offset);
             let block_reader = BlockReader::new(block_buffer_data);
 
-            if let Some((op_type_ref, op_id_found)) = block_reader.search(&key, id) {
-                let current_op_type = match op_type_ref {
-                    OpTypeRef::Write(v) => OpType::Write(KeyVec::from(v.as_ref())),
-                    OpTypeRef::Delete => OpType::Delete,
-                };
+            if let Some((current_op_type, op_id_found)) = block_reader.search(&key, id) {
+                // current_op_type is already OpType, no need for conversion
                 match best_op {
                     Some((_, current_best_id)) => {
                         if op_id_found > current_best_id {
@@ -255,7 +252,7 @@ pub struct TableBuilder<T: Store> {
     store: T,
     block_metas: Vec<BlockMeta>,
     block_num_limit: usize,
-    current_block_first_key: Option<KeyVec>,
+    current_block_first_key: Option<KeyBytes>,
     block_builder: BlockBuilder,
 }
 impl<T: Store> TableBuilder<T> {
@@ -272,20 +269,20 @@ impl<T: Store> TableBuilder<T> {
         Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
     }
 
-    pub fn add(&mut self, op: KVOpertionRef) -> bool {
+    pub fn add(&mut self, op: KVOpertion) -> bool {
         // If the current block is empty, this operation's key is the first key of the block.
         if self.block_builder.is_empty() {
             self.current_block_first_key = Some(op.key.as_ref().into());
         }
 
         // Try to add the operation to the current block builder.
-        if !self.block_builder.add(&op) {
+        if !self.block_builder.add(op.clone()) {
             // If adding fails, the current block is full. Flush it.
             let last_key = self
                 .block_builder
                 .last_key()
                 .expect("Block should have a last key if it's full and add failed");
-            self.flush_current_block(last_key);
+            self.flush_current_block(KeyBytes::from_vec(last_key.into_inner()));
 
             // Check if we've reached the overall block limit for the table.
             if self.block_metas.len() >= self.block_num_limit {
@@ -294,13 +291,13 @@ impl<T: Store> TableBuilder<T> {
 
             // Create a new block builder and add the operation to it.
             self.block_builder = BlockBuilder::new();
-            self.current_block_first_key = Some(op.key.as_ref().into());
-            self.block_builder.add(&op); // This add should succeed as it's a new empty block.
+            self.current_block_first_key = Some(op.key.clone());
+            self.block_builder.add(op); // This add should succeed as it's a new empty block.
         }
         true
     }
 
-    fn flush_current_block(&mut self, last_key: KeyVec) {
+    fn flush_current_block(&mut self, last_key: KeyBytes) {
         if self.block_builder.is_empty() {
             return; // Nothing to flush
         }
@@ -334,7 +331,7 @@ impl<T: Store> TableBuilder<T> {
                 .block_builder
                 .last_key()
                 .expect("Block should have a last key if it's not empty");
-            self.flush_current_block(last_key);
+            self.flush_current_block(KeyBytes::from_vec(last_key.into_inner()));
         }
 
         // Calculate the offset where block metadata will start
@@ -367,12 +364,8 @@ impl<T: Store> TableBuilder<T> {
         }
     }
     pub fn fill_with_op<'a, IT: Iterator<Item = &'a KVOpertion>>(&mut self, it: IT) {
-        let op_ref_iter = it.map(|op| KVOpertionRef::from_op(op));
-        self.fill_with_op_ref(op_ref_iter);
-    }
-    pub fn fill_with_op_ref<'a, IT: Iterator<Item = KVOpertionRef<'a>>>(&mut self, it: IT) {
         for op_ref in it {
-            if !self.add(op_ref) {
+            if !self.add(op_ref.clone()) {
                 // If add returns false, it means the table is full (block_num_limit reached)
                 // and we cannot add more operations.
                 break;
@@ -392,6 +385,7 @@ pub mod test {
     use super::{TableBuilder, DATA_BLOCK_SIZE};
     use crate::db::block::test::create_kv_data_with_range_id_offset;
     use crate::db::common::OpId;
+    use crate::db::key::KeyBytes;
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
     use core::panic;
@@ -494,10 +488,10 @@ pub mod test {
         let num_kvs = 100;
         let table = create_test_table(0..num_kvs);
         let (min_key, max_key) = table.key_range();
-        assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
+        assert_eq!(min_key, KeyBytes::from("000000".as_bytes()));
         assert_eq!(
             max_key,
-            KeyVec::from(pad_zero((num_kvs - 1) as u64).as_bytes())
+            KeyBytes::from(pad_zero((num_kvs - 1) as u64).as_bytes())
         );
     }
 
@@ -509,9 +503,8 @@ pub mod test {
         let store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
 
-        use crate::db::common::KVOpertionRef;
         for kv_op in &kvs {
-            tb.add(KVOpertionRef::from_op(kv_op));
+            tb.add(kv_op.clone());
         }
         let table_reader = tb.flush();
 
@@ -543,8 +536,8 @@ pub mod test {
         let store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
 
-        let mut kvs_iter = kvs.iter();
-        tb.fill_with_op(&mut kvs_iter);
+        let kvs_iter = kvs.iter();
+        tb.fill_with_op(kvs_iter);
         let table_reader = tb.flush();
 
         // Check block metas
@@ -572,13 +565,12 @@ pub mod test {
     fn test_table_build_use_large_iter_and_check_by_iterator() {
         let num = 70000;
         //test data more than table
-        let mut kvs = create_kv_data_in_range_zero_to(num);
+        let kvs = create_kv_data_in_range_zero_to(num);
 
-        let mut kvs_ref = kvs.iter();
         let id = "1".to_string();
         let mut store = Memstore::create(&id);
         let mut tb = TableBuilder::new_with_store(store);
-        tb.fill_with_op(&mut kvs_ref);
+        tb.fill_with_op(kvs.iter());
         let table = tb.flush();
 
         let meta = &table.block_metas;
@@ -754,8 +746,8 @@ pub mod test {
         use std::io::Seek;
 
         let original_meta = BlockMeta {
-            first_key: KeyVec::from_vec(b"key_a".to_vec()),
-            last_key: KeyVec::from_vec(b"key_z".to_vec()),
+            first_key: KeyBytes::from_vec(b"key_a".to_vec()),
+            last_key: KeyBytes::from_vec(b"key_z".to_vec()),
         };
 
         let mut buffer = new_buffer(1024); // Sufficiently large buffer
