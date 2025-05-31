@@ -36,8 +36,8 @@ pub type ThreadSafeTableReader<T> = Arc<TableReader<T>>;
 
 #[derive(PartialEq, Debug)]
 struct BlockMeta {
-    first_key: KeyBytes,
-    last_key: KeyBytes,
+    first_key: KeyVec,
+    last_key: KeyVec,
 }
 
 impl BlockMeta {
@@ -56,13 +56,13 @@ impl BlockMeta {
         let first_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
         let mut first_key_data = vec![0u8; first_key_len];
         r.read_exact(&mut first_key_data).unwrap();
-        let first_key = KeyBytes::from_vec(first_key_data);
+        let first_key = KeyVec::from_vec(first_key_data);
 
         // Decode last_key
         let last_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
         let mut last_key_data = vec![0u8; last_key_len];
         r.read_exact(&mut last_key_data).unwrap();
-        let last_key = KeyBytes::from_vec(last_key_data);
+        let last_key = KeyVec::from_vec(last_key_data);
 
         BlockMeta {
             first_key,
@@ -106,7 +106,7 @@ impl<T: Store> TableReader<T> {
         self.store.id()
     }
     // min and max key in table
-    pub fn key_range(&self) -> (KeyBytes, KeyBytes) {
+    pub fn key_range(&self) -> (KeyVec, KeyVec) {
         if self.block_metas.is_empty() {
             panic!("table can't be empty")
         }
@@ -317,8 +317,8 @@ impl<T: Store> TableBuilder<T> {
 
         // Add block metadata
         self.block_metas.push(BlockMeta {
-            first_key,
-            last_key,
+            first_key: KeyVec::from_vec(first_key.into_inner().to_vec()),
+            last_key: KeyVec::from_vec(last_key.into_inner().to_vec()),
         });
         self.block_builder.reset();
 
@@ -490,10 +490,10 @@ pub mod test {
         let num_kvs = 100;
         let table = create_test_table(0..num_kvs);
         let (min_key, max_key) = table.key_range();
-        assert_eq!(min_key, KeyBytes::from("000000".as_bytes()));
+        assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
         assert_eq!(
             max_key,
-            KeyBytes::from(pad_zero((num_kvs - 1) as u64).as_bytes())
+            KeyVec::from(pad_zero((num_kvs - 1) as u64).as_bytes())
         );
     }
 
@@ -748,8 +748,8 @@ pub mod test {
         use std::io::Seek;
 
         let original_meta = BlockMeta {
-            first_key: KeyBytes::from_vec(b"key_a".to_vec()),
-            last_key: KeyBytes::from_vec(b"key_z".to_vec()),
+            first_key: KeyVec::from_vec(b"key_a".to_vec()),
+            last_key: KeyVec::from_vec(b"key_z".to_vec()),
         };
 
         let mut buffer = new_buffer(1024); // Sufficiently large buffer
