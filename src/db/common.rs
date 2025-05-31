@@ -146,8 +146,22 @@ impl KVOpertion {
         let end_offset = cursor.position() as usize;
         (KVOpertion { id, key, op }, end_offset)
     }
-    pub fn encode(&self, w: &mut Buffer) {
-        KVOpertionRef::from_op(self).encode(w);
+    pub fn encode<W:Write>(&self, mut w: &mut W) {
+        w.write_u64::<LittleEndian>(self.id).unwrap();
+        let key_len = self.key.len() as u64;
+        w.write_u64::<LittleEndian>(key_len).unwrap();
+        w.write_all(self.key.as_ref()).unwrap();
+        match &self.op {
+            OpType::Delete => {
+                w.write_u8(0).unwrap();
+            }
+            OpType::Write(v) => {
+                w.write_u8(1).unwrap();
+                let v_len = v.len() as u64;
+                w.write_u64::<LittleEndian>(v_len).unwrap();
+                w.write_all(v.as_ref()).unwrap();
+            }
+        }
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
