@@ -271,6 +271,11 @@ impl<T: Store> TableBuilder<T> {
         Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
     }
 
+    /// Adds a key-value operation to the current block.
+    /// If the current block becomes full, it flushes the block to the store
+    /// and starts a new block.
+    /// Returns `false` if the operation cannot be added because the table
+    /// has reached its `block_num_limit`.
     pub fn add(&mut self, op: KVOpertion) -> bool {
         // If the current block is empty, this operation's key is the first key of the block.
         if self.block_builder.is_empty() {
@@ -280,11 +285,7 @@ impl<T: Store> TableBuilder<T> {
         // Try to add the operation to the current block builder.
         if !self.block_builder.add(op.clone()) {
             // If adding fails, the current block is full. Flush it.
-            let last_key = self
-                .block_builder
-                .last_key()
-                .expect("Block should have a last key if it's full and add failed");
-            self.flush_current_block(KeyBytes::from_vec(last_key.into_inner()));
+            self.flush_current_block();
 
             // Check if we've reached the overall block limit for the table.
             if self.block_metas.len() >= self.block_num_limit {
@@ -299,7 +300,20 @@ impl<T: Store> TableBuilder<T> {
         true
     }
 
-    fn flush_current_block(&mut self, last_key: KeyBytes) {
+    /// Flushes the current `BlockBuilder`'s content to the underlying store.
+    ///
+    /// This function takes the data from the `block_builder`, appends it to the `store`,
+    /// creates a `BlockMeta` entry for the flushed block, and resets the `block_builder`.
+    /// It is called when a block is full or when the entire table is being flushed.
+    ///
+    /// # Arguments
+    /// * `last_key` - The last key contained in the block being flushed.
+    fn flush_current_block(&mut self) {
+        let last_key = self
+            .block_builder
+            .last_key()
+            .expect("Block should have a last key if it's full and add failed");
+
         if self.block_builder.is_empty() {
             return; // Nothing to flush
         }
@@ -333,7 +347,7 @@ impl<T: Store> TableBuilder<T> {
                 .block_builder
                 .last_key()
                 .expect("Block should have a last key if it's not empty");
-            self.flush_current_block(KeyBytes::from_vec(last_key.into_inner()));
+            self.flush_current_block();
         }
 
         // Calculate the offset where block metadata will start
