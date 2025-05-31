@@ -146,7 +146,7 @@ impl KVOpertion {
         let end_offset = cursor.position() as usize;
         (KVOpertion { id, key, op }, end_offset)
     }
-    pub fn encode<W:Write>(&self, mut w: &mut W) {
+    pub fn encode<W: Write>(&self, mut w: &mut W) {
         w.write_u64::<LittleEndian>(self.id).unwrap();
         let key_len = self.key.len() as u64;
         w.write_u64::<LittleEndian>(key_len).unwrap();

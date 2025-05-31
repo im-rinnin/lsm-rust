@@ -154,6 +154,7 @@ impl<T: Store> TableReader<T> {
             .partition_point(|meta| meta.first_key.as_ref().le(key.as_ref()))
             .saturating_sub(1); // saturating_sub(1) handles the case where partition_point returns 0
 
+        let mut block_buffer_data = Option::Some(vec![0; DATA_BLOCK_SIZE]);
         // Iterate through blocks from the determined starting point.
         for i in start_idx..self.block_metas.len() {
             let block_meta = &self.block_metas[i];
@@ -172,9 +173,9 @@ impl<T: Store> TableReader<T> {
 
             // If we reach here, the block's key range [first_key, last_key] potentially contains the search key.
             let offset = i * DATA_BLOCK_SIZE;
-            let mut block_buffer_data = vec![0; DATA_BLOCK_SIZE];
-            self.store.read_at(&mut block_buffer_data, offset);
-            let block_reader = BlockReader::new(block_buffer_data);
+            let mut data = block_buffer_data.take().unwrap();
+            self.store.read_at(&mut data, offset);
+            let block_reader = BlockReader::new(data);
 
             if let Some((current_op_type, op_id_found)) = block_reader.search(&key, id) {
                 // current_op_type is already OpType, no need for conversion
@@ -189,6 +190,7 @@ impl<T: Store> TableReader<T> {
                     }
                 }
             }
+            block_buffer_data = Some(block_reader.into_inner());
         }
         best_op
     }

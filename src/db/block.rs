@@ -111,8 +111,8 @@ impl BlockReader {
         self.count
     }
 
-    pub fn inner(self) -> Vec<u8> {
-        self.data.to_vec()
+    pub fn into_inner(self) -> Vec<u8> {
+        self.data.into()
     }
 }
 
@@ -184,10 +184,7 @@ impl BlockBuilder {
         Ok(self.buffer.get_ref().as_ref())
     }
 
-    pub fn fill<T: Iterator<Item = KVOpertion>>(
-        &mut self,
-        it: &mut Peekable<T>,
-    ) -> Result<&[u8]> {
+    pub fn fill<T: Iterator<Item = KVOpertion>>(&mut self, it: &mut Peekable<T>) -> Result<&[u8]> {
         // Iterate through the peekable iterator and fill the block until it's full or the iterator is exhausted.
         // get first key by peek() if pit is empty return error with message "at least one kv"
         let first_kv = it
@@ -805,7 +802,7 @@ pub mod test {
 
         // The final size of the block should be DATA_BLOCK_SIZE
         assert_eq!(
-            block_reader.inner().len(),
+            block_reader.into_inner().len(),
             DATA_BLOCK_SIZE,
             "Final block size should be DATA_BLOCK_SIZE"
         );
