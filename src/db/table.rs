@@ -270,6 +270,9 @@ impl<T: Store> TableBuilder<T> {
     pub fn new_with_store(store: T) -> Self {
         Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
     }
+    pub fn is_empty(&self) -> bool {
+        self.block_metas.is_empty() && self.block_builder.is_empty()
+    }
 
     /// Adds a key-value operation to the current block.
     /// If the current block becomes full, it flushes the block to the store
