@@ -23,7 +23,7 @@ pub enum ChangeType {
 pub struct TableChange {
     level: usize,
     index: usize,
-    id: String,
+    id: u64,
     change_type: ChangeType,
 }
 
@@ -244,7 +244,7 @@ impl<T: Store> LevelStorege<T> {
                     table_change.push(TableChange {
                         level: target_level_depth,
                         index: first_overlap_idx + i,
-                        id: table.store_id().parse().unwrap(),
+                        id: table.store_id(), // Convert u64 to String
                         change_type: ChangeType::Delete,
                     });
                 }
@@ -271,15 +271,15 @@ impl<T: Store> LevelStorege<T> {
             let mut compacted_output_tables: Vec<ThreadSafeTableReader<T>> = Vec::new();
 
             let mut store_id_generator = || {
-                let id = next_sstable_id_counter.to_string();
+                let id = next_sstable_id_counter; // Generate u64 directly
                 next_sstable_id_counter += 1;
                 id
             };
 
             let mut current_table_builder = {
                 let new_store_id = store_id_generator();
-                let new_store = T::create(&new_store_id);
-                // Using usize::MAX for block_count as no specific config is available for it.
+                let new_store = T::create(new_store_id); // Pass u64 directly
+                                                         // Using usize::MAX for block_count as no specific config is available for it.
                 TableBuilder::new_with_block_count(new_store, usize::MAX)
             };
 
@@ -291,7 +291,7 @@ impl<T: Store> LevelStorege<T> {
 
                     // Start a new table builder
                     let new_store_id = store_id_generator();
-                    let new_store = T::create(&new_store_id);
+                    let new_store = T::create(new_store_id); // Pass u64 directly
                     current_table_builder =
                         TableBuilder::new_with_block_count(new_store, usize::MAX);
                     // Add the current operation to the new table
@@ -331,7 +331,7 @@ impl<T: Store> LevelStorege<T> {
                 table_change.push(TableChange {
                     level: target_level_depth,
                     index: start_index + i,
-                    id: table.store_id().parse().unwrap(),
+                    id: table.store_id(), // Convert u64 to String
                     change_type: ChangeType::Add,
                 });
             }
@@ -366,7 +366,7 @@ impl<T: Store> LevelStorege<T> {
         }
 
         // get (store_id, position_in_sstables) of level.sstables
-        let mut store_id_positions: Vec<(String, usize)> = level
+        let mut store_id_positions: Vec<(u64, usize)> = level // Change String to u64
             .sstables
             .iter()
             .enumerate()
@@ -391,7 +391,7 @@ impl<T: Store> LevelStorege<T> {
         for pos in positions_to_remove {
             let table = level.sstables.remove(pos);
             table_change.push(TableChange {
-                id: table.store_id(),
+                id: table.store_id(), // Convert u64 to String
                 index: pos,
                 level: level_depth,
                 change_type: ChangeType::Delete,
@@ -576,12 +576,11 @@ mod test {
             let tmp = KVOpertion::new(
                 i as u64 + id_offset,
                 crate::db::block::test::pad_zero(i as u64).as_bytes().into(),
-                OpType::Write(value_transform(i).as_bytes().into()),
+                OpType::Write(value_transform(i).to_string().as_bytes().into()),
             );
             v.push(tmp);
         }
-        let id = format!("test_id_{}_{}", range.start, range.end); // Unique ID for Memstore
-        let mut store = Memstore::create(&id);
+        let mut store = Memstore::create(0); // Use the provided store_id
         let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(v.iter()); // Use iter()
         let res = table.flush();
@@ -740,7 +739,8 @@ mod test {
     }
 
     // New helper to create test table with custom ID
-    fn create_test_table_with_id(range: Range<usize>, id: String) -> TableReader<Memstore> {
+    fn create_test_table_with_id(range: Range<usize>, id: u64) -> TableReader<Memstore> {
+        // Change id type to u64
         let mut v = Vec::new();
         for i in range.clone() {
             let tmp = KVOpertion::new(
@@ -750,7 +750,7 @@ mod test {
             );
             v.push(tmp);
         }
-        let mut store = Memstore::create(&id);
+        let mut store = Memstore::create(id); // Pass u64 directly
         let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(v.iter());
         let res = table.flush();
@@ -772,7 +772,7 @@ mod test {
 
         let compacted_tables_zero = level_storage_zero.table_to_compact(0);
         assert_eq!(compacted_tables_zero.len(), 3);
-        let mut compacted_ids: Vec<String> = compacted_tables_zero
+        let mut compacted_ids: Vec<u64> = compacted_tables_zero
             .iter()
             .map(|table| table.store_id())
             .collect();
@@ -785,9 +785,9 @@ mod test {
 
         // Case 2: Non-Level Zero (is_level_zero = false)
         // Create tables with specific IDs to control the min_by_key behavior
-        let table_x = Arc::new(create_test_table_with_id(0..10, "id_001".to_string()));
-        let table_y = Arc::new(create_test_table_with_id(10..20, "id_000".to_string())); // This should be the min
-        let table_z = Arc::new(create_test_table_with_id(20..30, "id_002".to_string()));
+        let table_x = Arc::new(create_test_table_with_id(0..10, 1u64)); // Pass u64
+        let table_y = Arc::new(create_test_table_with_id(10..20, 0u64)); // Pass u64
+        let table_z = Arc::new(create_test_table_with_id(20..30, 2u64)); // Pass u64
 
         let level_n = super::Level::new(
             vec![table_x.clone(), table_y.clone(), table_z.clone()],
@@ -797,7 +797,7 @@ mod test {
 
         let compacted_tables_n = level_storage_n.table_to_compact(0);
         assert_eq!(compacted_tables_n.len(), 1);
-        assert_eq!(compacted_tables_n[0].store_id(), "id_000".to_string());
+        assert_eq!(compacted_tables_n[0].store_id(), 0u64); // Compare u64 with u64
         assert_eq!(compacted_tables_n[0].key_range(), table_y.key_range()); // Ensure it's table_y
     }
 
@@ -837,7 +837,7 @@ mod test {
         let table_l0_a = Arc::new(create_test_table_with_id_offset(0..100, 10000)); // keys "000000" to "000099", OpIds 10000-10099
         let table_l0_b = Arc::new(create_test_table_with_value_transform(
             50..150,
-            20000, // Higher opid offset for newer data, OpIds 20050-20149
+            20000,
             |i| format!("new_val_{}", i),
         )); // keys "000050" to "000149"
 
@@ -870,7 +870,7 @@ mod test {
         let max_store_id_in_compacted_level = compacted_level
             .sstables
             .iter()
-            .map(|table| table.store_id().parse::<u64>().unwrap())
+            .map(|table| table.store_id()) // store_id() already returns u64
             .max()
             .unwrap_or(0); // Default to 0 if no tables, though we assert !is_empty() below
 
@@ -1086,10 +1086,10 @@ mod test {
     #[test]
     fn test_take_out_table_to_compact() {
         // Create test tables with specific IDs to control ordering
-        let table_a = Arc::new(create_test_table_with_id(0..10, "id_003".to_string()));
-        let table_b = Arc::new(create_test_table_with_id(10..20, "id_001".to_string())); // Should be first when sorted
-        let table_c = Arc::new(create_test_table_with_id(20..30, "id_002".to_string())); // Should be second when sorted
-        let table_d = Arc::new(create_test_table_with_id(30..40, "id_004".to_string()));
+        let table_a = Arc::new(create_test_table_with_id(0..10, 3u64));
+        let table_b = Arc::new(create_test_table_with_id(10..20, 1u64)); // Should be first when sorted
+        let table_c = Arc::new(create_test_table_with_id(20..30, 2u64)); // Should be second when sorted
+        let table_d = Arc::new(create_test_table_with_id(30..40, 4u64));
 
         // Test Case 1: Take out tables from level 0 (should take tables exceeding limit)
         let level0 = super::Level::new(
@@ -1110,17 +1110,17 @@ mod test {
         assert_eq!(level_storage.levels[0].sstables.len(), 4); // No tables removed
 
         // Add one more table to exceed the limit
-        let table_e = Arc::new(create_test_table_with_id(40..50, "id_000".to_string())); // Smallest ID
+        let table_e = Arc::new(create_test_table_with_id(40..50, 0u64)); // Smallest ID
         level_storage.levels[0].sstables.push(table_e.clone());
 
         // Now we have 5 tables, should take out 1 (5 - 4 = 1)
         let (tables_to_compact, changes) = level_storage.take_out_table_to_compact(0);
         assert_eq!(tables_to_compact.len(), 1);
         // Should get table with smallest store_id
-        assert_eq!(tables_to_compact[0].store_id(), "id_000".to_string());
+        assert_eq!(tables_to_compact[0].store_id(), 0);
         // Verify table_change
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].id, "id_000".to_string());
+        assert_eq!(changes[0].id, 0u64);
         assert_eq!(changes[0].level, 0);
         assert_eq!(changes[0].change_type, ChangeType::Delete);
 
@@ -1161,7 +1161,7 @@ mod test {
             .map(|i| {
                 Arc::new(create_test_table_with_id(
                     i * 10..(i * 10 + 10),
-                    format!("id_{:03}", i),
+                    i as u64, // Pass u64 directly
                 ))
             })
             .collect();
@@ -1180,24 +1180,19 @@ mod test {
         assert_eq!(tables_to_compact4.len(), 4);
         assert_eq!(level_storage_many.levels[1].sstables.len(), 16);
 
-        // Should get tables with smallest store_ids (id_000, id_001, id_002, id_003)
-        let mut compacted_ids: Vec<String> = tables_to_compact4
+        // Should get tables with smallest store_ids (0, 1, 2, 3)
+        let mut compacted_ids: Vec<u64> = tables_to_compact4 // Change to u64
             .iter()
             .map(|table| table.store_id())
             .collect();
         compacted_ids.sort();
         assert_eq!(
             compacted_ids,
-            vec![
-                "id_000".to_string(),
-                "id_001".to_string(),
-                "id_002".to_string(),
-                "id_003".to_string()
-            ]
+            vec![0u64, 1u64, 2u64, 3u64] // Compare u64 with u64
         );
         // Verify table_change for multiple deletions
         assert_eq!(changes4.len(), 4);
-        let mut changed_ids: Vec<String> = changes4.iter().map(|c| c.id.clone()).collect();
+        let mut changed_ids: Vec<u64> = changes4.iter().map(|c| c.id).collect();
         changed_ids.sort();
         assert_eq!(changed_ids, compacted_ids); // IDs should match
         for change in changes4 {
@@ -1209,11 +1204,11 @@ mod test {
     #[test]
     fn test_compact_storage() {
         // Test Case 1: Level 0 exceeds limit, should compact to Level 1
-        let table_a = Arc::new(create_test_table_with_id(0..10, "id_001".to_string()));
-        let table_b = Arc::new(create_test_table_with_id(10..20, "id_002".to_string()));
-        let table_c = Arc::new(create_test_table_with_id(20..30, "id_003".to_string()));
-        let table_d = Arc::new(create_test_table_with_id(30..40, "id_004".to_string()));
-        let table_e = Arc::new(create_test_table_with_id(40..50, "id_005".to_string())); // This will exceed limit
+        let table_a = Arc::new(create_test_table_with_id(0..10, 1u64));
+        let table_b = Arc::new(create_test_table_with_id(10..20, 2u64));
+        let table_c = Arc::new(create_test_table_with_id(20..30, 3u64));
+        let table_d = Arc::new(create_test_table_with_id(30..40, 4u64));
+        let table_e = Arc::new(create_test_table_with_id(40..50, 5u64)); // This will exceed limit
 
         // Create level 0 with 5 tables (exceeds MAX_LEVEL_ZERO_TABLE_SIZE = 4)
         let level0 = super::Level::new(
@@ -1241,12 +1236,12 @@ mod test {
         assert!(!level_storage.levels[1].sstables.is_empty()); // Level 1 has compacted data
 
         // Verify that the table with smallest ID was moved to Level 1
-        let remaining_ids: Vec<String> = level_storage.levels[0]
+        let remaining_ids: Vec<u64> = level_storage.levels[0]
             .sstables
             .iter()
-            .map(|table| table.store_id())
+            .map(|table| table.store_id()) // Convert u64 to String
             .collect();
-        assert!(!remaining_ids.contains(&"id_001".to_string())); // Smallest ID should be compacted
+        assert!(!remaining_ids.contains(&1u64)); // Smallest ID should be compacted
 
         // Verify table_changes
         let delete_changes: Vec<_> = table_changes
@@ -1261,7 +1256,7 @@ mod test {
         // Expect one delete from level 0 (id_001)
         assert_eq!(delete_changes.len(), 1);
         assert_eq!(delete_changes[0].level, 0);
-        assert_eq!(delete_changes[0].id, "id_001".to_string());
+        assert_eq!(delete_changes[0].id, 1u64);
         assert_eq!(delete_changes[0].change_type, ChangeType::Delete);
 
         // Expect at least one add to level 1 (the compacted table)
@@ -1269,7 +1264,7 @@ mod test {
         for add_change in add_changes {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id.parse::<u64>().unwrap() >= 1000); // Should use the provided store_id_start
+            assert!(add_change.id >= 1000); // Should use the provided store_id_start
         }
 
         // KV checks after compaction: Verify all data is still accessible
@@ -1306,7 +1301,7 @@ mod test {
             .map(|i| {
                 Arc::new(create_test_table_with_id(
                     i * 10..(i * 10 + 10),
-                    format!("l1_id_{:03}", i),
+                    (1000 + i) as u64, // Assign unique u64 IDs for L1 tables
                 ))
             })
             .collect();
@@ -1332,7 +1327,7 @@ mod test {
         assert!(!level_storage_multi.levels[2].sstables.is_empty()); // Level 2 has compacted data
 
         // Test Case 3: No compaction needed (all levels within limits)
-        let small_table = Arc::new(create_test_table_with_id(0..10, "small_id".to_string()));
+        let small_table = Arc::new(create_test_table_with_id(0..10, 999u64)); // Assign a u64 ID
         let level0_small = super::Level::new(vec![small_table], true);
         let mut level_storage_small = super::LevelStorege::new(vec![level0_small], 2);
 
@@ -1396,9 +1391,9 @@ mod test {
         // Test that tables in a level are ordered by their first key after compaction
 
         // Create tables with non-sequential key ranges to test ordering
-        let table_c = Arc::new(create_test_table_with_id(200..300, "table_c".to_string())); // keys "000200" to "000299"
-        let table_a = Arc::new(create_test_table_with_id(0..100, "table_a".to_string())); // keys "000000" to "000099"
-        let table_b = Arc::new(create_test_table_with_id(100..200, "table_b".to_string())); // keys "000100" to "000199"
+        let table_c = Arc::new(create_test_table_with_id(200..300, 200u64)); // keys "000200" to "000299"
+        let table_a = Arc::new(create_test_table_with_id(0..100, 0u64)); // keys "000000" to "000099"
+        let table_b = Arc::new(create_test_table_with_id(100..200, 100u64)); // keys "000100" to "000199"
 
         // Create level 0 with tables in non-sorted order
         let level0 = super::Level::new(
@@ -1489,17 +1484,14 @@ mod test {
         // Should delete the overlapping table (table_l1_x)
         assert_eq!(delete_changes.len(), 1);
         assert_eq!(delete_changes[0].level, 1);
-        assert_eq!(
-            delete_changes[0].id.parse::<u64>().unwrap(),
-            table_l1_x.store_id().parse::<u64>().unwrap()
-        );
+        assert_eq!(delete_changes[0].id, table_l1_x.store_id());
 
         // Should add new compacted tables
         assert!(!add_changes.is_empty());
         for add_change in &add_changes {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id.parse::<u64>().unwrap() >= 5000); // Should use the provided store_id_start
+            assert!(add_change.id >= 5000); // Should use the provided store_id_start
         }
 
         // Case 2: No overlap with target level, input tables' keys < target level min key
@@ -1538,8 +1530,8 @@ mod test {
         for add_change in &add_changes_case2 {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id.parse::<u64>().unwrap() >= 6000); // Should use the provided store_id_start
-                                                                    // Since input keys are smaller than target level keys, new tables should be inserted at the beginning
+            assert!(add_change.id >= 6000); // Should use the provided store_id_start
+                                            // Since input keys are smaller than target level keys, new tables should be inserted at the beginning
             assert_eq!(add_change.index, 0);
         }
 
@@ -1548,7 +1540,7 @@ mod test {
         assert!(final_level.sstables.len() >= 2); // At least the original 2 tables plus compacted ones
 
         // The last tables should be the original ones (table_l1_z and table_l1_w)
-        let last_tables: Vec<String> = final_level
+        let last_tables: Vec<u64> = final_level
             .sstables
             .iter()
             .skip(final_level.sstables.len() - 2)

@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::common::Result;
-pub type StoreId = String;
+pub type StoreId = u64;
 // append only data store
 pub trait Store {
     fn flush(&mut self);
@@ -18,7 +18,7 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
-    fn create(id: &StoreId) -> Self;
+    fn create(id: StoreId) -> Self;
     fn id(&self) -> StoreId;
 }
 
@@ -35,14 +35,14 @@ impl Memstore {}
 
 impl Store for Memstore {
     fn close(self) {}
-    fn create(id: &StoreId) -> Self {
+    fn create(id: StoreId) -> Self {
         Memstore {
             store: Vec::new(),
-            id: id.clone(),
+            id,
         }
     }
     fn id(&self) -> StoreId {
-        self.id.clone()
+        self.id
     }
 
     fn len(&self) -> usize {
@@ -81,23 +81,14 @@ impl Store for Memstore {
     }
 }
 
-impl Filestore {
-    fn open(dir_path: String) -> Self {
-        let res = File::open(&dir_path);
-        Filestore {
-            f: res.unwrap(),
-            id: dir_path.clone(),
-        }
-    }
-}
 impl Store for Filestore {
     fn flush(&mut self) {
         self.f.sync_data();
     }
     fn id(&self) -> StoreId {
-        self.id.clone()
+        self.id
     }
-    fn create(id: &StoreId) -> Self {
+    fn create(id: StoreId) -> Self {
         unimplemented!()
     }
     fn len(&self) -> usize {
@@ -167,9 +158,11 @@ mod test {
 
     #[test]
     fn test_read_write_memsotre() {
-        let id = "1".to_string();
-        let mut m = Memstore::create(&id);
-        let id = String::from("1");
+        let id = 1u64;
+        let mut m = Memstore::create(id);
+        // The second 'id' variable is unused after the type change, can be removed if desired.
+        // For now, keeping it as is to minimize changes outside the direct fix.
+        let id_str_unused = String::from("1");
         let t = TestSerde {
             a: 1,
             b: "sdfs".to_string(),
@@ -188,8 +181,8 @@ mod test {
 
     #[test]
     fn test_read_at_memstore() {
-        let id = "test_read_at".to_string();
-        let mut m = Memstore::create(&id);
+        let id = 2u64; // Using a unique ID for this test
+        let mut m = Memstore::create(id);
         let data = b"0123456789abcdef";
         m.append(data);
         let original_len = m.store.len();
@@ -210,8 +203,8 @@ mod test {
     }
     #[test]
     fn test_write_at_memstore() {
-        let id = "test_write_at".to_string();
-        let mut m = Memstore::create(&id);
+        let id = 3u64; // Using a unique ID for this test
+        let mut m = Memstore::create(id);
         let initial_data = b"initial";
         m.append(initial_data);
         let initial_len = m.store.len();
@@ -230,7 +223,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_write_at_memstore_panic() {
-        let mut m = Memstore::create(&"panic_test".to_string());
+        let mut m = Memstore::create(4u64); // Using a unique ID for this test
         m.append(b"some data");
         m.seek(1); // Seek backwards, should panic due to assert
     }
@@ -245,7 +238,7 @@ mod test {
         // Test empty file
         let filestore = Filestore {
             f: File::open(path).unwrap(),
-            id: path.to_str().unwrap().to_string(),
+            id: 5u64, // Assigning a dummy u64 ID for test
         };
         assert_eq!(filestore.len(), 0);
 
@@ -253,7 +246,7 @@ mod test {
         fs::write(path, b"test data").unwrap();
         let filestore = Filestore {
             f: File::open(path).unwrap(),
-            id: path.to_str().unwrap().to_string(),
+            id: 5u64, // Assigning a dummy u64 ID for test
         };
         assert_eq!(filestore.len(), 9);
     }
@@ -275,7 +268,7 @@ mod test {
 
         let mut filestore = Filestore {
             f: file,
-            id: path.to_str().unwrap().to_string(),
+            id: 6u64, // Assigning a dummy u64 ID for test
         };
 
         // Append first part
@@ -314,7 +307,7 @@ mod test {
 
         let mut filestore = Filestore {
             f: file,
-            id: path.to_str().unwrap().to_string(),
+            id: 7u64, // Assigning a dummy u64 ID for test
         };
 
         // Write 10 bytes
@@ -365,7 +358,7 @@ mod test {
 
         let mut filestore = Filestore {
             f: file,
-            id: path.to_str().unwrap().to_string(),
+            id: 8u64, // Assigning a dummy u64 ID for test
         };
 
         // Append 10 bytes
@@ -389,8 +382,8 @@ mod test {
 
     #[test]
     fn test_memstore_pad_in_write() {
-        let id = "test_pad".to_string();
-        let mut m = Memstore::create(&id);
+        let id = 9u64; // Using a unique ID for this test
+        let mut m = Memstore::create(id);
 
         // Write initial data
         m.append(b"initial");
