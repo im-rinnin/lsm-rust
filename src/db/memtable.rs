@@ -1,4 +1,5 @@
 use std::fmt::Result;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::common::SearchResult;
 use super::key::{KeyBytes, KeyVec};
@@ -8,9 +9,8 @@ use crossbeam_skiplist::SkipMap;
 
 pub struct Memtable {
     table: SkipMap<(KeyBytes, OpId), OpType>,
-    max_op_id: Option<OpId>,
-    capacity_bytes: usize,
-    current_size_bytes: usize,
+    capacity_bytes: AtomicUsize,
+    current_size_bytes: AtomicUsize,
 }
 
 pub struct MemtableIterator<'a> {
@@ -21,9 +21,8 @@ impl Memtable {
     pub fn new(capacity_bytes: usize) -> Self {
         Memtable {
             table: SkipMap::new(),
-            max_op_id: None,
-            capacity_bytes,
-            current_size_bytes: 0,
+            capacity_bytes: AtomicUsize::new(capacity_bytes),
+            current_size_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -39,22 +38,11 @@ impl Memtable {
         None
     }
 
-    pub fn insert(&mut self, op: KVOpertion) -> Result {
-        if self.max_op_id.is_some() {
-            let id = self.max_op_id.unwrap();
-            if id >= op.id {
-                panic!(
-                    "insert a kv which op id is {} less or eq max op {} id in memtable",
-                    op.id, id
-                )
-            }
-        }
-
+    pub fn insert(&self, op: KVOpertion) -> Result {
         let op_size = op.encode_size();
-        let op_id = op.id;
         self.table.insert((op.key, op.id), op.op);
-        self.max_op_id = Some(op_id);
-        self.current_size_bytes += op_size;
+        self.current_size_bytes
+            .fetch_add(op_size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -69,11 +57,12 @@ impl Memtable {
     }
 
     pub fn estimated_size_bytes(&self) -> usize {
-        self.current_size_bytes
+        self.current_size_bytes.load(Ordering::Relaxed)
     }
 
     pub fn is_full(&self) -> bool {
-        self.current_size_bytes >= self.capacity_bytes
+        self.current_size_bytes.load(Ordering::Relaxed)
+            >= self.capacity_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -402,11 +391,13 @@ mod test {
     #[test]
     fn test_memtable_capacity() {
         let small_capacity = 100; // A small capacity for testing
-        let mut m = Memtable::new(small_capacity);
+        let m = Memtable::new(small_capacity); // No longer mutable
         let mut id = 0;
 
         // Insert operations until full
-        let mut current_size = 0;
+        // Note: current_size is now managed by the atomic counter within Memtable
+        // We can't track it externally in the same way for precise comparison
+        // but we can check the Memtable's reported size.
 
         while !m.is_full() {
             let op_id = get_next_id(&mut id);
@@ -418,16 +409,16 @@ mod test {
                 OpType::Write(value_str.as_bytes().into()),
             );
             let op_size = op.encode_size();
-            if current_size + op_size > small_capacity && !m.is_full() {
-                // If the next op would exceed capacity, and we're not already full,
-                // we expect it to become full after this insert.
+
+            // Check if adding the current operation would exceed the capacity
+            // This check is now more about predicting the state after the atomic operation
+            // For a single-threaded test, this logic is fine.
+            if m.estimated_size_bytes() + op_size > small_capacity && !m.is_full() {
                 m.insert(op).unwrap();
-                current_size += op_size;
                 assert!(m.is_full());
-                break; // Stop inserting once full
+                break;
             }
             m.insert(op).unwrap();
-            current_size += op_size;
             assert!(!m.is_full());
         }
 

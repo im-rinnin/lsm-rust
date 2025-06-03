@@ -1,4 +1,4 @@
-use std::{sync::Arc, usize};
+use std::{clone, sync::Arc, usize};
 
 use bincode::Options;
 
@@ -6,7 +6,6 @@ use crate::db::common::KViterAgg;
 
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
-    db_meta::{DBMeta, ThreadDbMeta},
     key::{KeySlice, KeyVec},
     lsm_storage::LsmStorage,
     store::{Store, StoreId},
@@ -94,6 +93,16 @@ pub struct LevelStorege<T: Store> {
     level_ratio: usize,
 }
 
+impl<T: Store> Clone for LevelStorege<T> {
+    fn clone(&self) -> Self {
+        LevelStorege {
+            levels: self.levels.clone(),
+            level_zero_num_limit: self.level_zero_num_limit,
+            level_ratio: self.level_ratio,
+        }
+    }
+}
+
 impl<T: Store> LevelStorege<T> {
     pub fn new(tables: Vec<Level<T>>, r: usize) -> Self {
         LevelStorege {
@@ -111,19 +120,14 @@ impl<T: Store> LevelStorege<T> {
         }
         None
     }
-    // compact table to next level tables which key range overlay
-    // table=self.sstables[index]
-    pub fn compact(&self, index: usize) -> Vec<TableReader<T>> {
-        unimplemented!()
-    }
     fn max_table_in_level(ratio: usize, level_depth: usize) -> usize {
         if level_depth == 0 {
             return MAX_LEVEL_ZERO_TABLE_SIZE;
         }
         return MAX_LEVEL_ZERO_TABLE_SIZE.pow(ratio as u32);
     }
-    fn compact_storage(&mut self, mut next_store_id: u64) ->Vec<TableChange>{
-            let mut table_change = Vec::new();
+    fn compact_storage(&mut self, mut next_store_id: u64) -> Vec<TableChange> {
+        let mut table_change = Vec::new();
         // Iterate through all levels starting from level 0
         for level_depth in 0..self.levels.len() {
             // Check if this level needs compaction
@@ -131,7 +135,6 @@ impl<T: Store> LevelStorege<T> {
             if self.levels[level_depth].sstables.len() <= max_tables {
                 continue; // No compaction needed for this level
             }
-
 
             // Take out tables that exceed the limit
             let (tables_to_compact, table_changes_from_take_out) =
@@ -155,7 +158,6 @@ impl<T: Store> LevelStorege<T> {
             // Update the next store ID for subsequent operations
             next_store_id = new_next_store_id;
             table_change.extend(table_changes_from_compact_level);
-
 
             // After compacting one level, we might need to check if the target level
             // now also needs compaction, but we'll handle that in the next iteration

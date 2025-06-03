@@ -23,7 +23,7 @@ pub trait Store {
 }
 
 pub struct Memstore {
-    store: RefCell<Cursor<Vec<u8>>>,
+    store: Vec<u8>,
     id: StoreId,
 }
 pub struct Filestore {
@@ -37,7 +37,7 @@ impl Store for Memstore {
     fn close(self) {}
     fn create(id: &StoreId) -> Self {
         Memstore {
-            store: RefCell::new(Cursor::new(Vec::new())),
+            store: Vec::new(),
             id: id.clone(),
         }
     }
@@ -46,29 +46,38 @@ impl Store for Memstore {
     }
 
     fn len(&self) -> usize {
-        self.store.borrow().position() as usize
+        self.store.len()
     }
     fn flush(&mut self) {}
     fn append(&mut self, data: &[u8]) {
-        self.store.borrow_mut().write(data);
+        self.store.extend_from_slice(data);
     }
     fn read_at(&self, buf: &mut [u8], offset: usize) {
-        let position = self.store.borrow().position();
-        self.store.borrow_mut().set_position(offset as u64);
-        let res = self.store.borrow_mut().read(buf).unwrap();
-        self.store.borrow_mut().set_position(position);
+        let end_offset = offset + buf.len();
+        if offset >= self.store.len() {
+            // If offset is beyond current data, fill buffer with zeros
+            buf.fill(0);
+            return;
+        }
+        let bytes_to_read = (self.store.len() - offset).min(buf.len());
+        buf[..bytes_to_read].copy_from_slice(&self.store[offset..offset + bytes_to_read]);
+        // If the buffer is larger than available data, pad the rest with zeros
+        if bytes_to_read < buf.len() {
+            buf[bytes_to_read..].fill(0);
+        }
     }
     fn seek(&mut self, position: usize) {
-        assert!(self.store.borrow().position() as usize <= position);
-        let current_pos = self.store.borrow().position() as usize;
-        if current_pos < position {
-            let padding_size = position - current_pos;
-            self.store
-                .borrow_mut()
-                .write_all(&vec![0u8; padding_size])
-                .unwrap();
+        let current_len = self.store.len();
+        assert!(
+            current_len <= position,
+            "Seeking backwards is not allowed in append-only store logic"
+        );
+        if position > current_len {
+            // Pad with zeros to reach the desired position
+            self.store.resize(position, 0);
         }
-        self.store.borrow_mut().set_position(position as u64);
+        // For Vec<u8>, 'seeking' just means ensuring its length is at least 'position'.
+        // Subsequent appends will start from 'position'.
     }
 }
 
@@ -183,21 +192,21 @@ mod test {
         let mut m = Memstore::create(&id);
         let data = b"0123456789abcdef";
         m.append(data);
-        let original_pos = m.store.borrow().position();
-        assert_eq!(original_pos, data.len() as u64);
+        let original_len = m.store.len();
+        assert_eq!(original_len, data.len());
 
         // Read from offset 5, length 4
         let mut read_buf = [0u8; 4];
         m.read_at(&mut read_buf, 5);
         assert_eq!(&read_buf, b"5678");
-        // Check position is restored
-        assert_eq!(m.store.borrow().position(), original_pos);
+        // Check length is not changed by read_at
+        assert_eq!(m.store.len(), original_len);
 
         // Read from offset 0, length 10
         let mut read_buf_2 = [0u8; 10];
         m.read_at(&mut read_buf_2, 0);
         assert_eq!(&read_buf_2, b"0123456789");
-        assert_eq!(m.store.borrow().position(), original_pos);
+        assert_eq!(m.store.len(), original_len);
     }
     #[test]
     fn test_write_at_memstore() {
@@ -205,17 +214,17 @@ mod test {
         let mut m = Memstore::create(&id);
         let initial_data = b"initial";
         m.append(initial_data);
-        let initial_pos = m.store.borrow().position();
-        assert_eq!(initial_pos, initial_data.len() as u64);
+        let initial_len = m.store.len();
+        assert_eq!(initial_len, initial_data.len());
 
         // Test seeking forward
-        let seek_pos = initial_pos as usize + 10;
+        let seek_pos = initial_len + 10;
         m.seek(seek_pos);
-        assert_eq!(m.store.borrow().position(), seek_pos as u64);
+        assert_eq!(m.store.len(), seek_pos);
 
         // Test seeking to current position (should work)
         m.seek(seek_pos);
-        assert_eq!(m.store.borrow().position(), seek_pos as u64);
+        assert_eq!(m.store.len(), seek_pos);
     }
 
     #[test]
@@ -385,11 +394,11 @@ mod test {
 
         // Write initial data
         m.append(b"initial");
-        assert_eq!(m.store.borrow().position(), 7);
+        assert_eq!(m.store.len(), 7);
 
         // Seek forward with padding
         m.seek(10);
-        assert_eq!(m.store.borrow().position(), 10);
+        assert_eq!(m.store.len(), 10);
 
         // Verify padding was written
         let mut buf = vec![0; 10];
@@ -397,7 +406,7 @@ mod test {
         assert_eq!(&buf[0..7], b"initial");
         assert_eq!(&buf[7..10], &[0u8; 3]);
 
-        // Verify position is maintained
-        assert_eq!(m.store.borrow().position(), 10);
+        // Verify length is maintained
+        assert_eq!(m.store.len(), 10);
     }
 }
