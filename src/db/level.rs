@@ -1,7 +1,5 @@
 use std::{clone, sync::Arc, usize};
 
-use bincode::Options;
-
 use crate::db::common::KViterAgg;
 
 use super::{
@@ -278,8 +276,8 @@ impl<T: Store> LevelStorege<T> {
 
             let mut current_table_builder = {
                 let new_store_id = store_id_generator();
-                let new_store = T::create(new_store_id); // Pass u64 directly
-                                                         // Using usize::MAX for block_count as no specific config is available for it.
+                let new_store = T::open(new_store_id); // Pass u64 directly
+                                                       // Using usize::MAX for block_count as no specific config is available for it.
                 TableBuilder::new_with_block_count(new_store, usize::MAX)
             };
 
@@ -291,7 +289,7 @@ impl<T: Store> LevelStorege<T> {
 
                     // Start a new table builder
                     let new_store_id = store_id_generator();
-                    let new_store = T::create(new_store_id); // Pass u64 directly
+                    let new_store = T::open(new_store_id); // Pass u64 directly
                     current_table_builder =
                         TableBuilder::new_with_block_count(new_store, usize::MAX);
                     // Add the current operation to the new table
@@ -580,7 +578,7 @@ mod test {
             );
             v.push(tmp);
         }
-        let mut store = Memstore::create(0); // Use the provided store_id
+        let mut store = Memstore::open(0); // Use the provided store_id
         let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(v.iter()); // Use iter()
         let res = table.flush();
@@ -750,7 +748,7 @@ mod test {
             );
             v.push(tmp);
         }
-        let mut store = Memstore::create(id); // Pass u64 directly
+        let mut store = Memstore::open(id); // Pass u64 directly
         let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(v.iter());
         let res = table.flush();

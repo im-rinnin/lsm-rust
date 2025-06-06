@@ -18,7 +18,7 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
-    fn create(id: StoreId) -> Self;
+    fn open(id: StoreId) -> Self;
     fn id(&self) -> StoreId;
 }
 
@@ -35,7 +35,7 @@ impl Memstore {}
 
 impl Store for Memstore {
     fn close(self) {}
-    fn create(id: StoreId) -> Self {
+    fn open(id: StoreId) -> Self {
         Memstore {
             store: Vec::new(),
             id,
@@ -88,8 +88,16 @@ impl Store for Filestore {
     fn id(&self) -> StoreId {
         self.id
     }
-    fn create(id: StoreId) -> Self {
-        unimplemented!()
+    fn open(id: StoreId) -> Self {
+        use std::fs::OpenOptions;
+        let filename = format!("{}.data", id); // Using .data as a generic extension for store files
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true) // Create the file if it doesn't exist
+            .open(&filename)
+            .expect(&format!("Failed to open file: {}", filename));
+        Filestore { f, id }
     }
     fn len(&self) -> usize {
         let meta = self.f.metadata().unwrap();
@@ -146,43 +154,12 @@ mod test {
     };
     use tempfile::NamedTempFile;
 
-    use serde::{Deserialize, Serialize};
-
     use super::{Memstore, Store};
-    #[derive(Serialize, Deserialize, Debug)]
-    struct TestSerde {
-        pub a: i32,
-        pub b: String,
-        pub c: Vec<i32>,
-    }
-
-    #[test]
-    fn test_read_write_memsotre() {
-        let id = 1u64;
-        let mut m = Memstore::create(id);
-        // The second 'id' variable is unused after the type change, can be removed if desired.
-        // For now, keeping it as is to minimize changes outside the direct fix.
-        let id_str_unused = String::from("1");
-        let t = TestSerde {
-            a: 1,
-            b: "sdfs".to_string(),
-            c: vec![1, 2, 3],
-        };
-        let mut a = Vec::new();
-        bincode::serialize_into(&mut a, &t);
-        bincode::serialize_into(&mut a, &t);
-        m.append(&a);
-        let mut data = vec![0; a.len()];
-        m.read_at(data.as_mut_slice(), 0);
-        let mut s = data.as_slice();
-        let d: TestSerde = bincode::deserialize_from(&mut s).unwrap();
-        let t: TestSerde = bincode::deserialize_from(&mut s).unwrap();
-    }
 
     #[test]
     fn test_read_at_memstore() {
         let id = 2u64; // Using a unique ID for this test
-        let mut m = Memstore::create(id);
+        let mut m = Memstore::open(id);
         let data = b"0123456789abcdef";
         m.append(data);
         let original_len = m.store.len();
@@ -204,7 +181,7 @@ mod test {
     #[test]
     fn test_write_at_memstore() {
         let id = 3u64; // Using a unique ID for this test
-        let mut m = Memstore::create(id);
+        let mut m = Memstore::open(id);
         let initial_data = b"initial";
         m.append(initial_data);
         let initial_len = m.store.len();
@@ -223,7 +200,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_write_at_memstore_panic() {
-        let mut m = Memstore::create(4u64); // Using a unique ID for this test
+        let mut m = Memstore::open(4u64); // Using a unique ID for this test
         m.append(b"some data");
         m.seek(1); // Seek backwards, should panic due to assert
     }
@@ -383,7 +360,7 @@ mod test {
     #[test]
     fn test_memstore_pad_in_write() {
         let id = 9u64; // Using a unique ID for this test
-        let mut m = Memstore::create(id);
+        let mut m = Memstore::open(id);
 
         // Write initial data
         m.append(b"initial");
@@ -401,5 +378,41 @@ mod test {
 
         // Verify length is maintained
         assert_eq!(m.store.len(), 10);
+    }
+
+    #[test]
+    fn test_filestore_open() {
+        use std::env;
+        use std::path::Path;
+        use tempfile::tempdir;
+
+        let test_id = 100u64; // Unique ID for this test
+
+        // Create a temporary directory
+        let dir = tempdir().expect("Failed to create temp dir");
+        let original_dir = env::current_dir().expect("Failed to get current dir");
+
+        // Change to the temporary directory
+        env::set_current_dir(&dir).expect("Failed to change to temp dir");
+
+        // Open the filestore
+        let filestore = Filestore::open(test_id);
+
+        // Verify the file exists
+        let expected_filename = format!("{}.data", test_id);
+        let file_path = Path::new(&expected_filename);
+        assert!(file_path.exists(), "File should exist after opening");
+
+        // Verify the ID
+        assert_eq!(
+            filestore.id(),
+            test_id,
+            "Filestore ID should match the opened ID"
+        );
+
+        // Clean up: The `dir` object will automatically delete the directory and its contents
+        // when it goes out of scope.
+        // Change back to the original directory
+        env::set_current_dir(&original_dir).expect("Failed to change back to original dir");
     }
 }

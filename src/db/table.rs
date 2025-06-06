@@ -21,7 +21,6 @@ use crate::db::{
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
-use serde::{Deserialize, Serialize};
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
@@ -395,7 +394,6 @@ impl<T: Store> TableBuilder<T> {
 
 #[cfg(test)]
 pub mod test {
-    use bincode::serialize_into;
     use byteorder::LittleEndian;
     use byteorder::WriteBytesExt;
 
@@ -432,7 +430,7 @@ pub mod test {
     ) -> TableReader<Memstore> {
         let v = create_kv_data_with_range_id_offset(range, id);
         let store_id = 1u64; // Assign a unique u64 ID for this test helper
-        let mut store = Memstore::create(store_id);
+        let mut store = Memstore::open(store_id);
         let mut it = v.iter();
         let mut table = TableBuilder::new_with_store(store);
         table.fill_with_op(it);
@@ -469,7 +467,7 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(num_kvs);
 
         let store_id = 100u64; // Assign a unique u64 ID for this test
-        let store = Memstore::create(store_id);
+        let store = Memstore::open(store_id);
         let mut table_builder = TableBuilder::new_with_store(store);
 
         table_builder.fill_with_op(kvs.iter());
@@ -519,7 +517,7 @@ pub mod test {
         let kvs = create_test_kvs_for_add_test();
 
         let store_id = 101u64; // Assign a unique u64 ID for this test
-        let store = Memstore::create(store_id);
+        let store = Memstore::open(store_id);
         let mut tb = TableBuilder::new_with_store(store);
 
         for kv_op in &kvs {
@@ -552,7 +550,7 @@ pub mod test {
         let kvs = create_test_kvs_for_add_test();
 
         let store_id = 102u64; // Assign a unique u64 ID for this test
-        let store = Memstore::create(store_id);
+        let store = Memstore::open(store_id);
         let mut tb = TableBuilder::new_with_store(store);
 
         let kvs_iter = kvs.iter();
@@ -587,7 +585,7 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(num);
 
         let store_id = 103u64; // Assign a unique u64 ID for this test
-        let mut store = Memstore::create(store_id);
+        let mut store = Memstore::open(store_id);
         let mut tb = TableBuilder::new_with_store(store);
         tb.fill_with_op(kvs.iter());
         let table = tb.flush();
@@ -650,7 +648,7 @@ pub mod test {
         });
 
         let store_id = 104u64; // Assign a unique u64 ID for this test
-        let store = Memstore::create(store_id);
+        let store = Memstore::open(store_id);
         let mut tb = TableBuilder::new_with_store(store);
         tb.fill_with_op(kvs.iter());
         let table_reader = tb.flush();

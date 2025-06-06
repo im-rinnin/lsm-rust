@@ -21,7 +21,6 @@ use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::Bytes;
 use bytes::BytesMut;
-use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 
 use crate::db::common::{new_buffer, Buffer, KVOpertion, KViterAgg};

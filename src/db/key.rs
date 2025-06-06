@@ -1,8 +1,6 @@
 use bytes::Bytes;
-use serde::Deserialize;
-use serde::Serialize;
 use std::usize;
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
 pub struct Key<T: AsRef<[u8]>> {
     data: T,
 }
