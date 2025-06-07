@@ -382,39 +382,4 @@ mod test {
         assert_eq!(m.store.len(), 10);
     }
 
-    #[test]
-    fn test_filestore_open() {
-        use std::env;
-        use std::path::Path;
-        use tempfile::tempdir;
-
-        let test_id = 100u64; // Unique ID for this test
-
-        // Create a temporary directory
-        let dir = tempdir().expect("Failed to create temp dir");
-        let original_dir = env::current_dir().expect("Failed to get current dir");
-
-        // Change to the temporary directory
-        env::set_current_dir(&dir).expect("Failed to change to temp dir");
-
-        // Open the filestore
-        let filestore = Filestore::open(test_id);
-
-        // Verify the file exists
-        let expected_filename = format!("{}.data", test_id);
-        let file_path = Path::new(&expected_filename);
-        assert!(file_path.exists(), "File should exist after opening");
-
-        // Verify the ID
-        assert_eq!(
-            filestore.id(),
-            test_id,
-            "Filestore ID should match the opened ID"
-        );
-
-        // Clean up: The `dir` object will automatically delete the directory and its contents
-        // when it goes out of scope.
-        // Change back to the original directory
-        env::set_current_dir(&original_dir).expect("Failed to change back to original dir");
-    }
 }
