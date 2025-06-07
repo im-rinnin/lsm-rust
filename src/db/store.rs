@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::common::Result;
+
 pub type StoreId = u64;
 // append only data store
 pub trait Store {
@@ -78,6 +79,11 @@ impl Store for Memstore {
         }
         // For Vec<u8>, 'seeking' just means ensuring its length is at least 'position'.
         // Subsequent appends will start from 'position'.
+    }
+}
+impl Filestore{
+    pub fn open_with(f: File, id: StoreId) -> Self {
+        Filestore { f, id }
     }
 }
 

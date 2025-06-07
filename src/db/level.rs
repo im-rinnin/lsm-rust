@@ -1,4 +1,14 @@
-use std::{clone, sync::Arc, usize};
+use std::{
+    clone,
+    fs::File,
+    io::{Read, Write},
+    sync::Arc,
+    usize,
+};
+
+use anyhow::{anyhow, Result};
+use byteorder::{LittleEndian, WriteBytesExt};
+use crc32fast::Hasher;
 
 use crate::db::common::KViterAgg;
 
@@ -6,23 +16,154 @@ use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
     key::{KeySlice, KeyVec},
     lsm_storage::LsmStorage,
-    store::{Store, StoreId},
+    store::{Filestore, Store, StoreId},
     table::{self, *},
 };
 
 const MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ChangeType {
-    Add,
-    Delete,
+    Add,    // encode to 0
+    Delete, // encode to 1
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableChange {
     level: usize,
     index: usize,
     id: u64,
     change_type: ChangeType,
+}
+
+impl TableChange {
+    fn encode<W: Write>(&self, writer: &mut W) {
+        writer.write_u64::<LittleEndian>(self.level as u64).unwrap();
+        writer.write_u64::<LittleEndian>(self.index as u64).unwrap();
+        writer.write_u64::<LittleEndian>(self.id).unwrap();
+        writer
+            .write_u8(match self.change_type {
+                ChangeType::Add => 0,
+                ChangeType::Delete => 1,
+            })
+            .unwrap();
+    }
+    fn decode<R: Read>(mut data: R) -> Self {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        let level = data.read_u64::<LittleEndian>().unwrap() as usize;
+        let index = data.read_u64::<LittleEndian>().unwrap() as usize;
+        let id = data.read_u64::<LittleEndian>().unwrap();
+        let change_type_byte = data.read_u8().unwrap();
+        let change_type = match change_type_byte {
+            0 => ChangeType::Add,
+            1 => ChangeType::Delete,
+            _ => panic!("Unknown ChangeType byte: {}", change_type_byte),
+        };
+        TableChange {
+            level,
+            index,
+            id,
+            change_type,
+        }
+    }
+}
+
+// level change 0: [table_change_count(u64)][table_change_entry_0][table_change_entry_1][check_sum of all table change]
+pub struct TableChangeLog<T: Store> {
+    storage: T,
+}
+const U64_SIZE: usize = std::mem::size_of::<u64>();
+const U32_SIZE: usize = std::mem::size_of::<u32>();
+// level (u64) + index (u64) + id (u64) + change_type (u8)
+const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 3 + std::mem::size_of::<u8>();
+
+impl TableChangeLog<Filestore> {
+    pub fn from_file(f: File, id: StoreId) -> Self {
+        TableChangeLog {
+            storage: Filestore::open_with(f, id),
+        }
+    }
+}
+impl<T: Store> TableChangeLog<T> {
+    pub fn from(id: StoreId) -> Self {
+        TableChangeLog {
+            storage: T::open(id),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_store(storage: T) -> Self {
+        TableChangeLog { storage }
+    }
+
+    pub fn append(&mut self, changes: Vec<TableChange>) {
+        // Write the number of changes as a u64
+        self.storage.append(&(changes.len() as u64).to_le_bytes());
+
+        // Write each TableChange entry
+        let mut hasher = Hasher::new();
+        for change in changes {
+            let mut buffer = Vec::new();
+            change.encode(&mut buffer);
+            hasher.update(&buffer); // Update checksum with each change's bytes
+            self.storage.append(&buffer);
+        }
+        let checksum = hasher.finalize();
+        self.storage.append(&checksum.to_le_bytes()); // Append the checksum
+        self.storage.flush();
+    }
+
+    fn get_all_changes(&self) -> Result<Vec<TableChange>> {
+        let storage_len = self.storage.len();
+        let mut all_decoded_changes = Vec::new();
+        let mut current_read_offset = 0;
+
+        while current_read_offset < storage_len {
+            // Read count (u64)
+            if current_read_offset + U64_SIZE > storage_len {
+                eprintln!("TableChangeLog: Corrupted log file - incomplete count header at offset {}. Remaining bytes: {}", current_read_offset, storage_len - current_read_offset);
+                break;
+            }
+            let mut count_buf = [0u8; U64_SIZE];
+            self.storage.read_at(&mut count_buf, current_read_offset);
+            let num_changes_in_batch = u64::from_le_bytes(count_buf) as usize;
+            current_read_offset += U64_SIZE;
+
+            let batch_changes_data_len = num_changes_in_batch * TABLE_CHANGE_ENCODED_SIZE;
+            let batch_expected_total_len = batch_changes_data_len + U32_SIZE; // Data + Checksum
+
+            if current_read_offset + batch_expected_total_len > storage_len {
+                eprintln!("TableChangeLog: Corrupted log file - incomplete batch data or checksum at offset {}. Expected total batch bytes: {}, Remaining bytes: {}", current_read_offset, batch_expected_total_len, storage_len - current_read_offset);
+                break;
+            }
+
+            let mut hasher = Hasher::new();
+            let mut change_bytes_buf = [0u8; TABLE_CHANGE_ENCODED_SIZE];
+
+            for _i in 0..num_changes_in_batch {
+                self.storage
+                    .read_at(&mut change_bytes_buf, current_read_offset);
+                hasher.update(&change_bytes_buf);
+
+                let decoded_change = TableChange::decode(&change_bytes_buf[..]);
+                all_decoded_changes.push(decoded_change);
+                current_read_offset += TABLE_CHANGE_ENCODED_SIZE;
+            }
+
+            // Read checksum (u32)
+            let mut checksum_buf = [0u8; U32_SIZE];
+            self.storage.read_at(&mut checksum_buf, current_read_offset);
+            let expected_checksum = u32::from_le_bytes(checksum_buf);
+            current_read_offset += U32_SIZE;
+
+            let calculated_checksum = hasher.finalize();
+            if calculated_checksum != expected_checksum {
+                eprintln!("TableChangeLog: Checksum mismatch detected for a batch at offset {}. Calculated: {}, Expected: {}. Log might be corrupted.", current_read_offset - U32_SIZE, calculated_checksum, expected_checksum);
+                return Err(anyhow::anyhow!("decode table change checksum"));
+            }
+        }
+        Ok(all_decoded_changes)
+    }
 }
 
 pub struct Level<T: Store> {
@@ -102,6 +243,57 @@ impl<T: Store> Clone for LevelStorege<T> {
 }
 
 impl<T: Store> LevelStorege<T> {
+    fn resotre_table_id(
+        start_level: Vec<Vec<StoreId>>,
+        changes: Vec<TableChange>,
+    ) -> Vec<Vec<StoreId>> {
+        let mut levels_data = start_level;
+
+        for change in changes {
+            // Ensure levels_data has enough capacity for the current level
+            while levels_data.len() <= change.level {
+                levels_data.push(Vec::new());
+            }
+
+            let level_tables = &mut levels_data[change.level];
+
+            match change.change_type {
+                ChangeType::Add => {
+                    // Ensure index is valid for insertion
+                    if change.index > level_tables.len() {
+                        // This case should ideally not happen if changes are applied in order
+                        // or if the index refers to an append. For now, panic or resize.
+                        // Given it's a restore, it implies a sequence of valid operations.
+                        panic!(
+                            "Invalid index for add operation: level {}, index {}, current len {}",
+                            change.level,
+                            change.index,
+                            level_tables.len()
+                        );
+                    }
+                    level_tables.insert(change.index, change.id);
+                }
+                ChangeType::Delete => {
+                    // Ensure index is valid for deletion
+                    if change.index >= level_tables.len() {
+                        // This indicates an inconsistency in the change log or out-of-order application
+                        panic!(
+                            "Invalid index for delete operation: level {}, index {}, current len {}",
+                            change.level,
+                            change.index,
+                            level_tables.len()
+                        );
+                    }
+                    level_tables.remove(change.index);
+                }
+            }
+        }
+        levels_data
+    }
+    fn from(changes: Vec<Vec<StoreId>>) -> Self {
+        unimplemented!()
+    }
+
     pub fn new(tables: Vec<Level<T>>, r: usize) -> Self {
         LevelStorege {
             levels: tables,
@@ -470,10 +662,12 @@ mod test {
     use std::ops::Range;
     use std::sync::Arc; // Moved from test functions
 
+    use crc32fast::Hasher;
+
     use crate::db::common::{KVOpertion, OpId, OpType}; // OpType moved from helper
     use crate::db::key::{KeySlice, KeyVec};
-    use crate::db::level::{ChangeType, Level, LevelStorege};
-    use crate::db::store::Store;
+    use crate::db::level::{ChangeType, Level, LevelStorege, TableChange, U32_SIZE};
+    use crate::db::store::{Filestore, Store, StoreId};
     // KeyVec moved from helper
     use crate::db::table::test::{create_test_table, create_test_table_with_id_offset};
     use crate::db::table::TableBuilder; // Moved from helper
@@ -1351,6 +1545,46 @@ mod test {
     }
 
     #[test]
+    fn test_table_change_encode_decode() {
+        let original_change = super::TableChange {
+            level: 5,
+            index: 10,
+            id: 12345,
+            change_type: super::ChangeType::Add,
+        };
+
+        let mut encoded_data = Vec::new();
+        original_change.encode(&mut encoded_data);
+
+        let decoded_change = super::TableChange::decode(encoded_data.as_slice());
+
+        assert_eq!(original_change.level, decoded_change.level);
+        assert_eq!(original_change.index, decoded_change.index);
+        assert_eq!(original_change.id, decoded_change.id);
+        assert_eq!(original_change.change_type, decoded_change.change_type);
+
+        let original_change_delete = super::TableChange {
+            level: 1,
+            index: 0,
+            id: 67890,
+            change_type: super::ChangeType::Delete,
+        };
+
+        let mut encoded_data_delete = Vec::new();
+        original_change_delete.encode(&mut encoded_data_delete);
+
+        let decoded_change_delete = super::TableChange::decode(encoded_data_delete.as_slice());
+
+        assert_eq!(original_change_delete.level, decoded_change_delete.level);
+        assert_eq!(original_change_delete.index, decoded_change_delete.index);
+        assert_eq!(original_change_delete.id, decoded_change_delete.id);
+        assert_eq!(
+            original_change_delete.change_type,
+            decoded_change_delete.change_type
+        );
+    }
+
+    #[test]
     fn test_max_table_in_level() {
         // Test level 0
         assert_eq!(
@@ -1444,6 +1678,266 @@ mod test {
             &compacted_level,
             &KeySlice::from("000250".as_bytes()),
             Some("250".as_bytes()),
+        );
+    }
+
+    #[test]
+    fn test_restore_table_id() {
+        // Scenario 1: Empty changes, empty start_level
+        let start_level: Vec<Vec<StoreId>> = vec![];
+        let changes: Vec<TableChange> = vec![];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![] as Vec<Vec<u64>>);
+
+        // Scenario 2: Empty changes, non-empty start_level
+        let start_level: Vec<Vec<StoreId>> = vec![vec![1, 2], vec![3]];
+        let changes: Vec<TableChange> = vec![];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level.clone(), changes);
+        assert_eq!(result, vec![vec![1, 2], vec![3]]);
+
+        // Scenario 3: Add operations
+        let start_level: Vec<Vec<StoreId>> = vec![vec![]]; // Start with an empty level 0
+        let changes = vec![
+            TableChange {
+                level: 0,
+                index: 0,
+                id: 100,
+                change_type: ChangeType::Add,
+            },
+            TableChange {
+                level: 0,
+                index: 1,
+                id: 101,
+                change_type: ChangeType::Add,
+            },
+            TableChange {
+                level: 1, // This will expand levels_data
+                index: 0,
+                id: 200,
+                change_type: ChangeType::Add,
+            },
+        ];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![vec![100, 101], vec![200]]);
+
+        // Scenario 4: Delete operations
+        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11, 12], vec![20, 21]];
+        let changes = vec![
+            TableChange {
+                level: 0,
+                index: 1,
+                id: 11,
+                change_type: ChangeType::Delete,
+            },
+            TableChange {
+                level: 1,
+                index: 0,
+                id: 20,
+                change_type: ChangeType::Delete,
+            },
+        ];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![vec![10, 12], vec![21]]);
+
+        // Scenario 5: Mixed Add and Delete
+        let start_level: Vec<Vec<StoreId>> = vec![vec![1, 2, 3]];
+        let changes = vec![
+            TableChange {
+                level: 0,
+                index: 1,
+                id: 2,
+                change_type: ChangeType::Delete,
+            }, // Delete 2
+            TableChange {
+                level: 0,
+                index: 1,
+                id: 4,
+                change_type: ChangeType::Add,
+            }, // Add 4 at index 1
+            TableChange {
+                level: 1,
+                index: 0,
+                id: 5,
+                change_type: ChangeType::Add,
+            }, // Add 5 to new level 1
+        ];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![vec![1, 4, 3], vec![5]]);
+
+        // Scenario 6: Add at the end of a level
+        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11]];
+        let changes = vec![TableChange {
+            level: 0,
+            index: 2,
+            id: 12,
+            change_type: ChangeType::Add,
+        }];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![vec![10, 11, 12]]);
+
+        // Scenario 7: Delete the last element
+        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11, 12]];
+        let changes = vec![TableChange {
+            level: 0,
+            index: 2,
+            id: 12,
+            change_type: ChangeType::Delete,
+        }];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![vec![10, 11]]);
+
+        // Scenario 8: Delete the first element
+        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11, 12]];
+        let changes = vec![TableChange {
+            level: 0,
+            index: 0,
+            id: 10,
+            change_type: ChangeType::Delete,
+        }];
+        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
+        assert_eq!(result, vec![vec![11, 12]]);
+
+    }
+
+    #[test]
+    fn test_table_change_log_get_all_changes() {
+        use tempfile::NamedTempFile;
+        use std::fs::OpenOptions;
+
+        use tempfile::tempdir;
+        let store_id = 999;
+        // Create a temporary directory
+        let tmp_dir = tempdir().expect("Failed to create temp directory");
+        // Get a file path in the temporary directory and record it
+        let path = tmp_dir.path().join(format!("{}.data", store_id));
+        // Open file by path and pass it to log
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .expect("Failed to open file in temp dir");
+        let mut log = super::TableChangeLog::<Filestore>::from_file(file, store_id);
+
+        // Case 1: Empty log
+        let empty_tmp_dir = tempdir().expect("Failed to create temp directory for empty log");
+        let empty_path = empty_tmp_dir.path().join(format!("{}.data", store_id + 1));
+        let empty_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&empty_path)
+            .expect("Failed to open empty file in temp dir");
+        let empty_log = super::TableChangeLog::<Filestore>::from_file(empty_file, store_id + 1);
+        assert!(empty_log.get_all_changes().unwrap().is_empty());
+
+        // Case 2: Log with one change batch
+        let change1 = TableChange {
+            level: 0,
+            index: 0,
+            id: 100,
+            change_type: ChangeType::Add,
+        };
+        log.append(vec![change1.clone()]);
+        // To read from the same log instance, we need to re-open the file or ensure the Filestore's internal cursor is reset.
+        // Since Filestore is append-only and doesn't reset its internal cursor for reads,
+        // we'll simulate re-opening the log from the file for each read operation to get all changes from the beginning.
+        // This is consistent with how a log would be read from disk.
+        let file_for_read1 = OpenOptions::new().read(true).open(&path).expect("Failed to open file for read");
+        let retrieved_changes_batch1 = super::TableChangeLog::<Filestore>::from_file(file_for_read1, store_id).get_all_changes().unwrap();
+        assert_eq!(retrieved_changes_batch1.len(), 1);
+        assert_eq!(retrieved_changes_batch1[0].id, 100);
+        assert_eq!(retrieved_changes_batch1[0].level, 0);
+        assert_eq!(retrieved_changes_batch1[0].index, 0);
+        assert_eq!(retrieved_changes_batch1[0].change_type, ChangeType::Add);
+
+        // Case 3: Log with multiple change batches
+        let change2 = TableChange {
+            level: 1,
+            index: 5,
+            id: 200,
+            change_type: ChangeType::Delete,
+        };
+        let change3 = TableChange {
+            level: 0,
+            index: 1,
+            id: 101,
+            change_type: ChangeType::Add,
+        };
+        log.append(vec![change2.clone(), change3.clone()]);
+
+        // Re-create log from same store_id to simulate opening an existing log
+        let file_for_read2 = OpenOptions::new().read(true).open(&path).expect("Failed to open file for read");
+        let log_reopened = super::TableChangeLog::<Filestore>::from_file(file_for_read2, store_id);
+        let retrieved_changes_reopened = log_reopened.get_all_changes().unwrap();
+
+        assert_eq!(retrieved_changes_reopened.len(), 3); // Total changes: 1 from first batch + 2 from second batch
+        assert_eq!(retrieved_changes_reopened[0].id, 100);
+        assert_eq!(retrieved_changes_reopened[1].id, 200);
+        assert_eq!(retrieved_changes_reopened[2].id, 101);
+
+        // Verify details of the second batch
+        assert_eq!(retrieved_changes_reopened[1].level, 1);
+        assert_eq!(retrieved_changes_reopened[1].index, 5);
+        assert_eq!(
+            retrieved_changes_reopened[1].change_type,
+            ChangeType::Delete
+        );
+
+        assert_eq!(retrieved_changes_reopened[2].level, 0);
+        assert_eq!(retrieved_changes_reopened[2].index, 1);
+        assert_eq!(retrieved_changes_reopened[2].change_type, ChangeType::Add);
+
+        // Case 4: Test with a batch of zero changes (should be handled gracefully)
+        log.append(vec![]);
+        let file_for_read3 = OpenOptions::new().read(true).open(&path).expect("Failed to open file for read");
+        let log_reopened_empty_batch = super::TableChangeLog::<Filestore>::from_file(file_for_read3, store_id);
+        let retrieved_changes_empty_batch = log_reopened_empty_batch.get_all_changes().unwrap();
+        assert_eq!(retrieved_changes_empty_batch.len(), 3); // Should still be 3, as empty batch adds no changes
+    }
+
+    #[test]
+    fn test_table_change_log_corrupted_checksum() {
+        let store_id = 1000;
+        let mut memstore = Memstore::open(store_id);
+
+        // Manually create a valid TableChange and its encoded bytes
+        let change = TableChange {
+            level: 0,
+            index: 0,
+            id: 1,
+            change_type: ChangeType::Add,
+        };
+        let mut change_buffer = Vec::new();
+        change.encode(&mut change_buffer); // This is 25 bytes
+
+        // Calculate correct checksum
+        let mut hasher = Hasher::new();
+        hasher.update(&change_buffer);
+        let correct_checksum = hasher.finalize();
+
+        // Prepare the full batch bytes: count + change_data + checksum
+        let mut batch_bytes = Vec::new();
+        batch_bytes.extend_from_slice(&(1u64).to_le_bytes()); // num_changes_in_batch = 1
+        batch_bytes.extend_from_slice(&change_buffer);
+        batch_bytes.extend_from_slice(&correct_checksum.to_le_bytes());
+
+        // Corrupt the checksum byte (e.g., flip a bit in the last byte of the checksum)
+        let checksum_start_index = batch_bytes.len() - U32_SIZE; // U32_SIZE is 4
+        batch_bytes[checksum_start_index] = batch_bytes[checksum_start_index].wrapping_add(1); // Corrupt one byte
+
+        // Append the corrupted bytes to the memstore
+        memstore.append(&batch_bytes);
+
+        // Create a TableChangeLog from the corrupted memstore
+        let corrupted_log = super::TableChangeLog::new_with_store(memstore);
+
+        // Attempt to get changes, expecting an error due to checksum mismatch
+        let result = corrupted_log.get_all_changes();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "decode table change checksum"
         );
     }
 

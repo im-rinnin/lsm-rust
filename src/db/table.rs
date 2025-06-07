@@ -25,7 +25,6 @@ use byteorder::WriteBytesExt;
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
     common::{OpTypeRef, SearchResult},
-    db_meta::{self, DBMeta},
     key::KeyBytes,
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
