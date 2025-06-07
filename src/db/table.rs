@@ -2,20 +2,14 @@
 // [<block>,<block>...<block><block_meta>...<block_meta><block_meta_offset(u64)><block_meta_count(u64)>]
 // <block_meta>:[key_size,first_key,key_size,last_key]
 use std::{
-    cell::RefCell,
-    cmp::Ordering,
-    collections::binary_heap::PeekMut,
     io::{Cursor, Read, Seek, Write},
-    iter::Peekable,
-    ops::Not,
     sync::Arc,
     u64, usize,
 };
 
 use crate::db::{
-    common::{new_buffer, Buffer, KVOpertion, KViterAgg, OpId, OpType, Result, Value},
-    key::{KeySlice, KeyVec, ValueByte},
-    memtable::Memtable,
+    common::{new_buffer, Buffer, KVOpertion , OpId, OpType},
+    key::{KeySlice, KeyVec },
     store::{Store, StoreId},
 };
 use byteorder::LittleEndian;
@@ -24,7 +18,7 @@ use byteorder::WriteBytesExt;
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
-    common::{OpTypeRef, SearchResult},
+    common::{ SearchResult},
     key::KeyBytes,
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -393,33 +387,24 @@ impl<T: Store> TableBuilder<T> {
 
 #[cfg(test)]
 pub mod test {
-    use byteorder::LittleEndian;
-    use byteorder::WriteBytesExt;
 
-    use super::BlockBuilder;
-    use super::BlockMeta;
-    use super::{TableBuilder, DATA_BLOCK_SIZE};
+    use super::{TableBuilder };
     use crate::db::block::test::create_kv_data_with_range_id_offset;
     use crate::db::common::OpId;
-    use crate::db::key::KeyBytes;
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
-    use core::panic;
     use std::{
-        hash::BuildHasher, io::Cursor, iter::Peekable, ops::Range, os::unix::fs::MetadataExt,
-        process::Output, rc::Rc, str::FromStr, usize,
+        ops::Range
     };
 
     use super::super::block::test::pad_zero;
-    use crate::db::common::KVOpertionRef;
     use crate::db::{
-        block::{test::create_kv_data_with_range, BlockIter},
-        common::{new_buffer, KVOpertion, OpType},
+        common::{ KVOpertion, OpType},
         store::{Memstore, Store},
     };
 
     use super::super::block::test::create_kv_data_in_range_zero_to;
-    use super::{KViterAgg, TableReader};
+    use super::{ TableReader};
     pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> {
         create_test_table_with_id_offset(range, 0)
     }

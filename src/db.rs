@@ -1,3 +1,4 @@
+#![allow(unused)]
 use std::{
     path::PathBuf,
     sync::{atomic::AtomicU64, Arc, Mutex},

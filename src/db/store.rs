@@ -1,12 +1,8 @@
 use std::{
-    cell::RefCell,
-    collections::HashMap,
     fs::File,
-    io::{Cursor, Read, Write},
-    usize,
+    io::Write,
 };
 
-use super::common::Result;
 
 pub type StoreId = u64;
 // append only data store
@@ -54,7 +50,7 @@ impl Store for Memstore {
         self.store.extend_from_slice(data);
     }
     fn read_at(&self, buf: &mut [u8], offset: usize) {
-        let end_offset = offset + buf.len();
+        let _end_offset = offset + buf.len();
         if offset >= self.store.len() {
             // If offset is beyond current data, fill buffer with zeros
             buf.fill(0);
@@ -89,7 +85,7 @@ impl Filestore{
 
 impl Store for Filestore {
     fn flush(&mut self) {
-        self.f.sync_data();
+        let _ = self.f.sync_data();
     }
     fn id(&self) -> StoreId {
         self.id
@@ -110,7 +106,7 @@ impl Store for Filestore {
         meta.len() as usize
     }
     fn close(self) {
-        self.f.sync_all();
+        let _ = self.f.sync_all();
     }
     fn append(&mut self, data: &[u8]) {
         self.f.write_all(data).unwrap()

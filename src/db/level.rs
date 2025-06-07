@@ -1,12 +1,11 @@
 use std::{
-    clone,
     fs::File,
     io::{Read, Write},
     sync::Arc,
     usize,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::Hasher;
 

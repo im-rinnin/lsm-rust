@@ -29,11 +29,11 @@ pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
 use crate::db::key::KeyVec;
 use std::cell::RefCell;
 
-use super::common::KVOpertionRef;
+use super::key::KeyBytes;
 
 pub struct BlockReader {
     data: Bytes,
-    first_key: KeyVec,
+    first_key: KeyBytes,
     count: usize,
 }
 
@@ -46,16 +46,17 @@ impl BlockReader {
         let count = cursor.read_u64::<LittleEndian>().unwrap() as usize;
 
         // The actual block data is everything before the count
-        let block_data_slice = &data[..count_bytes_start];
+        let data_bytes = Bytes::from(data);
+
+        let bytes = data_bytes.slice(..count_bytes_start);
 
         // Decode the first KV operation to get the first key
-        let first_kv = KVOpertionRef::decode(block_data_slice);
-        let first_key = first_kv.key.as_ref();
-        let t = KeyVec::from_vec(Vec::from(first_key));
+        let (first_kv, _) = KVOpertion::decode(bytes);
+        let first_key = first_kv.key;
 
         BlockReader {
-            data: Bytes::from(data),
-            first_key: t,
+            data: data_bytes,
+            first_key,
             count,
         }
     }
@@ -102,7 +103,7 @@ impl BlockReader {
         BlockIter::new(bytes, count)
     }
 
-    pub fn first_key(&self) -> &KeyVec {
+    pub fn first_key(&self) -> &KeyBytes {
         &self.first_key
     }
 
@@ -134,10 +135,11 @@ impl BlockBuilder {
         if let Some(pos) = self.last_key_positon {
             // Create a slice from the buffer starting at the last_key_positon
             let buffer_ref = self.buffer.get_ref();
-            let slice_from_last_key = &buffer_ref[pos as usize..];
+            let slice_from_last_key = buffer_ref[pos as usize..].to_vec();
+            let data = Bytes::from(slice_from_last_key);
 
             // Decode the KV operation from this slice to get the key
-            let kv_op = KVOpertionRef::decode(slice_from_last_key);
+            let (kv_op, _) = KVOpertion::decode(data);
             Some(KeyVec::from(kv_op.key.as_ref())) // Convert KeySlice to KeyVec
         } else {
             None
@@ -619,7 +621,6 @@ pub mod test {
         }
         assert_eq!(count, br_count, "Iterator count should match block count");
     }
-    use crate::db::common::KVOpertionRef;
 
     #[test]
     fn test_block_builder_last_key() {
