@@ -11,7 +11,7 @@ impl<T: Store> LogFile<T> {
     pub fn open(store: T) -> Self {
         LogFile { s: store }
     }
-    pub fn append(&mut self, ops: Vec<KVOpertion>) {
+    pub fn append(&mut self, ops: &Vec<KVOpertion>) {
         for op in ops {
             let mut buffer = Vec::new();
             op.encode(&mut buffer);
@@ -111,7 +111,7 @@ mod test {
             KVOpertion::new(3, KeyVec::from_vec(b"key3".to_vec()), OpType::Delete),
         ];
 
-        log_file.append(ops.clone());
+        log_file.append(&ops);
 
         // Re-open the log file to get a fresh store for iteration
         let read_file = OpenOptions::new()
