@@ -21,7 +21,7 @@ pub struct Config {
 pub struct LsmStorage<T: Store> {
     m: Arc<Memtable>,
     //  immutable memtable
-    imm: Option<Arc<Memtable>>,
+    imm: Vec<Arc<Memtable>>,
     // latest level storege
     current: LevelStorege<T>,
     // meta: ThreadDbMeta<T>,

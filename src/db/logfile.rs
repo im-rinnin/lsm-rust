@@ -11,12 +11,15 @@ impl<T: Store> LogFile<T> {
     pub fn open(store: T) -> Self {
         LogFile { s: store }
     }
-    pub fn append(&mut self, op: KVOpertion) {
-        let mut buffer = Vec::new();
-        op.encode(&mut buffer);
-        let len = buffer.len() as u64;
-        self.s.append(&len.to_le_bytes());
-        self.s.append(&buffer);
+    pub fn append(&mut self, ops: Vec<KVOpertion>) {
+        for op in ops {
+            let mut buffer = Vec::new();
+            op.encode(&mut buffer);
+            let len = buffer.len() as u64;
+            self.s.append(&len.to_le_bytes());
+            self.s.append(&buffer);
+        }
+        self.s.flush();
     }
 }
 
@@ -108,17 +111,15 @@ mod test {
             KVOpertion::new(3, KeyVec::from_vec(b"key3".to_vec()), OpType::Delete),
         ];
 
-        for op in &ops {
-            log_file.append(op.clone());
-        }
+        log_file.append(ops.clone());
 
         // Re-open the log file to get a fresh store for iteration
         let read_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(&filename)
-            .expect(&format!("Failed to open file for reading: {}", filename));
+            .open(&file_path) // Use file_path here
+            .expect(&format!("Failed to open file for reading: {}", file_path.display()));
         let read_store = Filestore::open_with(read_file, store_id);
         let mut iter = LogFileIter::new(read_store);
 
@@ -135,7 +136,16 @@ mod test {
         }
 
         // Test with an empty log file (using a different store_id to ensure it's empty)
-        let empty_store = Filestore::open(store_id + 1);
+        let empty_store_id = store_id + 1;
+        let empty_filename = format!("{}.data", empty_store_id);
+        let empty_file_path = dir.path().join(&empty_filename);
+        let empty_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&empty_file_path)
+            .expect(&format!("Failed to open empty file: {}", empty_file_path.display()));
+        let empty_store = Filestore::open_with(empty_file, empty_store_id);
         let mut empty_iter = LogFileIter::new(empty_store);
         assert!(empty_iter.next().is_none());
     }
