@@ -1,4 +1,5 @@
 #![allow(unused)]
+use std::sync::atomic::Ordering;
 use std::{
     path::PathBuf,
     sync::{atomic::AtomicU64, Arc, Condvar, Mutex},
@@ -6,7 +7,7 @@ use std::{
 };
 
 use common::{KVOpertion, OpId};
-use key::{KeyBytes, KeySlice, KeyVec, ValueByte, ValueSlice};
+use key::{KeyBytes, KeySlice, KeyVec, ValueByte, ValueSlice, ValueVec};
 
 mod store;
 
@@ -15,7 +16,7 @@ mod common;
 mod db_meta;
 mod key;
 mod level;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 mod logfile;
 mod lsm_storage;
 mod memtable;
@@ -27,13 +28,15 @@ use lsm_storage::LsmStorage;
 use store::{Store, StoreId};
 const START_WRITE_REQUEST_QUEUE_LEN: usize = 100;
 struct LsmDB<T: Store> {
-    current_max_op_id: AtomicU64,
+    current_max_op_id: Arc<AtomicU64>,
     current_max_sstable_id: AtomicU64, // dont need to save to file
-    write_done_cv: Arc<Mutex<Option<Arc<(Condvar, Mutex<bool>)>>>>,
+    // The Condvar/Mutex pair for signaling write completion.
+    write_done_cv: Arc<Mutex<Arc<(Condvar, Mutex<bool>)>>>,
     current: Arc<Mutex<Arc<LsmStorage<T>>>>,
     logfile: Arc<Mutex<LogFile<T>>>,
     level_meta_log: Arc<Mutex<TableChangeLog<T>>>,
-    request_queue: Receiver<KVOpertion>,
+    request_queue_r: Receiver<KVOpertion>,
+    request_queue_s: Sender<KVOpertion>,
 }
 
 impl<T: Store> LsmDB<T> {
@@ -46,8 +49,12 @@ impl<T: Store> LsmDB<T> {
     pub fn get_reader(&self) -> DBReader<T> {
         unimplemented!()
     }
-    pub fn get_writer(&self) -> DBWriter<T> {
-        unimplemented!()
+    pub fn get_writer(&self) -> DBWriter {
+        DBWriter {
+            max_op: self.current_max_op_id.clone(),
+            queue: self.request_queue_s.clone(),
+            write_done_cv: self.write_done_cv.clone(),
+        }
     }
 
     fn check_memtable_size(&self) {}
@@ -83,32 +90,33 @@ impl<T: Store> LsmDB<T> {
             // Drop the guard explicitly after checking the flag
             drop(stop_flag);
 
-            let queue_len = self.request_queue.len();
+            let queue_len = self.request_queue_r.len();
             if queue_len < START_WRITE_REQUEST_QUEUE_LEN {
                 continue;
             } // Needs constant definition
 
-            // Placeholder: CV swapping logic
-            let mut cv_guard = self.write_done_cv.lock().unwrap();
-            let current_cv_opt = cv_guard.take(); // Take the current CV out
-                                                  // Create and set a new CV pair
-            let new_cv_pair = Arc::new((Condvar::new(), Mutex::new(false)));
-            *cv_guard = Some(new_cv_pair.clone());
-            drop(cv_guard); // Release lock before potentially long operations
+            // CV swapping logic: Clone the old CV, replace with a new one
+            let old_cv_pair; // To hold the CV pair for notification
+            {
+                let mut cv_guard = self.write_done_cv.lock().unwrap();
+                // Clone the current Arc to notify waiters later
+                old_cv_pair = cv_guard.clone();
+                // Create and set a new CV pair for future writers
+                let new_cv_pair = Arc::new((Condvar::new(), Mutex::new(false)));
+                *cv_guard = new_cv_pair;
+                // MutexGuard is dropped here, releasing the lock
+            }
 
             let mut ops_to_write = Vec::new();
             // Drain the queue or receive multiple items
-            while let Ok(op) = self.request_queue.try_recv() {
+            while let Ok(op) = self.request_queue_r.try_recv() {
                 ops_to_write.push(op);
                 // Potentially break if too many ops are collected or after a timeout
             }
 
             if ops_to_write.is_empty() {
-                // If no ops were received, restore the original CV if it existed
-                if let Some(original_cv) = current_cv_opt {
-                    let mut cv_guard = self.write_done_cv.lock().unwrap();
-                    *cv_guard = Some(original_cv);
-                }
+                // If no ops were received, we don't need to notify anyone with the old CV.
+                // The new CV is already in place for the next batch.
                 continue; // Go back to sleep/wait
             }
 
@@ -128,32 +136,58 @@ impl<T: Store> LsmDB<T> {
                 }
             } // LsmStorage lock released
 
-            // Notify client threads using the CV that was taken out
-            if let Some(cv_pair) = current_cv_opt {
-                let (cv, lock) = &*cv_pair;
-                let mut completed = lock.lock().unwrap();
-                *completed = true;
-                cv.notify_all();
-            }
+            // Notify client threads using the old CV pair that was cloned earlier
+            let (cv, lock) = &*old_cv_pair;
+            let mut completed = lock.lock().unwrap();
+            *completed = true;
+            cv.notify_all();
         }
         // Note: The loop as written never exits. A mechanism to stop the worker is needed.
     }
 }
 
-pub struct DBWriter<T: Store> {
-    max_op: AtomicU64,
-    logfile: Arc<Mutex<LogFile<T>>>,
+pub struct DBWriter {
+    max_op: Arc<AtomicU64>,
+    queue: Sender<KVOpertion>,
+    write_done_cv: Arc<Mutex<Arc<(Condvar, Mutex<bool>)>>>,
 }
-impl<T: Store> DBWriter<T> {
-    pub fn write_batch(&mut self, kvs: Vec<(&KeyBytes, &ValueByte)>) -> OpId {
-        unimplemented!()
-    }
-    pub fn write(&mut self, kvs: Vec<(&KeySlice, &ValueSlice)>) -> OpId {
-        unreachable!()
-        // * fetch and increase max op id by kvs len
-        // * write to log file  (lock and release)
-        // * Write to memtable.
-        // return max op id in kvs
+impl DBWriter {
+    pub fn write(&mut self, kvs: Vec<(&KeyVec, &ValueVec)>) -> OpId {
+        // Fetch current max op id and increment by kvs len
+        let start_op_id = self.max_op.fetch_add(kvs.len() as u64, Ordering::SeqCst);
+        let end_op_id = start_op_id + kvs.len() as u64;
+
+        // Get and lock the current write_done_cv pair
+        let cv_pair_arc = {
+            let cv_guard = self.write_done_cv.lock().unwrap();
+            cv_guard.clone() // Clone the Arc to hold onto the specific CV pair
+        };
+        let (cv, lock) = &*cv_pair_arc;
+
+        // Prepare the completed flag for waiting
+        let mut completed = lock.lock().unwrap();
+        assert!(!*completed);
+
+        // Submit write requests to the queue
+        for (i, (key, value)) in kvs.into_iter().enumerate() {
+            let op_id = start_op_id + i as u64;
+            let op = KVOpertion::new(
+                op_id,
+                key.clone(),
+                common::OpType::Write(ValueByte::from(value.as_ref())),
+            );
+            self.queue
+                .send(op)
+                .expect("Failed to send KVOpertion to queue");
+        }
+
+        // Wait for the worker thread to complete the write operation
+        while !*completed {
+            completed = cv.wait(completed).unwrap();
+        }
+
+        // Return the max op_id in this write operation
+        end_op_id - 1 // The last OpId in the range [start_op_id, end_op_id)
     }
 }
 pub struct DBReader<T: Store> {
