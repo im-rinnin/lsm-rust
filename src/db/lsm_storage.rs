@@ -50,19 +50,23 @@ impl<T: Store> LsmStorage<T> {
         self.current.table_num_in_levels()
     }
 
-    pub fn freeze_memtable(&self) -> Self {
-        let old_m = self.m.clone(); // Clone the Arc to move the old memtable to imm
-        let new_m = Arc::new(Memtable::new(old_m.get_capacity_bytes()));
+    /// Moves the current active memtable to the immutable list and creates a new active memtable.
+    /// Modifies the LsmStorage instance in place.
+    pub fn freeze_memtable(&mut self) {
+        // Create a new active memtable based on the capacity of the old one.
+        // Note: Accessing capacity might require changes if Memtable API changes.
+        // Assuming Memtable::new takes capacity. If not, adjust based on Config.
+        let new_m = Arc::new(Memtable::new(self.m.get_capacity_bytes()));
 
-        let mut new_imm = self.imm.clone(); // Clone the Vec of Arcs
-        new_imm.push(old_m); // Add the old active memtable to the immutable list
+        // Replace the current active memtable with the new one, getting the old one back.
+        let old_m = std::mem::replace(&mut self.m, new_m);
 
-        Self {
-            m: new_m,
-            imm: new_imm,
-            current: self.current.clone(), // Clone the LevelStorege
-        }
+        // Add the old memtable to the immutable list.
+        self.imm.push(old_m);
+
+        // No need to return Self, modification happens in place.
     }
+
     pub fn put(&self, query: KVOpertion) {
         // Insert the operation into the active memtable.
         // The memtable's insert method handles the key-op_id pair insertion.
@@ -282,7 +286,7 @@ mod test {
         ));
 
         // Freeze memtable, moving key1 to immutable list
-        lsm = lsm.freeze_memtable();
+        lsm.freeze_memtable();
 
         // Insert new data into the new active memtable
         let key2: KeyVec = "imm_key2".as_bytes().into();
@@ -330,7 +334,7 @@ mod test {
             key_overwrite.clone(),
             OpType::Write(KeyBytes::from(value_original.as_ref())),
         ));
-        lsm = lsm.freeze_memtable(); // Move original to immutable
+        lsm.freeze_memtable(); // Move original to immutable
 
         lsm.put(KVOpertion::new(
             op_id_new,
@@ -371,7 +375,7 @@ mod test {
             key_delete.clone(),
             OpType::Write(KeyBytes::from(value_delete.as_ref())),
         ));
-        lsm = lsm.freeze_memtable(); // Move original to immutable
+        lsm.freeze_memtable(); // Move original to immutable
 
         lsm.put(KVOpertion::new(
             op_id_actual_delete,
