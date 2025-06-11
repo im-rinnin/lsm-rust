@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::db::{
-    common::{new_buffer, Buffer, KVOpertion , OpId, OpType},
-    key::{KeySlice, KeyVec },
+    common::{new_buffer, Buffer, KVOpertion, OpId, OpType},
+    key::{KeySlice, KeyVec},
     store::{Store, StoreId},
 };
 use byteorder::LittleEndian;
@@ -18,7 +18,7 @@ use byteorder::WriteBytesExt;
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
-    common::{ SearchResult},
+    common::SearchResult,
     key::KeyBytes,
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -388,23 +388,21 @@ impl<T: Store> TableBuilder<T> {
 #[cfg(test)]
 pub mod test {
 
-    use super::{TableBuilder };
+    use super::TableBuilder;
     use crate::db::block::test::create_kv_data_with_range_id_offset;
     use crate::db::common::OpId;
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
-    use std::{
-        ops::Range
-    };
+    use std::ops::Range;
 
     use super::super::block::test::pad_zero;
     use crate::db::{
-        common::{ KVOpertion, OpType},
+        common::{KVOpertion, OpType},
         store::{Memstore, Store},
     };
 
     use super::super::block::test::create_kv_data_in_range_zero_to;
-    use super::{ TableReader};
+    use super::TableReader;
     pub fn create_test_table(range: Range<usize>) -> TableReader<Memstore> {
         create_test_table_with_id_offset(range, 0)
     }

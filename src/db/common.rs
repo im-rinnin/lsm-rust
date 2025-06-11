@@ -17,7 +17,7 @@ use super::key::KeyBytes;
 use super::key::ValueByte;
 use super::key::{KeyVec, ValueVec}; // Added for kv_opertion_len // Added for kv_opertion_len
 
-
+#[derive(Clone)] // Add Clone derive
 pub struct KeyQuery {
     pub key: KeyBytes,
     pub op_id: OpId,
@@ -103,12 +103,12 @@ impl KVOpertion {
 }
 // every Key in db has a unique id
 pub type OpId = u64;
+pub const MAX_OP_ID: OpId = u64::MAX; // Represents the maximum possible OpId
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)] // Added Clone
 pub enum OpType {
     Write(ValueByte),
     Delete,
 }
-
 
 pub struct KViterAgg<'a> {
     iters: Vec<&'a mut dyn Iterator<Item = KVOpertion>>,
@@ -285,5 +285,4 @@ pub mod test {
         assert_eq!(offset, op_res.encode_size());
         assert_eq!(op_res, op);
     }
-
 }

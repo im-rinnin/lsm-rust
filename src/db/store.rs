@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::Write,
-};
-
+use std::{fs::File, io::Write};
 
 pub type StoreId = u64;
 // append only data store
@@ -77,7 +73,7 @@ impl Store for Memstore {
         // Subsequent appends will start from 'position'.
     }
 }
-impl Filestore{
+impl Filestore {
     pub fn open_with(f: File, id: StoreId) -> Self {
         Filestore { f, id }
     }
@@ -381,5 +377,4 @@ mod test {
         // Verify length is maintained
         assert_eq!(m.store.len(), 10);
     }
-
 }

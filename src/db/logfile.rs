@@ -119,7 +119,10 @@ mod test {
             .write(true)
             .create(true)
             .open(&file_path) // Use file_path here
-            .expect(&format!("Failed to open file for reading: {}", file_path.display()));
+            .expect(&format!(
+                "Failed to open file for reading: {}",
+                file_path.display()
+            ));
         let read_store = Filestore::open_with(read_file, store_id);
         let mut iter = LogFileIter::new(read_store);
 
@@ -144,7 +147,10 @@ mod test {
             .write(true)
             .create(true)
             .open(&empty_file_path)
-            .expect(&format!("Failed to open empty file: {}", empty_file_path.display()));
+            .expect(&format!(
+                "Failed to open empty file: {}",
+                empty_file_path.display()
+            ));
         let empty_store = Filestore::open_with(empty_file, empty_store_id);
         let mut empty_iter = LogFileIter::new(empty_store);
         assert!(empty_iter.next().is_none());

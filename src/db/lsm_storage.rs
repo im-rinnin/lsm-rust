@@ -10,7 +10,6 @@ use crate::db::store::Memstore;
 use crate::db::store::Store;
 use crate::db::table::TableReader;
 
-
 pub struct Config {
     block_size: usize,
     sstable_size: usize,

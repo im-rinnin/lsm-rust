@@ -242,6 +242,13 @@ impl<T: Store> Clone for LevelStorege<T> {
 }
 
 impl<T: Store> LevelStorege<T> {
+    // return table number in every level, table number in level[0]=vec[0]
+    pub fn table_len_in_levels(&self) -> Vec<usize> {
+        self.levels
+            .iter()
+            .map(|level| level.sstables.len())
+            .collect()
+    }
     fn resotre_table_id(
         start_level: Vec<Vec<StoreId>>,
         changes: Vec<TableChange>,
@@ -2095,5 +2102,40 @@ mod test {
             .collect();
         assert!(last_tables.contains(&table_l1_z.store_id()));
         assert!(last_tables.contains(&table_l1_w.store_id()));
+    }
+
+    #[test]
+    fn test_table_len_in_levels() {
+        // Case 1: Empty LevelStorege
+        let empty_storage = LevelStorege::<Memstore>::new(vec![], 4, 2);
+        assert_eq!(empty_storage.table_len_in_levels(), vec![] as Vec<usize>);
+
+        // Case 2: Single level with tables
+        let table1 = Arc::new(create_test_table_with_id(0..10, 1));
+        let table2 = Arc::new(create_test_table_with_id(10..20, 2));
+        let level0 = Level::new(vec![table1.clone(), table2.clone()], true);
+        let storage_single_level = LevelStorege::new(vec![level0], 4, 2);
+        assert_eq!(storage_single_level.table_len_in_levels(), vec![2]);
+
+        // Case 3: Multiple levels with different table counts
+        let table3 = Arc::new(create_test_table_with_id(20..30, 3));
+        let level1 = Level::new(vec![table3.clone()], false);
+        let level2 = Level::new(vec![], false); // Empty level
+        let table4 = Arc::new(create_test_table_with_id(30..40, 4));
+        let table5 = Arc::new(create_test_table_with_id(40..50, 5));
+        let table6 = Arc::new(create_test_table_with_id(50..60, 6));
+        let level3 = Level::new(vec![table4, table5, table6], false);
+
+        let storage_multi_level = LevelStorege::new(
+            vec![
+                Level::new(vec![table1, table2], true), // Level 0: 2 tables
+                level1,                                 // Level 1: 1 table
+                level2,                                 // Level 2: 0 tables
+                level3,                                 // Level 3: 3 tables
+            ],
+            4,
+            2,
+        );
+        assert_eq!(storage_multi_level.table_len_in_levels(), vec![2, 1, 0, 3]);
     }
 }

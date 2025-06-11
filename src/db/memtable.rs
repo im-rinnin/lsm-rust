@@ -18,6 +18,9 @@ pub struct MemtableIterator<'a> {
 }
 
 impl Memtable {
+    pub fn get_capacity_bytes(&self) -> usize {
+        self.capacity_bytes.load(Ordering::Relaxed)
+    }
     pub fn new(capacity_bytes: usize) -> Self {
         Memtable {
             table: SkipMap::new(),
@@ -26,7 +29,7 @@ impl Memtable {
         }
     }
 
-    pub fn get<'a>(&'a self, q: KeyQuery) -> SearchResult {
+    pub fn get<'a>(&'a self, q: &KeyQuery) -> SearchResult {
         let range_start_bound = (q.key.clone(), 0);
         let range_end_bound = (q.key.clone(), q.op_id + 1);
 
@@ -146,7 +149,7 @@ mod test {
 
         // Test queries at different op_ids
         // Query at op_id 0: Should see "value1"
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: op_id_0,
             key: key.as_ref().into(),
         });
@@ -161,7 +164,7 @@ mod test {
         );
 
         // Query at op_id 1: Should see "value2"
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: op_id_1,
             key: key.as_ref().into(),
         });
@@ -176,14 +179,14 @@ mod test {
         );
 
         // Query at op_id 2: Should see None (deleted)
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: op_id_2,
             key: key.as_ref().into(),
         });
         assert!(matches!(res.unwrap().0, OpType::Delete));
 
         // Query at op_id 3: Should see "value3"
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: op_id_3,
             key: KeyBytes::from(key.as_ref()),
         });
@@ -198,7 +201,7 @@ mod test {
         );
 
         // Query at an op_id higher than any existing op: Should see "value3" (latest write)
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: current_max_op_id,
             key: KeyBytes::from(key.as_ref()),
         });
@@ -247,7 +250,7 @@ mod test {
 
         // check op id and key match in 0..10 (excluding 10)
         for i in 0..10 {
-            let res = m.get(KeyQuery {
+            let res = m.get(&KeyQuery {
                 op_id: current_max_op_id,
                 key: i.to_string().as_bytes().into(),
             });
@@ -265,7 +268,7 @@ mod test {
         }
 
         //check delete
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: current_max_op_id,
             key: 10.to_string().as_bytes().into(),
         });
@@ -279,7 +282,7 @@ mod test {
         );
 
         // 10 is deleted but still can be get by op id before its delete
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: 10, // Query at the op_id when key '10' was inserted
             key: 10.to_string().as_bytes().into(),
         });
@@ -293,7 +296,7 @@ mod test {
         );
 
         // Check overwritten key 12
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: current_max_op_id,
             key: 12.to_string().as_bytes().into(),
         });
@@ -308,14 +311,14 @@ mod test {
         );
 
         // check key not exit
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: current_max_op_id,
             key: 100.to_string().as_bytes().into(),
         });
         assert!(res.is_none(), "Key 100 should not exist");
 
         // check op id not match
-        let res = m.get(KeyQuery {
+        let res = m.get(&KeyQuery {
             op_id: 1,
             key: 5.to_string().as_bytes().into(),
         });
