@@ -1,3 +1,5 @@
+use std::fs::File; // Add import for File
+
 use super::{key::KeyBytes, store::*};
 use crate::db::common::KVOpertion;
 const LOG_FILE_NAME: &str = "logfile";
@@ -8,8 +10,13 @@ pub struct LogFile<T: Store> {
 }
 
 impl<T: Store> LogFile<T> {
-    pub fn open(store: T) -> Self {
-        LogFile { s: store }
+    pub fn open(store_id: StoreId) -> Self {
+        LogFile {
+            s: T::open(store_id),
+        }
+    }
+    pub fn open_with(t: T) -> Self {
+        LogFile { s: t }
     }
     pub fn append(&mut self, ops: &Vec<KVOpertion>) {
         for op in ops {
@@ -94,8 +101,8 @@ mod test {
             .create(true)
             .open(&file_path) // Open file using the full path
             .expect(&format!("Failed to open file: {}", file_path.display()));
-        let filestore_write = Filestore::open_with(file, store_id);
-        let mut log_file = LogFile::open(filestore_write);
+        let filestore_write = Filestore::open_with_file(file, store_id);
+        let mut log_file = LogFile::open_with(filestore_write);
 
         let ops = vec![
             KVOpertion::new(
@@ -123,7 +130,7 @@ mod test {
                 "Failed to open file for reading: {}",
                 file_path.display()
             ));
-        let read_store = Filestore::open_with(read_file, store_id);
+        let read_store = Filestore::open_with_file(read_file, store_id);
         let mut iter = LogFileIter::new(read_store);
 
         let mut retrieved_ops = Vec::new();
@@ -151,7 +158,7 @@ mod test {
                 "Failed to open empty file: {}",
                 empty_file_path.display()
             ));
-        let empty_store = Filestore::open_with(empty_file, empty_store_id);
+        let empty_store = Filestore::open_with_file(empty_file, empty_store_id);
         let mut empty_iter = LogFileIter::new(empty_store);
         assert!(empty_iter.next().is_none());
     }

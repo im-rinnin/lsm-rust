@@ -79,7 +79,7 @@ const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 3 + std::mem::size_of::<u8>(
 impl TableChangeLog<Filestore> {
     pub fn from_file(f: File, id: StoreId) -> Self {
         TableChangeLog {
-            storage: Filestore::open_with(f, id),
+            storage: Filestore::open_with_file(f, id),
         }
     }
 }
@@ -243,7 +243,7 @@ impl<T: Store> Clone for LevelStorege<T> {
 
 impl<T: Store> LevelStorege<T> {
     // return table number in every level, table number in level[0]=vec[0]
-    pub fn table_len_in_levels(&self) -> Vec<usize> {
+    pub fn table_num_in_levels(&self) -> Vec<usize> {
         self.levels
             .iter()
             .map(|level| level.sstables.len())
@@ -2108,14 +2108,14 @@ mod test {
     fn test_table_len_in_levels() {
         // Case 1: Empty LevelStorege
         let empty_storage = LevelStorege::<Memstore>::new(vec![], 4, 2);
-        assert_eq!(empty_storage.table_len_in_levels(), vec![] as Vec<usize>);
+        assert_eq!(empty_storage.table_num_in_levels(), vec![] as Vec<usize>);
 
         // Case 2: Single level with tables
         let table1 = Arc::new(create_test_table_with_id(0..10, 1));
         let table2 = Arc::new(create_test_table_with_id(10..20, 2));
         let level0 = Level::new(vec![table1.clone(), table2.clone()], true);
         let storage_single_level = LevelStorege::new(vec![level0], 4, 2);
-        assert_eq!(storage_single_level.table_len_in_levels(), vec![2]);
+        assert_eq!(storage_single_level.table_num_in_levels(), vec![2]);
 
         // Case 3: Multiple levels with different table counts
         let table3 = Arc::new(create_test_table_with_id(20..30, 3));
@@ -2136,6 +2136,6 @@ mod test {
             4,
             2,
         );
-        assert_eq!(storage_multi_level.table_len_in_levels(), vec![2, 1, 0, 3]);
+        assert_eq!(storage_multi_level.table_num_in_levels(), vec![2, 1, 0, 3]);
     }
 }

@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write};
+use std::{fs::File, io::Write, path::PathBuf};
 
 pub type StoreId = u64;
 // append only data store
@@ -12,6 +12,7 @@ pub trait Store {
     fn len(&self) -> usize;
     fn close(self);
     fn open(id: StoreId) -> Self;
+    fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self;
     fn id(&self) -> StoreId;
 }
 
@@ -22,12 +23,16 @@ pub struct Memstore {
 pub struct Filestore {
     f: File,
     id: StoreId,
+    filename: String,
 }
 
 impl Memstore {}
 
 impl Store for Memstore {
     fn close(self) {}
+    fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self {
+        Self::open(id)
+    }
     fn open(id: StoreId) -> Self {
         Memstore {
             store: Vec::new(),
@@ -74,8 +79,17 @@ impl Store for Memstore {
     }
 }
 impl Filestore {
-    pub fn open_with(f: File, id: StoreId) -> Self {
-        Filestore { f, id }
+    // only for test
+    pub fn open_with_file(f: File, id: StoreId) -> Self {
+        // test file no name
+        Filestore {
+            f,
+            id,
+            filename: String::from(""),
+        }
+    }
+    fn get_filename(&self) -> String {
+        self.filename.clone()
     }
 }
 
@@ -86,16 +100,25 @@ impl Store for Filestore {
     fn id(&self) -> StoreId {
         self.id
     }
-    fn open(id: StoreId) -> Self {
+    fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self {
+        assert!(!postfix.is_empty());
         use std::fs::OpenOptions;
-        let filename = format!("{}.data", id); // Using .data as a generic extension for store files
+        let filename = if prefix.is_empty() {
+            format!("{}.{}", id, postfix) // No prefix, no underscore
+        } else {
+            format!("{}_{}.{}", prefix, id, postfix) // Prefix exists, add underscore
+        };
+        let path = PathBuf::from(&filename); // Create PathBuf
         let f = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true) // Create the file if it doesn't exist
-            .open(&filename)
-            .expect(&format!("Failed to open file: {}", filename));
-        Filestore { f, id }
+            .open(&path) // Open using PathBuf
+            .expect(&format!("Failed to open file: {}", path.display()));
+        Filestore { f, id, filename } // Store path
+    }
+    fn open(id: StoreId) -> Self {
+        Self::open_with(id, "", "")
     }
     fn len(&self) -> usize {
         let meta = self.f.metadata().unwrap();
@@ -214,6 +237,7 @@ mod test {
         let filestore = Filestore {
             f: File::open(path).unwrap(),
             id: 5u64, // Assigning a dummy u64 ID for test
+            filename: "test".to_string(),
         };
         assert_eq!(filestore.len(), 0);
 
@@ -222,6 +246,7 @@ mod test {
         let filestore = Filestore {
             f: File::open(path).unwrap(),
             id: 5u64, // Assigning a dummy u64 ID for test
+            filename: "test".to_string(),
         };
         assert_eq!(filestore.len(), 9);
     }
@@ -244,6 +269,7 @@ mod test {
         let mut filestore = Filestore {
             f: file,
             id: 6u64, // Assigning a dummy u64 ID for test
+            filename: "test".to_string(),
         };
 
         // Append first part
@@ -283,6 +309,7 @@ mod test {
         let mut filestore = Filestore {
             f: file,
             id: 7u64, // Assigning a dummy u64 ID for test
+            filename: "test".to_string(),
         };
 
         // Write 10 bytes
@@ -334,6 +361,7 @@ mod test {
         let mut filestore = Filestore {
             f: file,
             id: 8u64, // Assigning a dummy u64 ID for test
+            filename: "test".to_string(),
         };
 
         // Append 10 bytes

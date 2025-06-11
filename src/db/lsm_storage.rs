@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::usize;
 
 use crate::db::common::*;
 use crate::db::level::LevelStorege;
@@ -43,6 +44,10 @@ impl<T: Store> LsmStorage<T> {
             imm: Vec::new(),
             current: LevelStorege::new(vec![], config.first_level_sstable_num, config.level_factor),
         }
+    }
+
+    pub fn table_num_in_levels(&self) -> Vec<usize> {
+        self.current.table_num_in_levels()
     }
 
     pub fn freeze_memtable(&self) -> Self {
