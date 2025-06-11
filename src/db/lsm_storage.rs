@@ -1,3 +1,4 @@
+use core::str;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -14,14 +15,6 @@ use crate::db::table::TableReader;
 
 use super::key::KeySlice;
 
-pub struct Config {
-    block_size: usize,
-    sstable_size: usize,
-    level_factor: usize,
-    first_level_sstable_num: usize,
-    memtable_capacity_bytes: usize,
-}
-
 pub struct LsmStorage<T: Store> {
     m: Arc<Memtable>,
     //  immutable memtable
@@ -29,16 +22,45 @@ pub struct LsmStorage<T: Store> {
     // latest level storege
     current: LevelStorege<T>,
 }
-
+#[derive(Clone, Copy)]
+pub struct LsmStorageConfig {
+    pub block_size: usize,
+    pub sstable_size: usize,
+    pub level_factor: usize,
+    pub first_level_sstable_num: usize,
+    pub memtable_capacity_bytes: usize,
+}
+impl Default for LsmStorageConfig {
+    fn default() -> Self {
+        LsmStorageConfig {
+            block_size: 4096,              // 4kb
+            sstable_size: 4 * 1024 * 1024, //4M
+            level_factor: 4,
+            first_level_sstable_num: 4,
+            memtable_capacity_bytes: 4 * 1024 * 1024, //4MB
+        }
+    }
+}
+impl LsmStorageConfig {
+    pub fn config_for_test() -> Self {
+        LsmStorageConfig {
+            block_size: 4096,
+            sstable_size: 4 * 1024 * 1024, //4M
+            level_factor: 2,
+            first_level_sstable_num: 4,
+            memtable_capacity_bytes: 4 * 1024 * 1024, //4MB
+        }
+    }
+}
 impl<T: Store> LsmStorage<T> {
-    pub fn from(config: Config, level: LevelStorege<T>) -> Self {
+    pub fn from(config: LsmStorageConfig, level: LevelStorege<T>) -> Self {
         LsmStorage {
             m: Arc::new(Memtable::new(config.memtable_capacity_bytes)),
             imm: Vec::new(),
             current: level,
         }
     }
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: LsmStorageConfig) -> Self {
         LsmStorage {
             m: Arc::new(Memtable::new(config.memtable_capacity_bytes)),
             imm: Vec::new(),
@@ -65,6 +87,13 @@ impl<T: Store> LsmStorage<T> {
         self.imm.push(old_m);
 
         // No need to return Self, modification happens in place.
+    }
+
+    pub fn immtable_num(&self) -> usize {
+        self.imm.len()
+    }
+    pub fn memtable_size(&self) -> usize {
+        self.m.get_capacity_bytes()
     }
 
     pub fn put(&self, query: KVOpertion) {
@@ -135,7 +164,7 @@ impl<T: Store> LsmStorage<T> {
 mod test {
     use std::sync::Arc;
 
-    use super::{Config, LsmStorage};
+    use super::{LsmStorage, LsmStorageConfig};
     use crate::db::common::{KVOpertion, KeyQuery, OpType};
     use crate::db::key::{KeyBytes, KeySlice, KeyVec};
     use crate::db::store::Memstore;
@@ -144,7 +173,7 @@ mod test {
     /// It inserts a key-value pair and then retrieves it to verify correctness.
     #[test]
     fn test_put() {
-        let config = Config {
+        let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
             level_factor: 10,
@@ -189,7 +218,7 @@ mod test {
     /// that `get` can find keys in different levels and handles non-existent keys correctly.
     #[test]
     fn test_get_from_level() {
-        let config = Config {
+        let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
             level_factor: 10,
@@ -266,7 +295,7 @@ mod test {
     /// and where a key was deleted in the active memtable after existing in an immutable one.
     #[test]
     fn test_get_from_imm_memtable() {
-        let config = Config {
+        let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
             level_factor: 10,
@@ -408,7 +437,7 @@ mod test {
     /// memtable correctly hide previous values for the same key within that memtable.
     #[test]
     fn test_get_from_memtable() {
-        let config = Config {
+        let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
             level_factor: 10,

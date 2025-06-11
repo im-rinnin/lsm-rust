@@ -322,7 +322,24 @@ impl<T: Store> LevelStorege<T> {
         return self.level_zero_num_limit * self.level_ratio.pow(level_depth as u32);
     }
 
-    fn compact_storage(&mut self, mut next_store_id: u64) -> Vec<TableChange> {
+    /// Initiates the compaction process across all levels of the LSM storage.
+    ///
+    /// This function iterates through each level, identifies if compaction is needed
+    /// based on the number of tables exceeding the configured limit for that level,
+    /// and then performs the compaction. Compaction involves merging tables from
+    /// the current level with overlapping tables from the next level, creating
+    /// new compacted tables, and updating the level metadata.
+    ///
+    /// It returns a vector of `TableChange` events that describe the additions
+    /// and deletions of tables during the compaction process. These changes
+    /// should be persisted to the table change log.
+    ///
+    /// # Arguments
+    /// * `next_store_id` - The starting ID to use for newly created SSTable files.
+    ///
+    /// # Returns
+    /// A `Vec<TableChange>` detailing all table additions and deletions that occurred.
+    pub fn compact_storage(&mut self, mut next_store_id: u64) -> (u64, Vec<TableChange>) {
         let mut table_change = Vec::new();
         // Iterate through all levels starting from level 0
         for level_depth in 0..self.levels.len() {
@@ -358,7 +375,7 @@ impl<T: Store> LevelStorege<T> {
             // After compacting one level, we might need to check if the target level
             // now also needs compaction, but we'll handle that in the next iteration
         }
-        return table_change;
+        return (next_store_id, table_change);
     }
 
     /// Gets the overall key range (min and max keys) across a collection of tables.
@@ -1453,7 +1470,23 @@ mod test {
         assert_eq!(level_storage.levels[0].sstables.len(), 5);
 
         // Perform compaction
-        let table_changes = level_storage.compact_storage(1000);
+        let start_id_case1 = 1000;
+        let (next_id, table_changes) = level_storage.compact_storage(start_id_case1);
+
+        // Find the maximum store ID among the newly added tables in level 1
+        let max_new_id_case1 = table_changes
+            .iter()
+            .filter(|tc| tc.change_type == ChangeType::Add && tc.level == 1)
+            .map(|tc| tc.id)
+            .max()
+            .expect("Should have added tables in level 1");
+
+        // Assert next_id is one greater than the max ID used
+        assert_eq!(
+            next_id,
+            max_new_id_case1 + 1,
+            "next_id should be max new table id + 1"
+        );
 
         // After compaction: Level 0 should have 4 tables, Level 1 should exist with compacted table
         assert_eq!(level_storage.levels.len(), 2); // Level 1 should be created
@@ -1489,7 +1522,7 @@ mod test {
         for add_change in add_changes {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id >= 1000); // Should use the provided store_id_start
+            assert!(add_change.id >= start_id_case1); // Should use the provided store_id_start
         }
 
         // KV checks after compaction: Verify all data is still accessible
@@ -1546,7 +1579,24 @@ mod test {
         assert_eq!(level_storage_multi.levels[1].sstables.len(), 25);
 
         // Perform compaction
-        level_storage_multi.compact_storage(2000);
+        let start_id_case2 = 2000;
+        let (next_id_case2, table_changes_case2) =
+            level_storage_multi.compact_storage(start_id_case2);
+
+        // Find the maximum store ID among the newly added tables in level 2
+        let max_new_id_case2 = table_changes_case2
+            .iter()
+            .filter(|tc| tc.change_type == ChangeType::Add && tc.level == 2)
+            .map(|tc| tc.id)
+            .max()
+            .expect("Should have added tables in level 2");
+
+        // Assert next_id is one greater than the max ID used
+        assert_eq!(
+            next_id_case2,
+            max_new_id_case2 + 1,
+            "next_id should be max new table id + 1"
+        );
 
         // After compaction: Level 1 should have 20 tables (limit). Level 2 should be created.
         // 5 tables (25 - 20) should be compacted from L1 to L2.
@@ -1564,7 +1614,19 @@ mod test {
         let original_table_count = level_storage_small.levels[0].sstables.len();
 
         // Perform compaction
-        level_storage_small.compact_storage(3000);
+        let start_id_case3 = 3000;
+        let (next_id_case3, table_changes_case3) =
+            level_storage_small.compact_storage(start_id_case3);
+
+        // Assert next_id is unchanged if no tables were created
+        assert_eq!(
+            next_id_case3, start_id_case3,
+            "next_id should be unchanged if no compaction happened"
+        );
+        assert!(
+            table_changes_case3.is_empty(),
+            "No table changes expected if no compaction happened"
+        );
 
         // Should remain unchanged
         assert_eq!(level_storage_small.levels.len(), original_len);
@@ -1578,7 +1640,18 @@ mod test {
             super::LevelStorege::new(vec![], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
 
         // Should not panic and remain empty
-        empty_level_storage.compact_storage(4000);
+        let start_id_case4 = 4000;
+        let (next_id_case4, table_changes_case4) =
+            empty_level_storage.compact_storage(start_id_case4);
+        assert_eq!(
+            next_id_case4, start_id_case4,
+            "next_id should be unchanged for empty storage"
+        );
+        assert!(
+            table_changes_case4.is_empty(),
+            "No table changes expected for empty storage"
+        );
+
         assert_eq!(empty_level_storage.levels.len(), 0);
     }
 
