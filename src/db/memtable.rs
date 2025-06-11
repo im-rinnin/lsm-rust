@@ -53,7 +53,7 @@ impl Memtable {
         self.table.len()
     }
 
-    fn to_iter<'a>(&'a self) -> MemtableIterator<'a> {
+    pub fn to_iter<'a>(&'a self) -> MemtableIterator<'a> {
         MemtableIterator {
             inner_iter: self.table.iter(),
         }
@@ -70,11 +70,19 @@ impl Memtable {
 }
 
 impl<'a> Iterator for MemtableIterator<'a> {
-    type Item = Entry<'a, (KeyBytes, OpId), OpType>;
+    type Item = KVOpertion;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next = self.inner_iter.next();
-        next
+        self.inner_iter.next().map(|entry| {
+            let (key_bytes, op_id) = entry.key();
+            let op_type = entry.value();
+            // Clone the key and op_type as KVOpertion takes ownership
+            KVOpertion {
+                id: *op_id,
+                key: key_bytes.clone(),
+                op: op_type.clone(),
+            }
+        })
     }
 }
 
@@ -372,9 +380,7 @@ mod test {
 
         let mut actual_iter_data: Vec<(String, OpId, OpType)> = Vec::new();
         for entry in m.to_iter() {
-            let (key_vec, op_id) = entry.key();
-            let op_type = entry.value();
-            actual_iter_data.push((key_vec.to_string(), *op_id, op_type.clone()));
+            actual_iter_data.push((entry.key.to_string(), entry.id, entry.op.clone()));
         }
 
         assert_eq!(actual_iter_data.len(), expected_iter_data.len());

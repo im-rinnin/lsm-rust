@@ -14,12 +14,13 @@ use crate::db::store::Store;
 use crate::db::table::TableReader;
 
 use super::key::KeySlice;
+use super::store::StoreId;
 
+#[derive(Clone)]
 pub struct LsmStorage<T: Store> {
     m: Arc<Memtable>,
     //  immutable memtable
     imm: Vec<Arc<Memtable>>,
-    // latest level storege
     current: LevelStorege<T>,
 }
 #[derive(Clone, Copy)]
@@ -28,7 +29,7 @@ pub struct LsmStorageConfig {
     pub sstable_size: usize,
     pub level_factor: usize,
     pub first_level_sstable_num: usize,
-    pub memtable_capacity_bytes: usize,
+    pub memtable_size_limit: usize,
 }
 impl Default for LsmStorageConfig {
     fn default() -> Self {
@@ -37,7 +38,7 @@ impl Default for LsmStorageConfig {
             sstable_size: 4 * 1024 * 1024, //4M
             level_factor: 4,
             first_level_sstable_num: 4,
-            memtable_capacity_bytes: 4 * 1024 * 1024, //4MB
+            memtable_size_limit: 2 * 1024 * 1024, //4MB
         }
     }
 }
@@ -48,21 +49,21 @@ impl LsmStorageConfig {
             sstable_size: 4 * 1024 * 1024, //4M
             level_factor: 2,
             first_level_sstable_num: 4,
-            memtable_capacity_bytes: 4 * 1024 * 1024, //4MB
+            memtable_size_limit: 4 * 1024 * 1024, //4MB
         }
     }
 }
 impl<T: Store> LsmStorage<T> {
     pub fn from(config: LsmStorageConfig, level: LevelStorege<T>) -> Self {
         LsmStorage {
-            m: Arc::new(Memtable::new(config.memtable_capacity_bytes)),
+            m: Arc::new(Memtable::new(config.memtable_size_limit)),
             imm: Vec::new(),
             current: level,
         }
     }
     pub fn new(config: LsmStorageConfig) -> Self {
         LsmStorage {
-            m: Arc::new(Memtable::new(config.memtable_capacity_bytes)),
+            m: Arc::new(Memtable::new(config.memtable_size_limit)),
             imm: Vec::new(),
             current: LevelStorege::new(vec![], config.first_level_sstable_num, config.level_factor),
         }
@@ -87,6 +88,29 @@ impl<T: Store> LsmStorage<T> {
         self.imm.push(old_m);
 
         // No need to return Self, modification happens in place.
+    }
+
+    /// Dumps the oldest immutable memtable (if any) to a new SSTable in level 0.
+    ///
+    /// # Arguments
+    /// * `next_sstable_id` - A mutable reference to the next available store ID, which will be incremented.
+    pub fn dump_imm_memtable(&mut self, next_sstable_id: &mut StoreId) {
+        // Check if there are any immutable memtables to dump
+        if self.imm.is_empty() {
+            return;
+        }
+
+        // take first immtable out (oldest one)
+        let oldest_imm = self.imm.remove(0); // Remove from the front
+
+        // create kv iterator from the memtable
+        // Assuming Memtable has an `iter()` method that returns an iterator yielding KVOpertion
+        // The iterator needs to own or reference the data appropriately.
+        // Let's assume `oldest_imm.iter()` returns `impl Iterator<Item = KVOpertion>`.
+        let kv_iterator = oldest_imm.to_iter();
+
+        // call level.push_new_table to dump memtable
+        self.current.push_new_table(kv_iterator, next_sstable_id);
     }
 
     pub fn immtable_num(&self) -> usize {
@@ -178,7 +202,7 @@ mod test {
             sstable_size: 1024 * 1024,
             level_factor: 10,
             first_level_sstable_num: 2,
-            memtable_capacity_bytes: 1024, // Small capacity for testing
+            memtable_size_limit: 1024, // Small capacity for testing
         };
         let lsm = LsmStorage::<Memstore>::new(config);
 
@@ -223,7 +247,7 @@ mod test {
             sstable_size: 1024 * 1024,
             level_factor: 10,
             first_level_sstable_num: 2,
-            memtable_capacity_bytes: 1024,
+            memtable_size_limit: 1024,
         };
 
         // Create a dummy table for Level 0
@@ -300,7 +324,7 @@ mod test {
             sstable_size: 1024 * 1024,
             level_factor: 10,
             first_level_sstable_num: 2,
-            memtable_capacity_bytes: 1024,
+            memtable_size_limit: 1024,
         };
         let mut lsm = LsmStorage::<Memstore>::new(config);
 
@@ -442,7 +466,7 @@ mod test {
             sstable_size: 1024 * 1024,
             level_factor: 10,
             first_level_sstable_num: 2,
-            memtable_capacity_bytes: 1024, // Small capacity for testing
+            memtable_size_limit: 1024, // Small capacity for testing
         };
         let lsm = LsmStorage::<Memstore>::new(config);
 
@@ -513,5 +537,84 @@ mod test {
             result_before_delete.unwrap().op,
             OpType::Write(KeyBytes::from(value_original.as_ref()))
         );
+    }
+
+    #[test]
+    fn test_dump_imm_memtable() {
+        let config = LsmStorageConfig {
+            block_size: 4096,
+            sstable_size: 1024 * 1024,
+            level_factor: 10,
+            first_level_sstable_num: 2,
+            memtable_size_limit: 1024, // Small capacity
+        };
+        let mut lsm = LsmStorage::<Memstore>::new(config);
+        let mut next_sstable_id: u64 = 100;
+
+        // 1. Insert data into active memtable
+        let key1: KeyVec = "dump_key1".as_bytes().into();
+        let value1: KeyVec = "dump_value1".as_bytes().into();
+        let op1_id = 50;
+        lsm.put(KVOpertion::new(
+            op1_id,
+            key1.clone(),
+            OpType::Write(KeyBytes::from(value1.as_ref())),
+        ));
+
+        let key2: KeyVec = "dump_key2".as_bytes().into();
+        let value2: KeyVec = "dump_value2".as_bytes().into();
+        let op2_id = 51;
+        lsm.put(KVOpertion::new(
+            op2_id,
+            key2.clone(),
+            OpType::Write(KeyBytes::from(value2.as_ref())),
+        ));
+
+        // 2. Freeze the memtable
+        lsm.freeze_memtable();
+        assert_eq!(lsm.immtable_num(), 1); // Should have one immutable memtable
+        assert_eq!(lsm.table_num_in_levels(), vec![] as Vec<usize>); // No tables in levels yet
+
+        // 3. Dump the immutable memtable
+        lsm.dump_imm_memtable(&mut next_sstable_id);
+
+        // 4. Verify state after dump
+        assert_eq!(lsm.immtable_num(), 0); // Immutable list should be empty
+        assert_eq!(next_sstable_id, 101); // next_sstable_id should be incremented
+
+        // Check that level 0 now has one table
+        let level_counts = lsm.table_num_in_levels();
+        assert_eq!(level_counts.len(), 1);
+        assert_eq!(level_counts[0], 1); // One table in level 0
+
+        // Verify the dumped data can be retrieved (it's now in level 0)
+        let query1 = KeyQuery {
+            op_id: op1_id,
+            key: KeyBytes::from(key1.as_ref()),
+        };
+        let result1 = lsm.get(&query1);
+        assert!(result1.is_some());
+        assert_eq!(
+            result1.unwrap().op,
+            OpType::Write(KeyBytes::from(value1.as_ref()))
+        );
+
+        let query2 = KeyQuery {
+            op_id: op2_id,
+            key: KeyBytes::from(key2.as_ref()),
+        };
+        let result2 = lsm.get(&query2);
+        assert!(result2.is_some());
+        assert_eq!(
+            result2.unwrap().op,
+            OpType::Write(KeyBytes::from(value2.as_ref()))
+        );
+
+        // 5. Dump again when no immutable tables exist (should do nothing)
+        let initial_level_counts = lsm.table_num_in_levels();
+        lsm.dump_imm_memtable(&mut next_sstable_id);
+        assert_eq!(lsm.immtable_num(), 0);
+        assert_eq!(next_sstable_id, 101); // ID should not change
+        assert_eq!(lsm.table_num_in_levels(), initial_level_counts); // Levels should not change
     }
 }

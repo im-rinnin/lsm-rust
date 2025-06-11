@@ -307,6 +307,76 @@ impl<T: Store> LevelStorege<T> {
             level_ratio,
         }
     }
+
+    // add new table from iterator `it` to level 0.
+    // `next_sstable_id` is used to generate a unique ID for the new table and is incremented.
+    pub fn push_new_table<P: Iterator<Item = KVOpertion>>(
+        &mut self,
+        mut it: P, // Take iterator by value or mutable ref depending on usage
+        next_sstable_id: &mut StoreId,
+    ) {
+        // Ensure level 0 exists
+        if self.levels.is_empty() {
+            self.levels.push(Level::new(vec![], true)); // Create level 0 if it doesn't exist
+        } else if !self.levels[0].is_level_zero {
+            // If level 0 exists but isn't marked as level zero, insert a new level 0
+            self.levels.insert(0, Level::new(vec![], true));
+        }
+
+        // Generate ID for the new table
+        let new_table_id = *next_sstable_id;
+        *next_sstable_id += 1;
+
+        // Create store and builder for the new table
+        let new_store = T::open(new_table_id);
+        // Assuming default block count or size is okay here. Pass config if needed.
+        let mut table_builder = TableBuilder::new_with_store(new_store);
+
+        // Fill the table builder with data from the iterator
+        // Use a loop to handle potential errors or specific logic if `fill` isn't suitable
+        // Keep track of the tables created in this push operation
+        let mut created_tables = Vec::new();
+
+        while let Some(op) = it.next() {
+            // Try adding the operation to the current builder
+            if !table_builder.add(op.clone()) {
+                // If add fails, the current builder is full.
+                // Flush the full builder if it's not empty.
+                if !table_builder.is_empty() {
+                    let new_table_reader = table_builder.flush();
+                    created_tables.push(Arc::new(new_table_reader));
+                }
+
+                // Create a new builder for the next table.
+                let new_table_id = *next_sstable_id;
+                *next_sstable_id += 1;
+                let new_store = T::open(new_table_id);
+                table_builder = TableBuilder::new_with_store(new_store);
+
+                // Add the operation that didn't fit into the previous builder to the new one.
+                // This should always succeed on a fresh builder unless the single op is too large.
+                if !table_builder.add(op.clone()) {
+                    // Handle the edge case where a single operation is too large for a block/table.
+                    // This might indicate a configuration issue or an unexpectedly large KV pair.
+                    panic!("Error: Single KVOperation is too large to fit in a new table block during push_new_table. Operation ID: {}", op.id);
+                }
+            }
+        }
+
+        // After the loop, flush the last builder if it contains any data.
+        if !table_builder.is_empty() {
+            let new_table_reader = table_builder.flush();
+            created_tables.push(Arc::new(new_table_reader));
+        }
+
+        // Add all newly created tables to the beginning of level 0 in reverse order
+        // so the table containing the latest data appears first.
+        for table_reader in created_tables.into_iter().rev() {
+            self.levels[0].sstables.insert(0, table_reader);
+        }
+        // If the iterator was empty and no tables were created, this function effectively does nothing.
+    }
+
     pub fn find(&self, key: &KeySlice, opid: OpId) -> SearchResult {
         // Search from level 0 upwards (newest data to oldest)
         for level in self.levels.iter() {
@@ -2210,5 +2280,142 @@ mod test {
             2,
         );
         assert_eq!(storage_multi_level.table_num_in_levels(), vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn test_push_new_table() {
+        // Create an empty LevelStorege
+        let mut level_storage = LevelStorege::<Memstore>::new(vec![], 4, 2);
+        let mut next_id: StoreId = 100;
+
+        // Case 1: Push data that fits into one table
+        let data1 = vec![
+            KVOpertion::new(
+                1,
+                "key001".as_bytes().into(),
+                OpType::Write("val001".as_bytes().into()),
+            ),
+            KVOpertion::new(
+                2,
+                "key002".as_bytes().into(),
+                OpType::Write("val002".as_bytes().into()),
+            ),
+        ];
+        level_storage.push_new_table(data1.into_iter(), &mut next_id);
+
+        assert_eq!(level_storage.levels.len(), 1); // Level 0 should be created
+        assert_eq!(level_storage.levels[0].sstables.len(), 1); // One table in level 0
+        assert_eq!(level_storage.levels[0].sstables[0].store_id(), 100); // Check table ID
+        assert_eq!(next_id, 101); // next_id should be incremented
+
+        // Verify data can be found
+        assert_level_storage_find_and_check(
+            &level_storage,
+            &KeySlice::from("key001".as_bytes()),
+            Some("val001".as_bytes()),
+            u64::MAX,
+        );
+        assert_level_storage_find_and_check(
+            &level_storage,
+            &KeySlice::from("key002".as_bytes()),
+            Some("val002".as_bytes()),
+            u64::MAX,
+        );
+
+        // Case 2: Push more data, creating another table in level 0
+        let data2 = vec![
+            KVOpertion::new(
+                3,
+                "key003".as_bytes().into(),
+                OpType::Write("val003".as_bytes().into()),
+            ),
+            KVOpertion::new(
+                4,
+                "key004".as_bytes().into(),
+                OpType::Write("val004".as_bytes().into()),
+            ),
+        ];
+        level_storage.push_new_table(data2.into_iter(), &mut next_id);
+
+        assert_eq!(level_storage.levels.len(), 1);
+        assert_eq!(level_storage.levels[0].sstables.len(), 2); // Now two tables in level 0
+        assert_eq!(level_storage.levels[0].sstables[0].store_id(), 101); // Newest table first
+        assert_eq!(level_storage.levels[0].sstables[1].store_id(), 100);
+        assert_eq!(next_id, 102);
+
+        // Verify new data and old data
+        assert_level_storage_find_and_check(
+            &level_storage,
+            &KeySlice::from("key001".as_bytes()),
+            Some("val001".as_bytes()),
+            u64::MAX,
+        );
+        assert_level_storage_find_and_check(
+            &level_storage,
+            &KeySlice::from("key003".as_bytes()),
+            Some("val003".as_bytes()),
+            u64::MAX,
+        );
+
+        // Case 3: Push data that requires multiple tables (simulate large data)
+        // We need enough data to force TableBuilder::add to return false.
+        // The exact amount depends on DATA_BLOCK_SIZE and KV operation encoding size.
+        // Let's create many small KVs. Assume DATA_BLOCK_SIZE is small for testing or create many KVs.
+        // For simplicity, let's assume 2 KVs fill a block and force a new table.
+        // (This requires adjusting TableBuilder/BlockBuilder logic or creating lots of data)
+
+        // Reset storage for this case
+        let mut level_storage_multi = LevelStorege::<Memstore>::new(vec![], 4, 2);
+        let mut next_id_multi: StoreId = 200;
+
+        // Create enough data to likely span multiple tables.
+        // The exact number depends on block size and encoding.
+        // Let's create 1000 KVs. If block size is ~4KB, this should create multiple tables.
+        // Use the existing helper function to create the KVOpertions.
+        // Note: create_test_table_with_id_offset returns a TableReader, we need the Vec<KVOpertion>.
+        // We need a function like `create_kv_data_with_range_id_offset` from block::test.
+        // Let's assume we have access to a similar function or adapt it.
+        // For now, we'll use the existing map as the helper isn't directly usable here.
+        // Re-using the map logic but ensuring it matches the helper's output format if possible.
+        let large_data: Vec<KVOpertion> =
+            crate::db::block::test::create_kv_data_with_range_id_offset(1000..200000, 0);
+
+        let initial_table_count = level_storage_multi
+            .levels
+            .get(0)
+            .map_or(0, |l| l.sstables.len());
+        level_storage_multi.push_new_table(large_data.into_iter(), &mut next_id_multi);
+
+        assert_eq!(level_storage_multi.levels.len(), 1);
+        let final_table_count = level_storage_multi.levels[0].sstables.len();
+        // We expect more than one table to be created. The exact number depends on block/table size.
+        assert!(
+            final_table_count > initial_table_count + 1,
+            "Expected multiple tables to be created for large data push"
+        );
+        assert_eq!(
+            next_id_multi,
+            200 + (final_table_count - initial_table_count) as u64
+        ); // ID incremented for each new table
+
+        // Verify some data points
+        assert_level_storage_find_and_check(
+            &level_storage_multi,
+            &KeySlice::from("001001".as_bytes()),
+            Some("1001".as_bytes()),
+            u64::MAX,
+        );
+        assert_level_storage_find_and_check(
+            &level_storage_multi,
+            &KeySlice::from("001400".as_bytes()),
+            Some("1400".as_bytes()),
+            u64::MAX,
+        );
+        assert_level_storage_find_and_check(
+            &level_storage_multi,
+            &KeySlice::from("001999".as_bytes()),
+            Some("1999".as_bytes()),
+            u64::MAX,
+        );
     }
 }
