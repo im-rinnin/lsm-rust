@@ -81,7 +81,7 @@ impl<T: Store> LsmStorage<T> {
     pub fn table_num_in_levels(&self) -> Vec<usize> {
         self.current.table_num_in_levels()
     }
-    pub fn compact_level(&mut self, next_store_id: &mut StoreId) ->Vec<TableChange>{
+    pub fn compact_level(&mut self, next_store_id: &mut StoreId) -> Vec<TableChange> {
         self.current.compact_storage(next_store_id)
     }
 

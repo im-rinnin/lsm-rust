@@ -12,7 +12,7 @@ pub struct LogFile<T: Store> {
 impl<T: Store> LogFile<T> {
     pub fn open(store_id: StoreId) -> Self {
         LogFile {
-            s: T::open(store_id),
+            s: T::open_with(store_id, "log", "data"),
         }
     }
     pub fn open_with(t: T) -> Self {

@@ -327,10 +327,7 @@ impl<T: Store> LevelStorege<T> {
         let new_table_id = *next_sstable_id;
         *next_sstable_id += 1;
 
-        // Create store and builder for the new table
-        let new_store = T::open(new_table_id);
-        // Assuming default block count or size is okay here. Pass config if needed.
-        let mut table_builder = TableBuilder::new_with_store(new_store);
+        let mut table_builder = TableBuilder::new_with_id(new_table_id);
 
         // Fill the table builder with data from the iterator
         // Use a loop to handle potential errors or specific logic if `fill` isn't suitable
@@ -350,8 +347,7 @@ impl<T: Store> LevelStorege<T> {
                 // Create a new builder for the next table.
                 let new_table_id = *next_sstable_id;
                 *next_sstable_id += 1;
-                let new_store = T::open(new_table_id);
-                table_builder = TableBuilder::new_with_store(new_store);
+                table_builder = TableBuilder::new_with_id(new_table_id);
 
                 // Add the operation that didn't fit into the previous builder to the new one.
                 // This should always succeed on a fresh builder unless the single op is too large.
@@ -559,8 +555,7 @@ impl<T: Store> LevelStorege<T> {
 
             let mut current_table_builder = {
                 let new_store_id = store_id_generator();
-                let new_store = T::open(new_store_id);
-                TableBuilder::new_with_block_count(new_store, usize::MAX)
+                TableBuilder::new_with_id(new_store_id)
             };
 
             while let Some(kv_op) = kv_iter_agg.next() {
@@ -571,9 +566,7 @@ impl<T: Store> LevelStorege<T> {
 
                     // Start a new table builder
                     let new_store_id = store_id_generator();
-                    let new_store = T::open(new_store_id);
-                    current_table_builder =
-                        TableBuilder::new_with_block_count(new_store, usize::MAX);
+                    current_table_builder = TableBuilder::new_with_id(new_store_id);
                     // Add the current operation to the new table
                     let add_res = current_table_builder.add(kv_op.clone());
                     assert!(add_res);
@@ -866,8 +859,7 @@ mod test {
             );
             v.push(tmp);
         }
-        let mut store = Memstore::open(0); // Use the provided store_id
-        let mut table = TableBuilder::new_with_store(store);
+        let mut table = TableBuilder::new_with_id(0);
         table.fill_with_op(v.iter()); // Use iter()
         let res = table.flush();
         res
@@ -1037,8 +1029,7 @@ mod test {
             );
             v.push(tmp);
         }
-        let mut store = Memstore::open(id); // Pass u64 directly
-        let mut table = TableBuilder::new_with_store(store);
+        let mut table = TableBuilder::new_with_id(id);
         table.fill_with_op(v.iter());
         let res = table.flush();
         res

@@ -11,6 +11,7 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
+    // only for test
     fn open(id: StoreId) -> Self;
     fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self;
     fn id(&self) -> StoreId;

@@ -26,6 +26,9 @@ const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 pub type ThreadSafeTableReader<T> = Arc<TableReader<T>>;
 
+fn open_store<T: Store>(id: StoreId) -> T {
+    T::open_with(id, "table", "data")
+}
 #[derive(PartialEq, Debug)]
 struct BlockMeta {
     first_key: KeyVec,
@@ -69,7 +72,11 @@ pub struct TableReader<T: Store> {
 }
 // for level 0,must consider multiple key with diff value/or delete
 impl<T: Store> TableReader<T> {
-    pub fn new(mut store: T) -> Self {
+    pub fn new(store_id: StoreId) -> Self {
+        let store = open_store::<T>(store_id);
+        Self::new_with_store_for_test(store)
+    }
+    pub fn new_with_store_for_test(store: T) -> Self {
         let store_len = store.len();
         let mut buffer_for_meta_pointers = [0u8; 16]; // Buffer for offset and count (2 * u64)
 
@@ -250,17 +257,23 @@ pub struct TableBuilder<T: Store> {
     block_builder: BlockBuilder,
 }
 impl<T: Store> TableBuilder<T> {
-    pub fn new_with_block_count(store: T, block_count: usize) -> Self {
-        TableBuilder {
+    pub fn new_with_store_for_test(store: T) -> Self {
+        Self {
             store,
             block_metas: Vec::new(),
-            block_num_limit: block_count,
+            block_num_limit: BLOCK_COUNT_LIMIT,
             current_block_first_key: None,
             block_builder: BlockBuilder::new(),
         }
     }
-    pub fn new_with_store(store: T) -> Self {
-        Self::new_with_block_count(store, BLOCK_COUNT_LIMIT)
+    pub fn new_with_id(store_id: StoreId) -> Self {
+        Self {
+            store: open_store(store_id),
+            block_metas: Vec::new(),
+            block_num_limit: BLOCK_COUNT_LIMIT,
+            current_block_first_key: None,
+            block_builder: BlockBuilder::new(),
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.block_metas.is_empty() && self.block_builder.is_empty()
@@ -393,6 +406,8 @@ pub mod test {
     use crate::db::common::OpId;
     use crate::db::key::KeySlice;
     use crate::db::key::KeyVec;
+    use crate::db::table::open_store;
+    use std::mem;
     use std::ops::Range;
 
     use super::super::block::test::pad_zero;
@@ -412,9 +427,8 @@ pub mod test {
     ) -> TableReader<Memstore> {
         let v = create_kv_data_with_range_id_offset(range, id);
         let store_id = 1u64; // Assign a unique u64 ID for this test helper
-        let mut store = Memstore::open(store_id);
         let mut it = v.iter();
-        let mut table = TableBuilder::new_with_store(store);
+        let mut table = TableBuilder::new_with_id(store_id);
         table.fill_with_op(it);
         let res = table.flush();
         res
@@ -450,12 +464,12 @@ pub mod test {
 
         let store_id = 100u64; // Assign a unique u64 ID for this test
         let store = Memstore::open(store_id);
-        let mut table_builder = TableBuilder::new_with_store(store);
+        let mut table_builder = TableBuilder::new_with_store_for_test(store);
 
         table_builder.fill_with_op(kvs.iter());
         let table_reader = table_builder.flush();
         let store = table_reader.take();
-        let table_reader = TableReader::new(store);
+        let table_reader = TableReader::new_with_store_for_test(store);
 
         // Verify that keys can be found in the new table reader
         for i in 0..num_kvs {
@@ -499,8 +513,7 @@ pub mod test {
         let kvs = create_test_kvs_for_add_test();
 
         let store_id = 101u64; // Assign a unique u64 ID for this test
-        let store = Memstore::open(store_id);
-        let mut tb = TableBuilder::new_with_store(store);
+        let mut tb = TableBuilder::<Memstore>::new_with_id(store_id);
 
         for kv_op in &kvs {
             tb.add(kv_op.clone());
@@ -532,8 +545,7 @@ pub mod test {
         let kvs = create_test_kvs_for_add_test();
 
         let store_id = 102u64; // Assign a unique u64 ID for this test
-        let store = Memstore::open(store_id);
-        let mut tb = TableBuilder::new_with_store(store);
+        let mut tb = TableBuilder::<Memstore>::new_with_id(store_id);
 
         let kvs_iter = kvs.iter();
         tb.fill_with_op(kvs_iter);
@@ -567,8 +579,7 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(num);
 
         let store_id = 103u64; // Assign a unique u64 ID for this test
-        let mut store = Memstore::open(store_id);
-        let mut tb = TableBuilder::new_with_store(store);
+        let mut tb = TableBuilder::<Memstore>::new_with_id(store_id);
         tb.fill_with_op(kvs.iter());
         let table = tb.flush();
 
@@ -630,8 +641,7 @@ pub mod test {
         });
 
         let store_id = 104u64; // Assign a unique u64 ID for this test
-        let store = Memstore::open(store_id);
-        let mut tb = TableBuilder::new_with_store(store);
+        let mut tb = TableBuilder::<Memstore>::new_with_id(store_id);
         tb.fill_with_op(kvs.iter());
         let table_reader = tb.flush();
 
