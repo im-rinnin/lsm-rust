@@ -14,15 +14,9 @@ use crate::db::store::Store;
 use crate::db::table::TableReader;
 
 use super::key::KeySlice;
+use super::level::TableChange;
 use super::store::StoreId;
 
-#[derive(Clone)]
-pub struct LsmStorage<T: Store> {
-    m: Arc<Memtable>,
-    //  immutable memtable
-    imm: Vec<Arc<Memtable>>,
-    current: LevelStorege<T>,
-}
 #[derive(Clone, Copy)]
 pub struct LsmStorageConfig {
     pub block_size: usize,
@@ -53,6 +47,21 @@ impl LsmStorageConfig {
         }
     }
 }
+pub struct LsmStorage<T: Store> {
+    m: Arc<Memtable>,
+    //  immutable memtable
+    imm: Vec<Arc<Memtable>>,
+    current: LevelStorege<T>,
+}
+impl<T: Store> Clone for LsmStorage<T> {
+    fn clone(&self) -> Self {
+        LsmStorage {
+            m: self.m.clone(),
+            imm: self.imm.clone(),
+            current: self.current.clone(),
+        }
+    }
+}
 impl<T: Store> LsmStorage<T> {
     pub fn from(config: LsmStorageConfig, level: LevelStorege<T>) -> Self {
         LsmStorage {
@@ -71,6 +80,9 @@ impl<T: Store> LsmStorage<T> {
 
     pub fn table_num_in_levels(&self) -> Vec<usize> {
         self.current.table_num_in_levels()
+    }
+    pub fn compact_level(&mut self, next_store_id: &mut StoreId) ->Vec<TableChange>{
+        self.current.compact_storage(next_store_id)
     }
 
     /// Moves the current active memtable to the immutable list and creates a new active memtable.

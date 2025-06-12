@@ -86,7 +86,7 @@ impl TableChangeLog<Filestore> {
 impl<T: Store> TableChangeLog<T> {
     pub fn from(id: StoreId) -> Self {
         TableChangeLog {
-            storage: T::open(id),
+            storage: T::open_with(id, "table_changes", "data"),
         }
     }
 
@@ -409,7 +409,7 @@ impl<T: Store> LevelStorege<T> {
     ///
     /// # Returns
     /// A `Vec<TableChange>` detailing all table additions and deletions that occurred.
-    pub fn compact_storage(&mut self, mut next_store_id: u64) -> (u64, Vec<TableChange>) {
+    pub fn compact_storage(&mut self, mut next_store_id: &mut u64) -> Vec<TableChange> {
         let mut table_change = Vec::new();
         // Iterate through all levels starting from level 0
         for level_depth in 0..self.levels.len() {
@@ -435,17 +435,15 @@ impl<T: Store> LevelStorege<T> {
             }
 
             // Perform compaction to the next level
-            let (new_next_store_id, table_changes_from_compact_level) =
-                self.compact_level(next_store_id, tables_to_compact, level_depth);
+            let table_changes_from_compact_level =
+                self.compact_level(&mut next_store_id, tables_to_compact, level_depth);
 
-            // Update the next store ID for subsequent operations
-            next_store_id = new_next_store_id;
             table_change.extend(table_changes_from_compact_level);
 
             // After compacting one level, we might need to check if the target level
             // now also needs compaction, but we'll handle that in the next iteration
         }
-        return (next_store_id, table_change);
+        return table_change;
     }
 
     /// Gets the overall key range (min and max keys) across a collection of tables.
@@ -489,13 +487,13 @@ impl<T: Store> LevelStorege<T> {
     /// * `level_depth` - Source level index (target will be level_depth + 1)
     ///
     /// # Returns
-    /// The next available store ID after creating new SSTable files
+    /// A `Vec<TableChange>` detailing all table additions and deletions that occurred.
     fn compact_level(
         &mut self,
-        store_id_start: u64,
+        store_id_start: &mut u64,
         input_tables: Vec<ThreadSafeTableReader<T>>,
         level_depth: usize,
-    ) -> (u64, Vec<TableChange>) {
+    ) -> Vec<TableChange> {
         assert!(!input_tables.is_empty());
 
         // 1. Get key range in input_tables
@@ -512,7 +510,7 @@ impl<T: Store> LevelStorege<T> {
             target_level_depth,
         );
 
-        let mut next_sstable_id_counter = store_id_start as u64;
+        let mut next_sstable_id_counter = *store_id_start;
         // 2. Find tables which key range overlap with key range in target level
         if let Some(target_level) = self.levels.get_mut(target_level_depth) {
             if let Some((first_overlap_idx, last_overlap_idx)) = check_res {
@@ -527,7 +525,7 @@ impl<T: Store> LevelStorege<T> {
                     table_change.push(TableChange {
                         level: target_level_depth,
                         index: first_overlap_idx + i,
-                        id: table.store_id(), // Convert u64 to String
+                        id: table.store_id(),
                         change_type: ChangeType::Delete,
                     });
                 }
@@ -542,7 +540,7 @@ impl<T: Store> LevelStorege<T> {
                 tables_to_compact.into_iter().collect();
 
             let mut table_iters: Vec<TableIter<T>> = owned_tables
-                .iter() // Iterate over references to the owned tables
+                .iter()
                 .map(|table_reader| table_reader.to_iter())
                 .collect();
 
@@ -554,15 +552,14 @@ impl<T: Store> LevelStorege<T> {
             let mut compacted_output_tables: Vec<ThreadSafeTableReader<T>> = Vec::new();
 
             let mut store_id_generator = || {
-                let id = next_sstable_id_counter; // Generate u64 directly
+                let id = next_sstable_id_counter;
                 next_sstable_id_counter += 1;
                 id
             };
 
             let mut current_table_builder = {
                 let new_store_id = store_id_generator();
-                let new_store = T::open(new_store_id); // Pass u64 directly
-                                                       // Using usize::MAX for block_count as no specific config is available for it.
+                let new_store = T::open(new_store_id);
                 TableBuilder::new_with_block_count(new_store, usize::MAX)
             };
 
@@ -574,11 +571,11 @@ impl<T: Store> LevelStorege<T> {
 
                     // Start a new table builder
                     let new_store_id = store_id_generator();
-                    let new_store = T::open(new_store_id); // Pass u64 directly
+                    let new_store = T::open(new_store_id);
                     current_table_builder =
                         TableBuilder::new_with_block_count(new_store, usize::MAX);
                     // Add the current operation to the new table
-                    let add_res = current_table_builder.add(kv_op.clone()); // This should succeed on a new empty builder
+                    let add_res = current_table_builder.add(kv_op.clone());
                     assert!(add_res);
                 }
             }
@@ -614,7 +611,7 @@ impl<T: Store> LevelStorege<T> {
                 table_change.push(TableChange {
                     level: target_level_depth,
                     index: start_index + i,
-                    id: table.store_id(), // Convert u64 to String
+                    id: table.store_id(),
                     change_type: ChangeType::Add,
                 });
             }
@@ -624,7 +621,8 @@ impl<T: Store> LevelStorege<T> {
                 target_level.sstables.insert(start_index + i, table);
             }
         }
-        return (next_sstable_id_counter, table_change);
+        *store_id_start = next_sstable_id_counter;
+        return table_change;
     }
 
     /// Determines which tables from a given level need to be compacted and removes them from the level.
@@ -1150,14 +1148,14 @@ mod test {
 
         // Input tables for compaction (from level 0)
         let input_tables_for_compact = vec![table_l0_b.clone(), table_l0_a.clone()];
-        let store_id_start = 10000; // Starting ID for new SSTables
+        let mut store_id_start = 10000; // Starting ID for new SSTables
 
         // Create a mutable copy of level_storage to perform compaction
         let mut level_storage_mut = level_storage;
 
         // Perform compaction
-        let (next_id, _table_changes) =
-            level_storage_mut.compact_level(store_id_start, input_tables_for_compact, 0);
+        let table_changes =
+            level_storage_mut.compact_level(&mut store_id_start, input_tables_for_compact, 0);
 
         // Get the compacted level (level 1)
         let compacted_level = &level_storage_mut.levels[1];
@@ -1171,9 +1169,9 @@ mod test {
             .unwrap_or(0); // Default to 0 if no tables, though we assert !is_empty() below
 
         assert_eq!(
-            next_id,
+            store_id_start,
             max_store_id_in_compacted_level + 1,
-            "next_id should be max store id in compacted_level + 1"
+            "store_id_start should be max store id in compacted_level + 1"
         );
 
         // Assertions on the compacted level
@@ -1235,8 +1233,12 @@ mod test {
             2,
         );
         let input_tables_no_overlap = vec![table_l0_b.clone(), table_l0_a.clone()];
-        let (_next_id_no_overlap, _table_changes_no_overlap) =
-            level_storage_no_overlap.compact_level(store_id_start, input_tables_no_overlap, 0);
+        let mut store_id_start_no_overlap = store_id_start; // Use a new mutable variable for this test case
+        let _table_changes_no_overlap = level_storage_no_overlap.compact_level(
+            &mut store_id_start_no_overlap,
+            input_tables_no_overlap,
+            0,
+        );
 
         // Get the compacted level (level 1)
         let compacted_level_no_overlap = &level_storage_no_overlap.levels[1];
@@ -1540,8 +1542,9 @@ mod test {
         assert_eq!(level_storage.levels[0].sstables.len(), 5);
 
         // Perform compaction
-        let start_id_case1 = 1000;
-        let (next_id, table_changes) = level_storage.compact_storage(start_id_case1);
+        let mut start_id_case1 = 1000;
+        let original_start_id = start_id_case1;
+        let table_changes = level_storage.compact_storage(&mut start_id_case1);
 
         // Find the maximum store ID among the newly added tables in level 1
         let max_new_id_case1 = table_changes
@@ -1553,9 +1556,9 @@ mod test {
 
         // Assert next_id is one greater than the max ID used
         assert_eq!(
-            next_id,
+            start_id_case1,
             max_new_id_case1 + 1,
-            "next_id should be max new table id + 1"
+            "start_id_case1 should be max new table id + 1"
         );
 
         // After compaction: Level 0 should have 4 tables, Level 1 should exist with compacted table
@@ -1592,7 +1595,7 @@ mod test {
         for add_change in add_changes {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id >= start_id_case1); // Should use the provided store_id_start
+            assert!(add_change.id >= original_start_id); // Should use the provided store_id_start
         }
 
         // KV checks after compaction: Verify all data is still accessible
@@ -1649,9 +1652,8 @@ mod test {
         assert_eq!(level_storage_multi.levels[1].sstables.len(), 25);
 
         // Perform compaction
-        let start_id_case2 = 2000;
-        let (next_id_case2, table_changes_case2) =
-            level_storage_multi.compact_storage(start_id_case2);
+        let mut start_id_case2 = 2000;
+        let table_changes_case2 = level_storage_multi.compact_storage(&mut start_id_case2);
 
         // Find the maximum store ID among the newly added tables in level 2
         let max_new_id_case2 = table_changes_case2
@@ -1663,9 +1665,9 @@ mod test {
 
         // Assert next_id is one greater than the max ID used
         assert_eq!(
-            next_id_case2,
+            start_id_case2,
             max_new_id_case2 + 1,
-            "next_id should be max new table id + 1"
+            "start_id_case2 should be max new table id + 1"
         );
 
         // After compaction: Level 1 should have 20 tables (limit). Level 2 should be created.
@@ -1684,14 +1686,13 @@ mod test {
         let original_table_count = level_storage_small.levels[0].sstables.len();
 
         // Perform compaction
-        let start_id_case3 = 3000;
-        let (next_id_case3, table_changes_case3) =
-            level_storage_small.compact_storage(start_id_case3);
+        let mut start_id_case3 = 3000;
+        let table_changes_case3 = level_storage_small.compact_storage(&mut start_id_case3);
 
         // Assert next_id is unchanged if no tables were created
         assert_eq!(
-            next_id_case3, start_id_case3,
-            "next_id should be unchanged if no compaction happened"
+            start_id_case3, start_id_case3,
+            "start_id_case3 should be unchanged if no compaction happened"
         );
         assert!(
             table_changes_case3.is_empty(),
@@ -1710,12 +1711,11 @@ mod test {
             super::LevelStorege::new(vec![], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
 
         // Should not panic and remain empty
-        let start_id_case4 = 4000;
-        let (next_id_case4, table_changes_case4) =
-            empty_level_storage.compact_storage(start_id_case4);
+        let mut start_id_case4 = 4000;
+        let table_changes_case4 = empty_level_storage.compact_storage(&mut start_id_case4);
         assert_eq!(
-            next_id_case4, start_id_case4,
-            "next_id should be unchanged for empty storage"
+            start_id_case4, start_id_case4,
+            "start_id_case4 should be unchanged for empty storage"
         );
         assert!(
             table_changes_case4.is_empty(),
@@ -1827,7 +1827,9 @@ mod test {
 
         // Perform compaction from level 0 to level 1
         let input_tables = vec![table_c.clone(), table_a.clone(), table_b.clone()];
-        let (_next_id, _table_changes) = level_storage.compact_level(1000, input_tables, 0);
+        let mut store_id_start_for_test = 1000; // Define a mutable variable for the store_id
+        let _table_changes =
+            level_storage.compact_level(&mut store_id_start_for_test, input_tables, 0);
 
         // Get the compacted level (level 1)
         let compacted_level = &level_storage.levels[1];
@@ -2159,7 +2161,8 @@ mod test {
 
         // Perform compaction
         let input_tables = vec![table_l0_a.clone(), table_l0_b.clone()];
-        let (next_id, table_changes) = level_storage.compact_level(5000, input_tables, 0);
+        let mut store_id_start = 5000; // Define a mutable variable for the store_id
+        let table_changes = level_storage.compact_level(&mut store_id_start, input_tables, 0);
 
         // Verify table changes for overlap case
         // Should have:
@@ -2206,8 +2209,9 @@ mod test {
 
         // Perform compaction
         let input_tables_case2 = vec![table_l0_c.clone(), table_l0_d.clone()];
-        let (next_id_case2, table_changes_case2) =
-            level_storage_case2.compact_level(6000, input_tables_case2, 0);
+        let mut store_id_start_case2 = 6000; // Define a mutable variable for the store_id
+        let table_changes_case2 =
+            level_storage_case2.compact_level(&mut store_id_start_case2, input_tables_case2, 0);
 
         // Verify table changes for no overlap case
         let delete_changes_case2: Vec<_> = table_changes_case2
