@@ -18,6 +18,9 @@ pub struct MemtableIterator<'a> {
 }
 
 impl Memtable {
+    pub fn get_size(&self) -> usize {
+        self.current_size_bytes.load(Ordering::Relaxed)
+    }
     pub fn get_capacity_bytes(&self) -> usize {
         self.capacity_bytes.load(Ordering::Relaxed)
     }

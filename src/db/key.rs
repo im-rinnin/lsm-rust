@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::usize;
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Hash)]
 pub struct Key<T: AsRef<[u8]>> {
     data: T,
 }

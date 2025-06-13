@@ -129,7 +129,7 @@ impl<T: Store> LsmStorage<T> {
         self.imm.len()
     }
     pub fn memtable_size(&self) -> usize {
-        self.m.get_capacity_bytes()
+        self.m.get_size()
     }
 
     pub fn put(&self, query: KVOpertion) {
