@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Write},
     sync::Arc,
@@ -9,7 +10,7 @@ use anyhow::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::Hasher;
 
-use crate::db::common::KViterAgg;
+use crate::db::{common::KViterAgg, key::KeyBytes};
 
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
@@ -334,7 +335,12 @@ impl<T: Store> LevelStorege<T> {
         // Keep track of the tables created in this push operation
         let mut created_tables = Vec::new();
 
+        let mut print = false;
         while let Some(op) = it.next() {
+            if !print {
+                println!("dump key is {:?}", op.key);
+                print = true;
+            }
             // Try adding the operation to the current builder
             if !table_builder.add(op.clone()) {
                 // If add fails, the current builder is full.
@@ -471,6 +477,21 @@ impl<T: Store> LevelStorege<T> {
         (min_key, max_key)
     }
 
+    fn get_target_level_key_ranges(sstables: &Vec<Arc<TableReader<T>>>) -> Vec<(KeyVec, KeyVec)> {
+        let mut target_level_key_value_range = vec![];
+        for table in sstables {
+            target_level_key_value_range.push(table.key_range());
+        }
+        target_level_key_value_range.sort_by(|a, b| a.0.cmp(&b.0));
+        target_level_key_value_range
+    }
+
+    // case 1 target level contains no table
+    // case 2 no overlap in target level but overlap in input_tables
+    // case 3 overlap in target level and no overlap in input_tables
+    // case 4 no overlap in target level and no overlap in input_tables
+    // case 5 input_tables overlap with target_level
+
     /// Compacts tables from one level to the next level.
     ///
     /// This function takes input tables from `level_depth` and merges them with
@@ -490,132 +511,206 @@ impl<T: Store> LevelStorege<T> {
         input_tables: Vec<ThreadSafeTableReader<T>>,
         level_depth: usize,
     ) -> Vec<TableChange> {
-        assert!(!input_tables.is_empty());
+        let target_level = level_depth + 1;
 
-        // 1. Get key range in input_tables
-        let (min_key, max_key) = self.get_key_range(&input_tables);
+        if input_tables.is_empty() {
+            return vec![];
+        }
 
-        let target_level_depth = level_depth + 1;
-        let mut tables_to_compact: Vec<ThreadSafeTableReader<T>> = input_tables;
-        let mut non_overlapping_tables: Vec<ThreadSafeTableReader<T>> = Vec::new();
-        let mut table_change: Vec<TableChange> = Vec::new();
+        let mut table_change = vec![];
 
-        let check_res = self.table_range_overlap(
-            &min_key.as_ref().into(),
-            &max_key.as_ref().into(),
-            target_level_depth,
-        );
+        //  find all table in target_level overlap with input_tables and also get input table overlap with target_level
+        let mut target_overlap_index_set = HashSet::new();
+        let mut input_no_overlap_index_set = HashSet::new();
 
-        let mut next_sstable_id_counter = *store_id_start;
-        // 2. Find tables which key range overlap with key range in target level
-        if let Some(target_level) = self.levels.get_mut(target_level_depth) {
-            if let Some((first_overlap_idx, last_overlap_idx)) = check_res {
-                // Collect overlapping tables and remove them from target level
-                let removed_tables: Vec<ThreadSafeTableReader<T>> = target_level
-                    .sstables
-                    .drain(first_overlap_idx..=last_overlap_idx)
-                    .collect();
+        let target_level_key_value_range =
+            Self::get_target_level_key_ranges(&self.levels.get(target_level).unwrap().sstables);
 
-                // Record removed tables in table_change
-                for (i, table) in removed_tables.iter().enumerate() {
-                    table_change.push(TableChange {
-                        level: target_level_depth,
-                        index: first_overlap_idx + i,
-                        id: table.store_id(),
-                        change_type: ChangeType::Delete,
-                    });
-                }
-
-                tables_to_compact.extend(removed_tables);
-            }
-
-            // 3. Change these table to table iter, pass them to KvIterAgg, build compacted table from it , get output tables
-            // Collect the ThreadSafeTableReader instances into a Vec first.
-            // This ensures they are owned and persist while their iterators are used.
-            let owned_tables: Vec<ThreadSafeTableReader<T>> =
-                tables_to_compact.into_iter().collect();
-
-            let mut table_iters: Vec<TableIter<T>> = owned_tables
-                .iter()
-                .map(|table_reader| table_reader.to_iter())
-                .collect();
-
-            let iter_refs: Vec<&mut dyn Iterator<Item = KVOpertion>> = table_iters
-                .iter_mut()
-                .map(|iter| iter as &mut dyn Iterator<Item = KVOpertion>)
-                .collect();
-            let mut kv_iter_agg = KViterAgg::new(iter_refs);
-            let mut compacted_output_tables: Vec<ThreadSafeTableReader<T>> = Vec::new();
-
-            let mut store_id_generator = || {
-                let id = next_sstable_id_counter;
-                next_sstable_id_counter += 1;
-                id
-            };
-
-            let mut current_table_builder = {
-                let new_store_id = store_id_generator();
-                TableBuilder::new_with_id(new_store_id)
-            };
-
-            while let Some(kv_op) = kv_iter_agg.next() {
-                // Try to add the operation. If it fails (table is full), flush and start a new one.
-                if !current_table_builder.add(kv_op.clone()) {
-                    // Table is full, flush it
-                    compacted_output_tables.push(Arc::new(current_table_builder.flush()));
-
-                    // Start a new table builder
-                    let new_store_id = store_id_generator();
-                    current_table_builder = TableBuilder::new_with_id(new_store_id);
-                    // Add the current operation to the new table
-                    let add_res = current_table_builder.add(kv_op.clone());
-                    assert!(add_res);
-                }
-            }
-            // Flush any remaining data in the last builder
-            if !current_table_builder.is_empty() {
-                compacted_output_tables.push(Arc::new(current_table_builder.flush()));
-            }
-
-            // Record each compacted output table in table_change
-            // Determine the start index for new tables based on whether there was overlap
-            let start_index = if let Some((first_overlap_idx, _)) = check_res {
-                // Case 2: There was overlap, insert at the position where overlapping tables were removed
-                first_overlap_idx
+        for (input_index, table) in input_tables.iter().enumerate() {
+            let key_range = table.key_range();
+            let table_index = Self::key_range_overlap(key_range, &target_level_key_value_range);
+            if table_index.is_empty() {
+                input_no_overlap_index_set.insert(input_index);
             } else {
-                // Case 1: No overlap, determine position based on key comparison
-                if target_level.sstables.is_empty() {
-                    // Empty target level, insert at beginning
-                    0
-                } else {
-                    // Compare input tables' min key with target level's max key
-                    let target_max_key = target_level.sstables.last().unwrap().key_range().1;
-                    if min_key.as_ref() > target_max_key.as_ref() {
-                        // Input tables' min key is greater than target level's max key, insert at end
-                        target_level.sstables.len()
-                    } else {
-                        // Input tables' min key is less than or equal to target level's max key, insert at beginning
-                        0
-                    }
-                }
-            };
-
-            for (i, table) in compacted_output_tables.iter().enumerate() {
-                table_change.push(TableChange {
-                    level: target_level_depth,
-                    index: start_index + i,
-                    id: table.store_id(),
-                    change_type: ChangeType::Add,
-                });
-            }
-
-            // Insert all compacted output tables at the correct position
-            for (i, table) in compacted_output_tables.into_iter().enumerate() {
-                target_level.sstables.insert(start_index + i, table);
+                target_overlap_index_set.extend(table_index);
             }
         }
-        *store_id_start = next_sstable_id_counter;
-        return table_change;
+        //
+        // for table in no_overlap_tables_in_target_level, find table no overlap with input_tables,
+        // name it as pass_table(don't need compacet)
+        let mut no_need_to_compact_input_table_index = vec![];
+        let input_key_range = Self::get_target_level_key_ranges(&input_tables);
+        for index in input_no_overlap_index_set {
+            let table = input_tables.get(index).unwrap();
+            let check_res = Self::key_range_overlap(table.key_range(), &input_key_range);
+            assert!(check_res.len() >= 1);
+            if check_res.len() == 1 {
+                no_need_to_compact_input_table_index.push(index);
+            }
+        }
+        // Separate input_tables into those that need compaction and those that don't
+        let mut tables_to_compact_from_input = Vec::new();
+        let mut pass_through_input_tables = Vec::new();
+        for (index, table) in input_tables.into_iter().enumerate() {
+            if no_need_to_compact_input_table_index.contains(&index) {
+                pass_through_input_tables.push(table);
+            } else {
+                tables_to_compact_from_input.push(table);
+            }
+        }
+
+        // 4. Do compaction for tables that overlap from both input_tables and target_level
+        let mut tables_from_target_to_compact: Vec<ThreadSafeTableReader<T>> = Vec::new();
+        let mut tables_to_pass_through_target: Vec<ThreadSafeTableReader<T>> = Vec::new();
+        let current_target_sstables = std::mem::take(&mut self.levels[target_level].sstables); // Temporarily take ownership
+
+        for (index, table) in current_target_sstables.into_iter().enumerate() {
+            if target_overlap_index_set.contains(&index) {
+                tables_from_target_to_compact.push(table.clone()); // Clone Arc for compaction
+                table_change.push(TableChange {
+                    id: table.store_id(),
+                    index: index, // This index refers to the original position in target_level
+                    level: target_level,
+                    change_type: ChangeType::Delete,
+                });
+            } else {
+                tables_to_pass_through_target.push(table);
+            }
+        }
+
+        let mut all_tables_for_merge = Vec::new();
+        all_tables_for_merge.extend(tables_to_compact_from_input);
+        all_tables_for_merge.extend(tables_from_target_to_compact);
+
+        // Sort tables for merge by first key to ensure correct merge order
+        all_tables_for_merge.sort_by(|a, b| a.key_range().0.cmp(&b.key_range().0));
+
+        // Create a vector to own the concrete iterator instances.
+        // The TableIter will borrow the TableReader inside the Arc.
+        // all_tables_for_merge (which owns the Arcs) must live longer than concrete_iterators.
+        let mut concrete_iterators: Vec<TableIter<T>> = Vec::new();
+        for table_reader_arc in &all_tables_for_merge {
+            // Iterate over references (&)
+            concrete_iterators.push(table_reader_arc.to_iter()); // Borrow happens here
+        }
+
+        // Create a vector of mutable trait object references from the concrete iterators.
+        // concrete_iterators owns the TableIter instances.
+        let iterators_for_agg: Vec<&mut dyn Iterator<Item = KVOpertion>> = concrete_iterators
+            .iter_mut()
+            .map(|it| it as &mut dyn Iterator<Item = KVOpertion>)
+            .collect();
+
+        let mut kv_iter_agg = KViterAgg::new(iterators_for_agg);
+        let mut compacted_tables = Vec::new();
+
+        if let Some(mut op) = kv_iter_agg.next() {
+            let mut table_builder = TableBuilder::new_with_id(*store_id_start);
+            *store_id_start += 1;
+
+            loop {
+                // If add fails, current builder is full. Flush and create new builder.
+                if !table_builder.add(op.clone()) {
+                    let new_table_reader = table_builder.flush();
+                    table_change.push(TableChange {
+                        id: new_table_reader.store_id(),
+                        index: 0, // Index will be sorted later
+                        level: target_level,
+                        change_type: ChangeType::Add,
+                    });
+                    compacted_tables.push(Arc::new(new_table_reader));
+
+                    table_builder = TableBuilder::new_with_id(*store_id_start);
+                    *store_id_start += 1;
+                    if !table_builder.add(op.clone()) {
+                        panic!("Error: Single KVOperation is too large to fit in a new table block during compaction. Operation ID: {}", op.id);
+                    }
+                }
+
+                if let Some(next_op) = kv_iter_agg.next() {
+                    op = next_op;
+                } else {
+                    // No more operations, flush the last builder
+                    if !table_builder.is_empty() {
+                        let new_table_reader = table_builder.flush();
+                        table_change.push(TableChange {
+                            id: new_table_reader.store_id(),
+                            index: 0, // Index will be sorted later
+                            level: target_level,
+                            change_type: ChangeType::Add,
+                        });
+                        compacted_tables.push(Arc::new(new_table_reader));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 5. Merge pass_through_input_tables, compacted_tables, and remaining tables in target_level (tables_to_pass_through_target)
+        let mut final_tables_for_target_level = Vec::new();
+        for table in &pass_through_input_tables {
+            table_change.push(TableChange {
+                level: target_level,
+                index: 0,
+                id: table.store_id(),
+                change_type: ChangeType::Add,
+            });
+        }
+        final_tables_for_target_level.extend(pass_through_input_tables);
+        final_tables_for_target_level.extend(compacted_tables);
+        final_tables_for_target_level.extend(tables_to_pass_through_target);
+
+        // Sort all tables in the target level by their first key
+        final_tables_for_target_level.sort_by(|a, b| a.key_range().0.cmp(&b.key_range().0));
+
+        // Update the sstables for the target level
+        self.levels[target_level].sstables = final_tables_for_target_level;
+
+        // Re-index TableChange.Add entries after sorting
+        let mut current_level_tables_ids: HashMap<u64, usize> = HashMap::new();
+        for (idx, table) in self.levels[target_level].sstables.iter().enumerate() {
+            current_level_tables_ids.insert(table.store_id(), idx);
+        }
+
+        for change in table_change.iter_mut() {
+            if change.change_type == ChangeType::Add && change.level == target_level {
+                if let Some(&new_index) = current_level_tables_ids.get(&change.id) {
+                    change.index = new_index;
+                } else {
+                    // This should not happen if logic is correct
+                    panic!(
+                        "Added table ID not found in final target level after sort: {}",
+                        change.id
+                    );
+                }
+            }
+        }
+
+        table_change
+    }
+
+    // find all key_range overlap with k, return index in key_ranges vec
+    // sorted_key_ranges order by first_key
+    // e.g. k:[2,10] key_ranges:[[1,3],[5,7],[12,20]] return (0,1)
+    fn key_range_overlap(
+        k: (KeyVec, KeyVec),
+        sorted_key_ranges: &Vec<(KeyVec, KeyVec)>,
+    ) -> Vec<usize> {
+        let (k_min, k_max) = k;
+        let mut overlapping_indices = Vec::new();
+
+        for (idx, (r_min, r_max)) in sorted_key_ranges.into_iter().enumerate() {
+            // Check for overlap: (k_min <= r_max) AND (k_max >= r_min)
+            if k_min.as_ref().le(r_max.as_ref()) && k_max.as_ref().ge(r_min.as_ref()) {
+                overlapping_indices.push(idx);
+            } else if r_min.as_ref().gt(k_max.as_ref()) {
+                // Since sorted_key_ranges is sorted by first_key,
+                // if the current range's min_key is already greater than k_max,
+                // no subsequent ranges will overlap.
+                break;
+            }
+        }
+        overlapping_indices
     }
 
     /// Determines which tables from a given level need to be compacted and removes them from the level.
@@ -1508,11 +1603,12 @@ mod test {
     #[test]
     fn test_compact_storage() {
         // Test Case 1: Level 0 exceeds limit, should compact to Level 1
+        let max_origin_id = 5;
         let table_a = Arc::new(create_test_table_with_id(0..10, 1u64)); // Smallest ID
         let table_b = Arc::new(create_test_table_with_id(10..20, 2u64));
         let table_c = Arc::new(create_test_table_with_id(20..30, 3u64));
         let table_d = Arc::new(create_test_table_with_id(30..40, 4u64));
-        let table_e = Arc::new(create_test_table_with_id(40..50, 5u64)); // This will exceed limit
+        let table_e = Arc::new(create_test_table_with_id(40..50, max_origin_id)); // This will exceed limit
 
         // Create level 0 with 5 tables (exceeds MAX_LEVEL_ZERO_TABLE_SIZE = 4)
         let level0 = super::Level::new(
@@ -1536,6 +1632,7 @@ mod test {
         let mut start_id_case1 = 1000;
         let original_start_id = start_id_case1;
         let table_changes = level_storage.compact_storage(&mut start_id_case1);
+        println!("{:?}", table_changes);
 
         // Find the maximum store ID among the newly added tables in level 1
         let max_new_id_case1 = table_changes
@@ -1545,12 +1642,7 @@ mod test {
             .max()
             .expect("Should have added tables in level 1");
 
-        // Assert next_id is one greater than the max ID used
-        assert_eq!(
-            start_id_case1,
-            max_new_id_case1 + 1,
-            "start_id_case1 should be max new table id + 1"
-        );
+        assert!(max_new_id_case1 <= max_origin_id, "id is from level0 table");
 
         // After compaction: Level 0 should have 4 tables, Level 1 should exist with compacted table
         assert_eq!(level_storage.levels.len(), 2); // Level 1 should be created
@@ -1586,7 +1678,7 @@ mod test {
         for add_change in add_changes {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id >= original_start_id); // Should use the provided store_id_start
+            assert!(add_change.id <= max_origin_id); // Should use the provided store_id_start
         }
 
         // KV checks after compaction: Verify all data is still accessible
@@ -1628,6 +1720,11 @@ mod test {
                 ))
             })
             .collect();
+        let max_id_in_l1 = many_tables_l1
+            .iter()
+            .map(|table| table.store_id())
+            .max()
+            .expect("many_tables_l1 should not be empty");
 
         let level1_many = super::Level::new(many_tables_l1, false);
         let mut level_storage_multi = super::LevelStorege::new(
@@ -1654,12 +1751,7 @@ mod test {
             .max()
             .expect("Should have added tables in level 2");
 
-        // Assert next_id is one greater than the max ID used
-        assert_eq!(
-            start_id_case2,
-            max_new_id_case2 + 1,
-            "start_id_case2 should be max new table id + 1"
-        );
+        assert!(max_new_id_case2 < max_id_in_l1);
 
         // After compaction: Level 1 should have 20 tables (limit). Level 2 should be created.
         // 5 tables (25 - 20) should be compacted from L1 to L2.
@@ -2135,6 +2227,205 @@ mod test {
     }
 
     #[test]
+    fn test_key_range_overlap() {
+        let to_kv_vec = |s: &str| KeyVec::from(s.as_bytes());
+
+        // Helper for creating range tuples
+        let r = |start: &str, end: &str| (to_kv_vec(start), to_kv_vec(end));
+
+        // Test Case 1: No overlap, target range before sorted_key_ranges
+        let k = r("000000", "000005");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![]
+        );
+
+        // Test Case 2: No overlap, target range after sorted_key_ranges
+        let k = r("000050", "000060");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![]
+        );
+
+        // Test Case 3: Exact overlap with one range
+        let k = r("000010", "000020");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 4: Partial overlap at the beginning of a range
+        let k = r("000005", "000015");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 5: Partial overlap at the end of a range
+        let k = r("000015", "000025");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 6: Overlap with multiple consecutive ranges
+        let k = r("000015", "000035");
+        let ranges = vec![
+            r("000010", "000020"),
+            r("000025", "000035"),
+            r("000040", "000050"),
+        ];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0, 1]
+        );
+
+        // Test Case 7: Range completely contains another range
+        let k = r("000000", "000050");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0, 1]
+        );
+
+        // Test Case 8: Range contained within another range
+        let k = r("000012", "000018");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 9: Empty sorted_key_ranges
+        let k = r("000010", "000020");
+        let ranges: Vec<(KeyVec, KeyVec)> = vec![];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![]
+        );
+
+        // Test Case 10: Overlap at boundary points with an empty space between
+        let k = r("000020", "000030");
+        let ranges = vec![r("000010", "000020"), r("000030", "000040")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0, 1]
+        );
+
+        // Test Case 11: Single range in sorted_key_ranges, no overlap
+        let k = r("000000", "000005");
+        let ranges = vec![r("000010", "000020")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![]
+        );
+
+        // Test Case 12: Single range in sorted_key_ranges, with overlap
+        let k = r("000015", "000025");
+        let ranges = vec![r("000010", "000020")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 13: With delete keys
+        let k = r("000000", "000000"); // A delete key
+        let ranges = vec![r("000000", "000000"), r("000010", "000020")]; // A range for the delete key
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 14: Overlap with only the exact min key of a range
+        let k = r("000000", "000010");
+        let ranges = vec![r("000010", "000020")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+
+        // Test Case 15: Overlap with only the exact max key of a range
+        let k = r("000020", "000030");
+        let ranges = vec![r("000010", "000020")];
+        assert_eq!(
+            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn test_compact_level_no_level() {
+        // create 3 table for compact input and
+    }
+
+    #[test]
+    fn test_compact_level_no_overlap() {
+        // level 1 table a [0..100] table b [200..300]
+        // new table c [120..160] compact it to level 1
+        // check by get key 120
+
+        // Create existing tables in level 1 (non-overlapping)
+        let table_l1_a = Arc::new(create_test_table_with_id_offset(0..100, 1000)); // keys "000000" to "000099"
+        let table_l1_b = Arc::new(create_test_table_with_id_offset(200..300, 2000)); // keys "000200" to "000299"
+
+        let level0_empty = super::Level::new(vec![], true); // Empty level 0
+        let level1 = super::Level::new(vec![table_l1_a.clone(), table_l1_b.clone()], false);
+        let mut level_storage = super::LevelStorege::new(
+            vec![level0_empty, level1],
+            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
+            2,
+        );
+
+        // Create a new table (table_c) that will be compacted into level 1.
+        // Its key range [120..160] falls between table_l1_a and table_l1_b, with no overlap.
+        let table_c_to_compact = Arc::new(create_test_table_with_id_offset(120..160, 3000)); // keys "000120" to "000159"
+
+        // Perform compaction. We're simulating compacting a single table into level 1.
+        let input_tables = vec![table_c_to_compact.clone()];
+        let mut store_id_start = 5000; // Starting ID for new SSTables
+        let _table_changes = level_storage.compact_level(&mut store_id_start, input_tables, 0); // level_depth 0 means input is from level 0, target is level 1
+
+        // Get the compacted level (level 1)
+        let compacted_level = &level_storage.levels[1]; // Since we only had level 1 initially, it's still levels[0]
+
+        // Assertions:
+        // 1. The compacted level should now contain 3 tables.
+        assert_eq!(compacted_level.sstables.len(), 3);
+
+        // 2. The tables should be in sorted order by their first key: table_l1_a, table_c_to_compact, table_l1_b
+        assert_eq!(
+            compacted_level.sstables[0].store_id(),
+            table_l1_a.store_id()
+        );
+        assert_eq!(
+            compacted_level.sstables[1].store_id(),
+            table_c_to_compact.store_id()
+        );
+        assert_eq!(
+            compacted_level.sstables[2].store_id(),
+            table_l1_b.store_id()
+        );
+
+        // 3. Verify that the key from the newly inserted table can be found.
+        let key_120 = KeySlice::from("000120".as_bytes());
+        assert_level_find_and_check(&compacted_level, &key_120, Some("120".as_bytes()));
+
+        // 4. Verify keys from original tables are still present.
+        let key_50 = KeySlice::from("000050".as_bytes());
+        assert_level_find_and_check(&compacted_level, &key_50, Some("50".as_bytes()));
+        let key_250 = KeySlice::from("000250".as_bytes());
+        assert_level_find_and_check(&compacted_level, &key_250, Some("250".as_bytes()));
+
+        // 5. Verify a key outside the range is not found.
+        let key_180 = KeySlice::from("000180".as_bytes());
+        assert_level_find_and_check(&compacted_level, &key_180, None);
+    }
+    #[test]
     fn test_compact_level_table_change() {
         // Case 1: Overlap with target level
         // Create input tables from level 0
@@ -2178,8 +2469,63 @@ mod test {
         for add_change in &add_changes {
             assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id >= 5000); // Should use the provided store_id_start
+            assert_eq!(add_change.id, 5000); // Assuming one compacted table for this data volume and using the starting ID
         }
+
+        // Verify the final state of the target level (Level 1)
+        let final_level_case1 = &level_storage.levels[1];
+        assert_eq!(
+            final_level_case1.sstables.len(),
+            2,
+            "Case 1: Final level 1 table count mismatch"
+        );
+
+        // Expected order: new compacted table (0..89) then original non-overlapping table_l1_y (100..149)
+        let added_table_id_case1 = add_changes[0].id; // Get the ID of the new compacted table
+        let expected_final_ids_case1 = vec![added_table_id_case1, table_l1_y.store_id()];
+        let actual_final_ids_case1: Vec<u64> = final_level_case1
+            .sstables
+            .iter()
+            .map(|t| t.store_id())
+            .collect();
+        assert_eq!(
+            actual_final_ids_case1, expected_final_ids_case1,
+            "Case 1: Final level 1 table IDs and order mismatch"
+        );
+
+        // Verify content by querying keys in Case 1
+        assert_level_find_and_check(
+            &final_level_case1,
+            &KeySlice::from("000010".as_bytes()),
+            Some("10".as_bytes()),
+        ); // from table_l0_a
+        assert_level_find_and_check(
+            &final_level_case1,
+            &KeySlice::from("000030".as_bytes()),
+            Some("30".as_bytes()),
+        ); // from table_l0_b
+        assert_level_find_and_check(
+            &final_level_case1,
+            &KeySlice::from("000050".as_bytes()),
+            Some("50".as_bytes()),
+        ); // from table_l0_b
+        assert_level_find_and_check(
+            &final_level_case1,
+            &KeySlice::from("000080".as_bytes()),
+            Some("80".as_bytes()),
+        ); // from table_l1_x
+           // Check a key from the non-overlapping table_l1_y
+        assert_level_find_and_check(
+            &final_level_case1,
+            &KeySlice::from("000120".as_bytes()),
+            Some("120".as_bytes()),
+        ); // from table_l1_y
+           // Check a key outside the range
+        assert_level_find_and_check(
+            &final_level_case1,
+            &KeySlice::from("000180".as_bytes()),
+            None,
+        );
 
         // Case 2: No overlap with target level, input tables' keys < target level min key
         // Create input tables with keys smaller than existing target level
@@ -2214,18 +2560,42 @@ mod test {
             .filter(|tc| tc.change_type == ChangeType::Add)
             .collect();
 
+        let final_level = &level_storage_case2.levels[1];
+        let expected_added_ids_sorted_by_key: Vec<u64> =
+            add_changes_case2.iter().map(|tc| tc.id).collect();
+        let mut expected_final_store_ids: Vec<u64> = Vec::new();
+        expected_final_store_ids.extend(expected_added_ids_sorted_by_key);
+        expected_final_store_ids.push(table_l1_z.store_id());
+        expected_final_store_ids.push(table_l1_w.store_id());
+
+        let actual_final_store_ids: Vec<u64> =
+            final_level.sstables.iter().map(|t| t.store_id()).collect();
+
+        assert_eq!(
+            actual_final_store_ids.len(),
+            expected_final_store_ids.len(),
+            "Final level table count mismatch"
+        );
+        assert_eq!(
+            actual_final_store_ids, expected_final_store_ids,
+            "Final level table IDs and order mismatch"
+        );
+
         // Should have no delete operations (no overlap)
         assert_eq!(delete_changes_case2.len(), 0);
 
         // Should have add operations for new compacted tables
-        assert!(!add_changes_case2.is_empty());
-        for add_change in &add_changes_case2 {
-            assert_eq!(add_change.level, 1);
-            assert_eq!(add_change.change_type, ChangeType::Add);
-            assert!(add_change.id >= 6000); // Should use the provided store_id_start
-                                            // Since input keys are smaller than target level keys, new tables should be inserted at the beginning
-            assert_eq!(add_change.index, 0);
-        }
+        assert_eq!(
+            add_changes_case2.len(),
+            1,
+            "Expected exactly one new compacted table to be added in Case 2"
+        );
+        let add_change = &add_changes_case2[0];
+        assert_eq!(add_change.level, 1);
+        assert_eq!(add_change.change_type, ChangeType::Add);
+        assert_eq!(add_change.id, 6000); // The single new compacted table should have this starting ID
+                                         // Since input keys are smaller than target level keys, new tables should be inserted at the beginning
+        assert_eq!(add_change.index, 0);
 
         // Verify that the original tables in target level are still there and shifted
         let final_level = &level_storage_case2.levels[1];
@@ -2242,6 +2612,7 @@ mod test {
         assert!(last_tables.contains(&table_l1_w.store_id()));
     }
 
+    /// Tests the `table_num_in_levels` method to ensure it correctly reports the number of tables in each level.
     #[test]
     fn test_table_len_in_levels() {
         // Case 1: Empty LevelStorege
