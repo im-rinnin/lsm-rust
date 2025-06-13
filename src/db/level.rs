@@ -243,70 +243,19 @@ impl<T: Store> Clone for LevelStorege<T> {
 }
 
 impl<T: Store> LevelStorege<T> {
-    // return table number in every level, table number in level[0]=vec[0]
-    pub fn table_num_in_levels(&self) -> Vec<usize> {
-        self.levels
-            .iter()
-            .map(|level| level.sstables.len())
-            .collect()
-    }
-    fn resotre_table_id(
-        start_level: Vec<Vec<StoreId>>,
-        changes: Vec<TableChange>,
-    ) -> Vec<Vec<StoreId>> {
-        let mut levels_data = start_level;
-
-        for change in changes {
-            // Ensure levels_data has enough capacity for the current level
-            while levels_data.len() <= change.level {
-                levels_data.push(Vec::new());
-            }
-
-            let level_tables = &mut levels_data[change.level];
-
-            match change.change_type {
-                ChangeType::Add => {
-                    // Ensure index is valid for insertion
-                    if change.index > level_tables.len() {
-                        // This case should ideally not happen if changes are applied in order
-                        // or if the index refers to an append. For now, panic or resize.
-                        // Given it's a restore, it implies a sequence of valid operations.
-                        panic!(
-                            "Invalid index for add operation: level {}, index {}, current len {}",
-                            change.level,
-                            change.index,
-                            level_tables.len()
-                        );
-                    }
-                    level_tables.insert(change.index, change.id);
-                }
-                ChangeType::Delete => {
-                    // Ensure index is valid for deletion
-                    if change.index >= level_tables.len() {
-                        // This indicates an inconsistency in the change log or out-of-order application
-                        panic!(
-                            "Invalid index for delete operation: level {}, index {}, current len {}",
-                            change.level,
-                            change.index,
-                            level_tables.len()
-                        );
-                    }
-                    level_tables.remove(change.index);
-                }
-            }
-        }
-        levels_data
-    }
-    fn from(changes: Vec<Vec<StoreId>>) -> Self {
-        unimplemented!()
-    }
-
     pub fn new(tables: Vec<Level<T>>, level_zero_num_limit: usize, level_ratio: usize) -> Self {
         LevelStorege {
             levels: tables,
             level_zero_num_limit,
             level_ratio,
         }
+    }
+    // return table number in every level, table number in level[0]=vec[0]
+    pub fn table_num_in_levels(&self) -> Vec<usize> {
+        self.levels
+            .iter()
+            .map(|level| level.sstables.len())
+            .collect()
     }
 
     // add new table from iterator `it` to level 0.
@@ -1952,123 +1901,6 @@ mod test {
             &KeySlice::from("000250".as_bytes()),
             Some("250".as_bytes()),
         );
-    }
-
-    #[test]
-    fn test_restore_table_id() {
-        // Scenario 1: Empty changes, empty start_level
-        let start_level: Vec<Vec<StoreId>> = vec![];
-        let changes: Vec<TableChange> = vec![];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![] as Vec<Vec<u64>>);
-
-        // Scenario 2: Empty changes, non-empty start_level
-        let start_level: Vec<Vec<StoreId>> = vec![vec![1, 2], vec![3]];
-        let changes: Vec<TableChange> = vec![];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level.clone(), changes);
-        assert_eq!(result, vec![vec![1, 2], vec![3]]);
-
-        // Scenario 3: Add operations
-        let start_level: Vec<Vec<StoreId>> = vec![vec![]]; // Start with an empty level 0
-        let changes = vec![
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 100,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 1,
-                id: 101,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 1, // This will expand levels_data
-                index: 0,
-                id: 200,
-                change_type: ChangeType::Add,
-            },
-        ];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![vec![100, 101], vec![200]]);
-
-        // Scenario 4: Delete operations
-        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11, 12], vec![20, 21]];
-        let changes = vec![
-            TableChange {
-                level: 0,
-                index: 1,
-                id: 11,
-                change_type: ChangeType::Delete,
-            },
-            TableChange {
-                level: 1,
-                index: 0,
-                id: 20,
-                change_type: ChangeType::Delete,
-            },
-        ];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![vec![10, 12], vec![21]]);
-
-        // Scenario 5: Mixed Add and Delete
-        let start_level: Vec<Vec<StoreId>> = vec![vec![1, 2, 3]];
-        let changes = vec![
-            TableChange {
-                level: 0,
-                index: 1,
-                id: 2,
-                change_type: ChangeType::Delete,
-            }, // Delete 2
-            TableChange {
-                level: 0,
-                index: 1,
-                id: 4,
-                change_type: ChangeType::Add,
-            }, // Add 4 at index 1
-            TableChange {
-                level: 1,
-                index: 0,
-                id: 5,
-                change_type: ChangeType::Add,
-            }, // Add 5 to new level 1
-        ];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![vec![1, 4, 3], vec![5]]);
-
-        // Scenario 6: Add at the end of a level
-        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11]];
-        let changes = vec![TableChange {
-            level: 0,
-            index: 2,
-            id: 12,
-            change_type: ChangeType::Add,
-        }];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![vec![10, 11, 12]]);
-
-        // Scenario 7: Delete the last element
-        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11, 12]];
-        let changes = vec![TableChange {
-            level: 0,
-            index: 2,
-            id: 12,
-            change_type: ChangeType::Delete,
-        }];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![vec![10, 11]]);
-
-        // Scenario 8: Delete the first element
-        let start_level: Vec<Vec<StoreId>> = vec![vec![10, 11, 12]];
-        let changes = vec![TableChange {
-            level: 0,
-            index: 0,
-            id: 10,
-            change_type: ChangeType::Delete,
-        }];
-        let result = LevelStorege::<Memstore>::resotre_table_id(start_level, changes);
-        assert_eq!(result, vec![vec![11, 12]]);
     }
 
     #[test]

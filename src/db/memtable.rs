@@ -18,12 +18,6 @@ pub struct MemtableIterator<'a> {
 }
 
 impl Memtable {
-    pub fn get_size(&self) -> usize {
-        self.current_size_bytes.load(Ordering::Relaxed)
-    }
-    pub fn get_capacity_bytes(&self) -> usize {
-        self.capacity_bytes.load(Ordering::Relaxed)
-    }
     pub fn new(capacity_bytes: usize) -> Self {
         Memtable {
             table: SkipMap::new(),
@@ -32,6 +26,12 @@ impl Memtable {
         }
     }
 
+    pub fn get_size(&self) -> usize {
+        self.current_size_bytes.load(Ordering::Relaxed)
+    }
+    pub fn get_capacity_bytes(&self) -> usize {
+        self.capacity_bytes.load(Ordering::Relaxed)
+    }
     pub fn get<'a>(&'a self, q: &KeyQuery) -> SearchResult {
         let range_start_bound = (q.key.clone(), 0);
         let range_end_bound = (q.key.clone(), q.op_id + 1);

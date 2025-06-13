@@ -266,6 +266,16 @@ impl<T: Store> TableBuilder<T> {
             block_builder: BlockBuilder::new(),
         }
     }
+    pub fn new_with_id_and_block_count_limit(store_id: StoreId, block_num_limit: usize) -> Self {
+        Self {
+            store: open_store(store_id),
+            block_metas: Vec::new(),
+            block_num_limit,
+            current_block_first_key: None,
+            block_builder: BlockBuilder::new(),
+        }
+    }
+
     pub fn new_with_id(store_id: StoreId) -> Self {
         Self {
             store: open_store(store_id),
