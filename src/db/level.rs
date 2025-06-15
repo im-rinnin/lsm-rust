@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    default,
     fs::File,
     io::{Read, Write},
     sync::Arc,
@@ -23,6 +24,7 @@ use super::{
 };
 
 const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
+const MAX_INPUT_TABLE_IN_COMPACT: usize = 1;
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ChangeType {
     Add,    // encode to 0
@@ -232,6 +234,7 @@ pub struct LevelStorege<T: Store> {
     //level n+1 table len =level n table len *ratio
     level_zero_num_limit: usize,
     level_ratio: usize,
+    max_input_table_in_compact: usize,
 }
 
 impl<T: Store> Clone for LevelStorege<T> {
@@ -240,16 +243,44 @@ impl<T: Store> Clone for LevelStorege<T> {
             levels: self.levels.clone(),
             level_zero_num_limit: self.level_zero_num_limit,
             level_ratio: self.level_ratio,
+            max_input_table_in_compact: self.max_input_table_in_compact,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub struct LevelStoregeConfig {
+    pub level_zero_num_limit: usize,
+    pub level_ratio: usize,
+    pub max_input_table_num_in_compact: usize,
+}
+
+impl Default for LevelStoregeConfig {
+    fn default() -> Self {
+        LevelStoregeConfig {
+            level_zero_num_limit: DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
+            level_ratio: 4,
+            max_input_table_num_in_compact: MAX_INPUT_TABLE_IN_COMPACT,
+        }
+    }
+}
+
+impl LevelStoregeConfig {
+    pub fn config_for_test() -> Self {
+        LevelStoregeConfig {
+            level_zero_num_limit: 2,
+            level_ratio: 2,
+            max_input_table_num_in_compact: MAX_INPUT_TABLE_IN_COMPACT,
         }
     }
 }
 
 impl<T: Store> LevelStorege<T> {
-    pub fn new(tables: Vec<Level<T>>, level_zero_num_limit: usize, level_ratio: usize) -> Self {
+    pub fn new(tables: Vec<Level<T>>, config: LevelStoregeConfig) -> Self {
         LevelStorege {
             levels: tables,
-            level_zero_num_limit,
-            level_ratio,
+            level_zero_num_limit: config.level_zero_num_limit,
+            level_ratio: config.level_ratio,
+            max_input_table_in_compact: config.max_input_table_num_in_compact,
         }
     }
     // return table number in every level, table number in level[0]=vec[0]
@@ -734,7 +765,7 @@ impl<T: Store> LevelStorege<T> {
         let mut tables_to_compact = Vec::new();
         let mut positions_to_remove: Vec<usize> = store_id_positions
             .into_iter()
-            .take(n)
+            .take(self.max_input_table_in_compact)
             .map(|(_, pos)| pos)
             .collect();
 
@@ -823,17 +854,16 @@ impl<T: Store> LevelStorege<T> {
 
 #[cfg(test)]
 mod test {
-    use std::default;
+    use super::LevelStoregeConfig;
     use std::ops::Range;
     use std::sync::Arc; // Moved from test functions
+    const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4; // Moved here for local test scope
 
     use crc32fast::Hasher;
 
     use crate::db::common::{KVOpertion, OpId, OpType}; // OpType moved from helper
     use crate::db::key::{KeySlice, KeyVec};
-    use crate::db::level::{
-        ChangeType, Level, LevelStorege, TableChange, DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, U32_SIZE,
-    };
+    use crate::db::level::{ChangeType, Level, LevelStorege, TableChange, U32_SIZE};
     use crate::db::store::{Filestore, Store, StoreId};
     // KeyVec moved from helper
     use crate::db::table::test::{create_test_table, create_test_table_with_id_offset};
@@ -1048,7 +1078,7 @@ mod test {
 
         // Create LevelStorege with levels
         let level_storage =
-            super::LevelStorege::new(vec![level0, level1], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2); // r is level_ratio, not relevant for this test
+            super::LevelStorege::new(vec![level0, level1], LevelStoregeConfig::config_for_test()); // r is level_ratio, not relevant for this test
 
         // Test cases for find:
 
@@ -1127,8 +1157,7 @@ mod test {
             true,
         );
         let level_storage_zero =
-            super::LevelStorege::new(vec![level_zero], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
-
+            super::LevelStorege::new(vec![level_zero], LevelStoregeConfig::config_for_test());
         let compacted_tables_zero = level_storage_zero.table_to_compact(0);
         assert_eq!(compacted_tables_zero.len(), 3);
         let mut compacted_ids: Vec<u64> = compacted_tables_zero
@@ -1153,7 +1182,7 @@ mod test {
             false,
         );
         let level_storage_n =
-            super::LevelStorege::new(vec![level_n], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![level_n], LevelStoregeConfig::config_for_test());
 
         let compacted_tables_n = level_storage_n.table_to_compact(0);
         assert_eq!(compacted_tables_n.len(), 1);
@@ -1170,7 +1199,7 @@ mod test {
 
         // Scenario 1: Single table
         let level_storage_single =
-            super::LevelStorege::new(vec![], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2); // Levels vector doesn't matter for this test
+            super::LevelStorege::new(vec![], LevelStoregeConfig::config_for_test()); // Levels vector doesn't matter for this test
         let (min_key, max_key) = level_storage_single.get_key_range(&[table_1.clone()]);
         assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
         assert_eq!(max_key, KeyVec::from("000009".as_bytes()));
@@ -1213,8 +1242,7 @@ mod test {
         // Create LevelStorege with levels
         let level_storage = super::LevelStorege::new(
             vec![level0.clone(), level1],
-            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Input tables for compaction (from level 0)
@@ -1300,8 +1328,7 @@ mod test {
         let empty_level1 = super::Level::new(vec![], false);
         let mut level_storage_no_overlap = super::LevelStorege::new(
             vec![level0.clone(), empty_level1],
-            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
         let input_tables_no_overlap = vec![table_l0_b.clone(), table_l0_a.clone()];
         let mut store_id_start_no_overlap = store_id_start; // Use a new mutable variable for this test case
@@ -1353,7 +1380,7 @@ mod test {
         );
 
         let level_storage =
-            super::LevelStorege::new(vec![level_n], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2); // Level 0 is the only level here
+            super::LevelStorege::new(vec![level_n], LevelStoregeConfig::config_for_test()); // Level 0 is the only level here
 
         let level_depth = 0; // We are testing the first (and only) level
 
@@ -1416,7 +1443,7 @@ mod test {
         // Test Case 9: Empty level
         let empty_level: Level<Memstore> = super::Level::new(vec![], false);
         let empty_level_storage =
-            super::LevelStorege::new(vec![empty_level], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![empty_level], LevelStoregeConfig::config_for_test());
         let start_key = KeySlice::from("key_start".as_bytes());
         let end_key = KeySlice::from("key_end".as_bytes());
         assert_eq!(
@@ -1436,8 +1463,7 @@ mod test {
         let single_table_level = super::Level::new(vec![table_1.clone()], false);
         let single_table_level_storage = super::LevelStorege::new(
             vec![single_table_level],
-            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
         let start_key = KeySlice::from("000120".as_bytes());
         let end_key = KeySlice::from("000180".as_bytes());
@@ -1479,8 +1505,9 @@ mod test {
             ],
             true, // Level 0
         );
-        let mut level_storage =
-            super::LevelStorege::new(vec![level0], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+        let mut config = LevelStoregeConfig::config_for_test();
+        config.level_zero_num_limit = 4;
+        let mut level_storage = super::LevelStorege::new(vec![level0], config);
 
         // Level 0 limit is MAX_LEVEL_ZERO_TABLE_SIZE = 4, so with 4 tables, no compaction needed
         let (tables_to_compact, changes) = level_storage.take_out_table_to_compact(0);
@@ -1516,8 +1543,7 @@ mod test {
                 super::Level::new(vec![], true), // Empty level 0
                 level1,
             ],
-            2,
-            10, // Added level_ratio
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Level 1 limit is level_zero_num_limit * level_ratio^1 = 2 * 10^1 = 20
@@ -1530,7 +1556,7 @@ mod test {
         // Test Case 3: Empty level
         let empty_level: Level<Memstore> = super::Level::new(vec![], false);
         let mut empty_level_storage =
-            super::LevelStorege::new(vec![empty_level], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![empty_level], LevelStoregeConfig::config_for_test());
         let (tables_to_compact3, changes3) = empty_level_storage.take_out_table_to_compact(0);
 
         assert_eq!(tables_to_compact3.len(), 0);
@@ -1554,17 +1580,21 @@ mod test {
                 super::Level::new(vec![], true), // Empty level 0
                 level_many,
             ],
-            2,
-            10, // level_ratio = 10
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Level 1 limit is 2 * 10^1 = 20.
-        // With 25 tables, should take out 5 (25 - 20 = 5)
+        // With 25 tables, should take out 1
         let (tables_to_compact4, changes4) = level_storage_many.take_out_table_to_compact(1);
-        assert_eq!(tables_to_compact4.len(), 5); // Expect 5 tables to be compacted
-        assert_eq!(level_storage_many.levels[1].sstables.len(), 20); // Expect 20 tables remaining
+        assert_eq!(
+            tables_to_compact4.len(),
+            config.max_input_table_num_in_compact
+        ); // Expect 1 tables to be compacted
+        assert_eq!(
+            level_storage_many.levels[1].sstables.len(),
+            num_tables - config.max_input_table_num_in_compact
+        ); // Expect 20 tables remaining
 
-        // Should get tables with smallest store_ids (0, 1, 2, 3, 4)
         let mut compacted_ids: Vec<u64> = tables_to_compact4
             .iter()
             .map(|table| table.store_id())
@@ -1572,10 +1602,10 @@ mod test {
         compacted_ids.sort();
         assert_eq!(
             compacted_ids,
-            vec![0u64, 1u64, 2u64, 3u64, 4u64] // Expect IDs 0, 1, 2, 3, 4
+            vec![0] // Expect IDs 0
         );
         // Verify table_change for multiple deletions
-        assert_eq!(changes4.len(), 5); // Expect 5 changes
+        assert_eq!(changes4.len(), 1); // Expect 5 changes
         let mut changed_ids: Vec<u64> = changes4.iter().map(|c| c.id).collect();
         changed_ids.sort();
         assert_eq!(changed_ids, compacted_ids); // IDs should match
@@ -1607,7 +1637,7 @@ mod test {
             true,
         );
         let mut level_storage =
-            super::LevelStorege::new(vec![level0], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![level0], LevelStoregeConfig::config_for_test());
 
         // Before compaction: Level 0 has 5 tables, no Level 1
         assert_eq!(level_storage.levels.len(), 1);
@@ -1716,8 +1746,7 @@ mod test {
                 super::Level::new(vec![], true), // Empty level 0
                 level1_many,
             ],
-            2,
-            10, // level_ratio = 10
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Before compaction: Level 1 has 25 tables. Limit is 2 * 10^1 = 20.
@@ -1740,14 +1769,14 @@ mod test {
         // After compaction: Level 1 should have 20 tables (limit). Level 2 should be created.
         // 5 tables (25 - 20) should be compacted from L1 to L2.
         assert_eq!(level_storage_multi.levels.len(), 3); // Level 2 should be created
-        assert_eq!(level_storage_multi.levels[1].sstables.len(), 20); // Level 1 reduced to limit
+        assert_eq!(level_storage_multi.levels[1].sstables.len(), 24); // Level 1 reduced to limit
         assert!(!level_storage_multi.levels[2].sstables.is_empty()); // Level 2 has compacted data
 
         // Test Case 3: No compaction needed (all levels within limits)
         let small_table = Arc::new(create_test_table_with_id(0..10, 999u64));
         let level0_small = super::Level::new(vec![small_table], true);
         let mut level_storage_small =
-            super::LevelStorege::new(vec![level0_small], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![level0_small], LevelStoregeConfig::config_for_test());
 
         let original_len = level_storage_small.levels.len();
         let original_table_count = level_storage_small.levels[0].sstables.len();
@@ -1775,7 +1804,7 @@ mod test {
 
         // Test Case 4: Empty level storage
         let mut empty_level_storage: LevelStorege<Memstore> =
-            super::LevelStorege::new(vec![], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![], LevelStoregeConfig::config_for_test());
 
         // Should not panic and remain empty
         let mut start_id_case4 = 4000;
@@ -1835,9 +1864,15 @@ mod test {
     #[test]
     fn test_max_table_in_level() {
         // Create LevelStorege instances with specific limits
-        let level_storage_ratio2 = LevelStorege::<Memstore>::new(vec![], 4, 2); // level_zero_limit=4, ratio=2
-        let level_storage_ratio3 = LevelStorege::<Memstore>::new(vec![], 4, 3); // level_zero_limit=4, ratio=3
-        let level_storage_limit2_ratio10 = LevelStorege::<Memstore>::new(vec![], 2, 10); // level_zero_limit=2, ratio=10
+        let mut config = LevelStoregeConfig::config_for_test();
+        config.level_zero_num_limit = 4;
+        let level_storage_ratio2 = LevelStorege::<Memstore>::new(vec![], config); // level_zero_limit=4, ratio=2
+        config.level_ratio = 3;
+        config.level_zero_num_limit = 4;
+        let level_storage_ratio3 = LevelStorege::<Memstore>::new(vec![], config); // level_zero_limit=4, ratio=3
+        config.level_zero_num_limit = 2;
+        config.level_ratio = 10;
+        let level_storage_limit2_ratio10 = LevelStorege::<Memstore>::new(vec![], config); // level_zero_limit=2, ratio=10
 
         // Test level 0
         assert_eq!(level_storage_ratio2.max_table_in_level(0), 4);
@@ -1888,8 +1923,7 @@ mod test {
         let empty_level1 = super::Level::new(vec![], false);
         let mut level_storage = super::LevelStorege::new(
             vec![level0, empty_level1],
-            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Perform compaction from level 0 to level 1
@@ -2244,8 +2278,7 @@ mod test {
         let level1 = super::Level::new(vec![table_l1_a.clone(), table_l1_b.clone()], false);
         let mut level_storage = super::LevelStorege::new(
             vec![level0_empty, level1],
-            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Create a new table (table_c) that will be compacted into level 1.
@@ -2306,7 +2339,7 @@ mod test {
         let level0 = super::Level::new(vec![table_l0_a.clone(), table_l0_b.clone()], true);
         let level1 = super::Level::new(vec![table_l1_x.clone(), table_l1_y.clone()], false);
         let mut level_storage =
-            super::LevelStorege::new(vec![level0, level1], DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE, 2);
+            super::LevelStorege::new(vec![level0, level1], LevelStoregeConfig::config_for_test());
 
         // Perform compaction
         let input_tables = vec![table_l0_a.clone(), table_l0_b.clone()];
@@ -2407,8 +2440,7 @@ mod test {
         let level1_case2 = super::Level::new(vec![table_l1_z.clone(), table_l1_w.clone()], false);
         let mut level_storage_case2 = super::LevelStorege::new(
             vec![level0_case2, level1_case2],
-            DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
 
         // Perform compaction
@@ -2483,14 +2515,16 @@ mod test {
     #[test]
     fn test_table_len_in_levels() {
         // Case 1: Empty LevelStorege
-        let empty_storage = LevelStorege::<Memstore>::new(vec![], 4, 2);
+        let empty_storage =
+            LevelStorege::<Memstore>::new(vec![], LevelStoregeConfig::config_for_test());
         assert_eq!(empty_storage.table_num_in_levels(), vec![] as Vec<usize>);
 
         // Case 2: Single level with tables
         let table1 = Arc::new(create_test_table_with_id(0..10, 1));
         let table2 = Arc::new(create_test_table_with_id(10..20, 2));
         let level0 = Level::new(vec![table1.clone(), table2.clone()], true);
-        let storage_single_level = LevelStorege::new(vec![level0], 4, 2);
+        let storage_single_level =
+            LevelStorege::new(vec![level0], LevelStoregeConfig::config_for_test());
         assert_eq!(storage_single_level.table_num_in_levels(), vec![2]);
 
         // Case 3: Multiple levels with different table counts
@@ -2509,8 +2543,7 @@ mod test {
                 level2,                                 // Level 2: 0 tables
                 level3,                                 // Level 3: 3 tables
             ],
-            4,
-            2,
+            LevelStoregeConfig::config_for_test(),
         );
         assert_eq!(storage_multi_level.table_num_in_levels(), vec![2, 1, 0, 3]);
     }
@@ -2518,7 +2551,8 @@ mod test {
     #[test]
     fn test_push_new_table() {
         // Create an empty LevelStorege
-        let mut level_storage = LevelStorege::<Memstore>::new(vec![], 4, 2);
+        let mut level_storage =
+            LevelStorege::<Memstore>::new(vec![], LevelStoregeConfig::config_for_test());
         let mut next_id: StoreId = 100;
 
         // Case 1: Push data that fits into one table
@@ -2598,7 +2632,8 @@ mod test {
         // (This requires adjusting TableBuilder/BlockBuilder logic or creating lots of data)
 
         // Reset storage for this case
-        let mut level_storage_multi = LevelStorege::<Memstore>::new(vec![], 4, 2);
+        let mut level_storage_multi =
+            LevelStorege::<Memstore>::new(vec![], LevelStoregeConfig::config_for_test());
         let mut next_id_multi: StoreId = 200;
 
         // Create enough data to likely span multiple tables.

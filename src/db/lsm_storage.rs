@@ -7,6 +7,7 @@ use std::usize;
 use tracing::info;
 
 use crate::db::common::*;
+use crate::db::db_log;
 use crate::db::level::LevelStorege;
 use crate::db::logfile::LogFile;
 use crate::db::memtable::Memtable;
@@ -16,6 +17,8 @@ use crate::db::store::Store;
 use crate::db::table::TableReader;
 
 use super::key::KeySlice;
+use super::level;
+use super::level::LevelStoregeConfig;
 use super::level::TableChange;
 use super::store::StoreId;
 
@@ -23,17 +26,15 @@ use super::store::StoreId;
 pub struct LsmStorageConfig {
     pub block_size: usize,
     pub sstable_size: usize,
-    pub level_factor: usize,
-    pub first_level_sstable_num: usize,
     pub memtable_size_limit: usize,
+    pub level_config: LevelStoregeConfig,
 }
 impl Default for LsmStorageConfig {
     fn default() -> Self {
         LsmStorageConfig {
             block_size: 4096,              // 4kb
             sstable_size: 4 * 1024 * 1024, //4M
-            level_factor: 4,
-            first_level_sstable_num: 4,
+            level_config: LevelStoregeConfig::default(),
             memtable_size_limit: 2 * 1024 * 1024, //4MB
         }
     }
@@ -43,8 +44,7 @@ impl LsmStorageConfig {
         LsmStorageConfig {
             block_size: 128,
             sstable_size: 512, //4M
-            level_factor: 2,
-            first_level_sstable_num: 2,
+            level_config: LevelStoregeConfig::config_for_test(),
             memtable_size_limit: 512, //4MB
         }
     }
@@ -76,7 +76,7 @@ impl<T: Store> LsmStorage<T> {
         LsmStorage {
             m: Arc::new(Memtable::new(config.memtable_size_limit)),
             imm: Vec::new(),
-            current: LevelStorege::new(vec![], config.first_level_sstable_num, config.level_factor),
+            current: LevelStorege::new(vec![], config.level_config),
         }
     }
 
@@ -85,6 +85,7 @@ impl<T: Store> LsmStorage<T> {
     }
 
     pub fn log_lsm_debug_info(&self) {
+        db_log::enable_log();
         // Print active memtable size
         tracing::debug!(
             "LsmStorage Debug Info:\n  Active Memtable Size: {} bytes",
@@ -101,24 +102,29 @@ impl<T: Store> LsmStorage<T> {
         );
 
         // Print information for tables in each level
-        tracing::debug!("  Levels:");
+        let mut levels_log_info = String::from("  Levels:\n");
         let levels_info = self.current.get_tables_level();
         for (level_idx, level_tables) in levels_info.iter().enumerate() {
-            tracing::debug!("    Level {}: ({} tables)", level_idx, level_tables.len());
+            levels_log_info.push_str(&format!(
+                "    Level {}: ({} tables)\n",
+                level_idx,
+                level_tables.len()
+            ));
             if level_tables.is_empty() {
-                tracing::debug!("      [Empty]");
+                levels_log_info.push_str("      [Empty]\n");
             } else {
                 for table in level_tables {
                     let (first_key, last_key) = table.key_range();
-                    tracing::debug!(
-                        "      Table ID: {}, Key Range: [\"{}\" -> \"{}\"]",
+                    levels_log_info.push_str(&format!(
+                        "      Table ID: {}, Key Range: [\"{}\" -> \"{}\"]\n",
                         table.store_id(),
                         first_key.to_string(),
                         last_key.to_string()
-                    );
+                    ));
                 }
             }
         }
+        tracing::debug!("{}", levels_log_info);
     }
     pub fn compact_level(&mut self, next_store_id: &mut StoreId) -> Vec<TableChange> {
         self.current.compact_storage(next_store_id)
@@ -243,6 +249,7 @@ mod test {
     use super::{LsmStorage, LsmStorageConfig};
     use crate::db::common::{KVOpertion, KeyQuery, OpType};
     use crate::db::key::{KeyBytes, KeySlice, KeyVec};
+    use crate::db::level::LevelStoregeConfig;
     use crate::db::store::Memstore;
 
     /// Tests the basic put and get functionality of the LsmStorage.
@@ -252,9 +259,8 @@ mod test {
         let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
-            level_factor: 10,
-            first_level_sstable_num: 2,
             memtable_size_limit: 1024, // Small capacity for testing
+            level_config: LevelStoregeConfig::default(),
         };
         let lsm = LsmStorage::<Memstore>::new(config);
 
@@ -297,9 +303,8 @@ mod test {
         let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
-            level_factor: 10,
-            first_level_sstable_num: 2,
             memtable_size_limit: 1024,
+            level_config: LevelStoregeConfig::default(),
         };
 
         // Create a dummy table for Level 0
@@ -311,11 +316,8 @@ mod test {
         let level1 = crate::db::level::Level::new(vec![Arc::new(table_lvl1)], false);
 
         // Create LevelStorege with these levels
-        let level_storage = crate::db::level::LevelStorege::new(
-            vec![level0, level1],
-            config.first_level_sstable_num,
-            config.level_factor,
-        );
+        let level_storage =
+            crate::db::level::LevelStorege::new(vec![level0, level1], config.level_config);
 
         // Create LsmStorage from the configured levels
         let lsm = LsmStorage::<Memstore>::from(config, level_storage);
@@ -374,9 +376,8 @@ mod test {
         let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
-            level_factor: 10,
-            first_level_sstable_num: 2,
             memtable_size_limit: 1024,
+            level_config: LevelStoregeConfig::default(),
         };
         let mut lsm = LsmStorage::<Memstore>::new(config);
 
@@ -516,9 +517,8 @@ mod test {
         let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
-            level_factor: 10,
-            first_level_sstable_num: 2,
             memtable_size_limit: 1024, // Small capacity for testing
+            level_config: LevelStoregeConfig::default(),
         };
         let lsm = LsmStorage::<Memstore>::new(config);
 
@@ -596,9 +596,8 @@ mod test {
         let config = LsmStorageConfig {
             block_size: 4096,
             sstable_size: 1024 * 1024,
-            level_factor: 10,
-            first_level_sstable_num: 2,
             memtable_size_limit: 1024, // Small capacity
+            level_config: LevelStoregeConfig::config_for_test(),
         };
         let mut lsm = LsmStorage::<Memstore>::new(config);
         let mut next_sstable_id: u64 = 100;
