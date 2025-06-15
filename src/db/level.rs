@@ -9,8 +9,10 @@ use std::{
 use anyhow::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::Hasher;
+use tracing::info;
 
 use crate::db::{common::KViterAgg, key::KeyBytes};
+use tracing::debug;
 
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
@@ -258,6 +260,13 @@ impl<T: Store> LevelStorege<T> {
             .collect()
     }
 
+    pub fn get_tables_level(&self) -> Vec<Vec<ThreadSafeTableReader<T>>> {
+        self.levels
+            .iter()
+            .map(|level| level.sstables.clone())
+            .collect()
+    }
+
     // add new table from iterator `it` to level 0.
     // `next_sstable_id` is used to generate a unique ID for the new table and is incremented.
     pub fn push_new_table<P: Iterator<Item = KVOpertion>>(
@@ -284,12 +293,7 @@ impl<T: Store> LevelStorege<T> {
         // Keep track of the tables created in this push operation
         let mut created_tables = Vec::new();
 
-        let mut print = false;
         while let Some(op) = it.next() {
-            if !print {
-                println!("dump key is {:?}", op.key);
-                print = true;
-            }
             // Try adding the operation to the current builder
             if !table_builder.add(op.clone()) {
                 // If add fails, the current builder is full.
@@ -323,6 +327,7 @@ impl<T: Store> LevelStorege<T> {
         // Add all newly created tables to the beginning of level 0 in reverse order
         // so the table containing the latest data appears first.
         for table_reader in created_tables.into_iter().rev() {
+            info!(id = table_reader.store_id(), "dump memtable to level zero");
             self.levels[0].sstables.insert(0, table_reader);
         }
         // If the iterator was empty and no tables were created, this function effectively does nothing.
@@ -361,6 +366,7 @@ impl<T: Store> LevelStorege<T> {
     /// # Returns
     /// A `Vec<TableChange>` detailing all table additions and deletions that occurred.
     pub fn compact_storage(&mut self, mut next_store_id: &mut u64) -> Vec<TableChange> {
+        info!("start compact storage");
         let mut table_change = Vec::new();
         // Iterate through all levels starting from level 0
         for level_depth in 0..self.levels.len() {
@@ -393,6 +399,15 @@ impl<T: Store> LevelStorege<T> {
 
             // After compacting one level, we might need to check if the target level
             // now also needs compaction, but we'll handle that in the next iteration
+        }
+        for change in &table_change {
+            debug!(
+                level = change.level,
+                index = change.index,
+                id = change.id,
+                change_type = ?change.change_type,
+                "table change during lsm compaction"
+            );
         }
         return table_change;
     }
@@ -460,6 +475,18 @@ impl<T: Store> LevelStorege<T> {
         input_tables: Vec<ThreadSafeTableReader<T>>,
         level_depth: usize,
     ) -> Vec<TableChange> {
+        info!(level = level_depth, "compact level");
+        if tracing::event_enabled!(tracing::Level::DEBUG) {
+            for table in &input_tables {
+                let (min_key, max_key) = table.key_range();
+                debug!(
+                    store_id = table.store_id(),
+                    min_key = %min_key.to_string(),
+                    max_key = %max_key.to_string(),
+                    "compacting input table"
+                );
+            }
+        }
         let target_level = level_depth + 1;
 
         if input_tables.is_empty() {
@@ -635,6 +662,15 @@ impl<T: Store> LevelStorege<T> {
             }
         }
 
+        for change in &table_change {
+            debug!(
+                level = change.level,
+                index = change.index,
+                id = change.id,
+                change_type = ?change.change_type,
+                "compact_level table change"
+            );
+        }
         table_change
     }
 
@@ -1581,7 +1617,6 @@ mod test {
         let mut start_id_case1 = 1000;
         let original_start_id = start_id_case1;
         let table_changes = level_storage.compact_storage(&mut start_id_case1);
-        println!("{:?}", table_changes);
 
         // Find the maximum store ID among the newly added tables in level 1
         let max_new_id_case1 = table_changes

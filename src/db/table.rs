@@ -15,6 +15,7 @@ use crate::db::{
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
+use tracing::debug;
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
@@ -73,6 +74,7 @@ pub struct TableReader<T: Store> {
 // for level 0,must consider multiple key with diff value/or delete
 impl<T: Store> TableReader<T> {
     pub fn new(store_id: StoreId) -> Self {
+        debug!(id = store_id, "table read new witht id ");
         let store = open_store::<T>(store_id);
         Self::new_with_store_for_test(store)
     }
@@ -258,6 +260,7 @@ pub struct TableBuilder<T: Store> {
 }
 impl<T: Store> TableBuilder<T> {
     pub fn new_with_store_for_test(store: T) -> Self {
+        debug!(id = store.id(), "table_builder new with store");
         Self {
             store,
             block_metas: Vec::new(),
@@ -267,6 +270,7 @@ impl<T: Store> TableBuilder<T> {
         }
     }
     pub fn new_with_id_and_block_count_limit(store_id: StoreId, block_num_limit: usize) -> Self {
+        debug!(id = store_id, "table_builder new with store");
         Self {
             store: open_store(store_id),
             block_metas: Vec::new(),
@@ -277,6 +281,7 @@ impl<T: Store> TableBuilder<T> {
     }
 
     pub fn new_with_id(store_id: StoreId) -> Self {
+        debug!(id = store_id, "table_builder new with store");
         Self {
             store: open_store(store_id),
             block_metas: Vec::new(),
@@ -600,7 +605,6 @@ pub mod test {
         let mut kv_index = 0; // Track index in the original kvs Vec
 
         for kv in table_iter {
-            println!("hi");
             // Find the corresponding original kv operation
             // This assumes the order is preserved, which should be the case
             // if KViterAgg sorts correctly.

@@ -1,5 +1,7 @@
 use std::{fs::File, io::Write, path::PathBuf};
 
+use tracing::info;
+
 pub type StoreId = u64;
 // append only data store
 pub trait Store {
@@ -97,6 +99,7 @@ impl Filestore {
 impl Store for Filestore {
     fn flush(&mut self) {
         let _ = self.f.sync_data();
+        info!(store_id = self.id(), "filestore flush");
     }
     fn id(&self) -> StoreId {
         self.id

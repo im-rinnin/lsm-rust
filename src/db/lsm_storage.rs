@@ -4,6 +4,8 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::usize;
 
+use tracing::info;
+
 use crate::db::common::*;
 use crate::db::level::LevelStorege;
 use crate::db::logfile::LogFile;
@@ -39,11 +41,11 @@ impl Default for LsmStorageConfig {
 impl LsmStorageConfig {
     pub fn config_for_test() -> Self {
         LsmStorageConfig {
-            block_size: 4096,
-            sstable_size: 4 * 1024 * 1024, //4M
+            block_size: 128,
+            sstable_size: 512, //4M
             level_factor: 2,
-            first_level_sstable_num: 4,
-            memtable_size_limit: 4 * 1024 * 1024, //4MB
+            first_level_sstable_num: 2,
+            memtable_size_limit: 512, //4MB
         }
     }
 }
@@ -81,6 +83,43 @@ impl<T: Store> LsmStorage<T> {
     pub fn table_num_in_levels(&self) -> Vec<usize> {
         self.current.table_num_in_levels()
     }
+
+    pub fn log_lsm_debug_info(&self) {
+        // Print active memtable size
+        tracing::debug!(
+            "LsmStorage Debug Info:\n  Active Memtable Size: {} bytes",
+            self.m.get_size()
+        );
+
+        // Print immutable memtable info
+        let imm_tables_num = self.imm.len();
+        let imm_tables_size: usize = self.imm.iter().map(|mem| mem.get_size()).sum();
+        tracing::debug!(
+            "  Immutable Memtables: {} (Total Size: {} bytes)",
+            imm_tables_num,
+            imm_tables_size
+        );
+
+        // Print information for tables in each level
+        tracing::debug!("  Levels:");
+        let levels_info = self.current.get_tables_level();
+        for (level_idx, level_tables) in levels_info.iter().enumerate() {
+            tracing::debug!("    Level {}: ({} tables)", level_idx, level_tables.len());
+            if level_tables.is_empty() {
+                tracing::debug!("      [Empty]");
+            } else {
+                for table in level_tables {
+                    let (first_key, last_key) = table.key_range();
+                    tracing::debug!(
+                        "      Table ID: {}, Key Range: [\"{}\" -> \"{}\"]",
+                        table.store_id(),
+                        first_key.to_string(),
+                        last_key.to_string()
+                    );
+                }
+            }
+        }
+    }
     pub fn compact_level(&mut self, next_store_id: &mut StoreId) -> Vec<TableChange> {
         self.current.compact_storage(next_store_id)
     }
@@ -98,6 +137,7 @@ impl<T: Store> LsmStorage<T> {
 
         // Add the old memtable to the immutable list.
         self.imm.push(old_m);
+        info!("freeze_memtable");
 
         // No need to return Self, modification happens in place.
     }
