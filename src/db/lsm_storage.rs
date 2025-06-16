@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::usize;
 
 use tracing::info;
+use tracing_subscriber::filter::Targets;
 
 use crate::db::common::*;
 use crate::db::db_log;
@@ -79,7 +80,14 @@ impl<T: Store> LsmStorage<T> {
         self.current.table_num_in_levels()
     }
 
+    pub fn need_compact(&self) -> bool {
+        self.current.need_compact()
+    }
+
     pub fn log_lsm_debug_info(&self) {
+        if !tracing::event_enabled!(tracing::Level::INFO) {
+            return;
+        }
         let mut debug_info = String::new();
         debug_info.push_str("LsmStorage Debug Info:\n");
 

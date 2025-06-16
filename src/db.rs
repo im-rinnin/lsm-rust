@@ -260,6 +260,18 @@ impl<T: Store> LsmDB<T> {
         lsm_storage_guard.memtable_size()
         // Lock released
     }
+
+    /// Checks if the stop signal has been received for the compaction thread.
+    /// Returns `true` if the thread should stop, `false` otherwise.
+    fn check_compact_thread_stop_signal(stop: &Arc<Mutex<bool>>) -> bool {
+        let stop_flag_inner = stop.lock().unwrap();
+        if *stop_flag_inner {
+            info!("thread received stop signal during in-loop compaction.");
+            return true; // Signal to exit the loop
+        }
+        false // Continue operation
+    }
+
     fn dump_and_compact_thread(
         current: Arc<RwLock<LsmStorage<T>>>,
         mut meta: TableChangeLog<Memstore>,
@@ -270,14 +282,9 @@ impl<T: Store> LsmDB<T> {
         statistic: Arc<DBStatistic>,
     ) {
         loop {
-            // Check if stop signal is received
-            let stop_flag = stop.lock().unwrap();
-            if *stop_flag {
-                info!("compact thread exit");
-                break; // Exit the loop if stop flag is true
+            if Self::check_compact_thread_stop_signal(&stop) {
+                break; // Exit the inner loop and then the outer loop
             }
-            drop(stop_flag); // Release the mutex guard
-
             // Wait for a manual compaction trigger or timeout
             let res = run_job.recv_timeout(Duration::from_millis(config.thread_sleep_time));
             match res {
@@ -297,34 +304,37 @@ impl<T: Store> LsmDB<T> {
                 }
             }
 
-            let mut lsm_storage_clone = current.read().unwrap().clone();
+            // Perform compaction and loop immediately if more compaction is needed
+            loop {
+                if Self::check_compact_thread_stop_signal(&stop) {
+                    break; // Exit the inner loop and then the outer loop
+                }
 
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                info!("before dump and compact");
+                let mut lsm_storage_clone = current.read().unwrap().clone();
+                info!("dump and compact ");
                 lsm_storage_clone.log_lsm_debug_info();
-            }
+                // Dump all immutable memtables until none are left
+                if lsm_storage_clone.immtable_num() > 0 {
+                    lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
+                }
 
-            // Dump all immutable memtables until none are left
-            if lsm_storage_clone.immtable_num() > 0 {
-                lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
-            }
+                let table_changes = lsm_storage_clone.compact_level(&mut next_sstable_id);
+                if table_changes.len() > 0 {
+                    meta.append(table_changes); // Persist changes to the TableChangeLog
+                }
 
-            // Check level zero size and compact if needed
-            // Get the current number of tables in level 0, defaulting to 0 if level 0 doesn't exist yet
-            let table_changes = lsm_storage_clone.compact_level(&mut next_sstable_id);
-            if table_changes.len() > 0 {
-                meta.append(table_changes); // Persist changes to the TableChangeLog
-            }
-
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                info!("after dump and compact");
+                info!("after a compact cycle");
                 lsm_storage_clone.log_lsm_debug_info();
-            }
 
-            // update currrent
-            *current.write().unwrap() = lsm_storage_clone;
-            statistic.compact_count.fetch_add(1, Ordering::SeqCst);
-            info!("compact finish");
+                let need_compact = lsm_storage_clone.need_compact();
+                // Update current LsmStorage state
+                *current.write().unwrap() = lsm_storage_clone;
+                statistic.compact_count.fetch_add(1, Ordering::SeqCst);
+                info!("compact finish");
+                if !need_compact {
+                    break;
+                }
+            }
         }
     }
 
@@ -355,12 +365,9 @@ impl<T: Store> LsmDB<T> {
         let mut total_buffered_size = 0; // Total size of requests in buffered_requests
 
         loop {
-            // Check if stop signal is received
-            let stop_flag = stop.lock().unwrap();
-            if *stop_flag {
-                break; // Exit the loop if stop flag is true
+            if Self::check_compact_thread_stop_signal(&stop) {
+                break; // Exit the loop if stop signal is true
             }
-            drop(stop_flag); // Release the mutex guard
 
             // Try to receive and buffer new requests
             while let Ok(request) = request_queue_r.try_recv() {
@@ -410,14 +417,9 @@ impl<T: Store> LsmDB<T> {
                         );
                         std::thread::sleep(std::time::Duration::from_millis(c.thread_sleep_time));
                         lsm_storage_guard = current_lsm.write().unwrap(); // Re-acquire lock
-                        let stop_flag_inner = stop.lock().unwrap();
-                        if *stop_flag_inner {
-                            info!(
-                                "Write worker received stop signal while waiting for compaction."
-                            );
-                            break; // Break out of the inner while loop
+                        if Self::check_compact_thread_stop_signal(&stop) {
+                            break; // Exit the loop if stop signal is true
                         }
-                        drop(stop_flag_inner);
                     }
                 }
             }
