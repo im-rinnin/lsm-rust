@@ -289,6 +289,7 @@ impl<T: Store> LsmDB<T> {
                     if !config.auto_compact {
                         continue;
                     }
+                    info!("timeout start compact");
                     // time out , proceed with compaction logic below
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -409,6 +410,14 @@ impl<T: Store> LsmDB<T> {
                         );
                         std::thread::sleep(std::time::Duration::from_millis(c.thread_sleep_time));
                         lsm_storage_guard = current_lsm.write().unwrap(); // Re-acquire lock
+                        let stop_flag_inner = stop.lock().unwrap();
+                        if *stop_flag_inner {
+                            info!(
+                                "Write worker received stop signal while waiting for compaction."
+                            );
+                            break; // Break out of the inner while loop
+                        }
+                        drop(stop_flag_inner);
                     }
                 }
             }
@@ -521,9 +530,10 @@ impl<T: Store> DBReader<T> {
 }
 #[cfg(test)]
 mod test {
-    use super::{Config, KeyBytes, OpType, ValueByte, WriteRequest};
+    use super::{Config, DBWriter, KeyBytes, OpType, ValueByte, WriteRequest};
     use crate::db::db_log;
     use crate::db::{store::Memstore, LsmDB};
+    use crossbeam_channel::Receiver;
     use std::mem::size_of;
     use std::sync::atomic::Ordering;
     use tracing::{info, Level};
@@ -544,24 +554,12 @@ mod test {
         config: Config,
         start_key: u64,
         num_kvs: usize,
+        manual_trigger: bool,
     ) -> HashMap<KeyBytes, ValueByte> {
         let mut writer = db.get_writer();
-        let mut kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_kvs);
-        let mut expected_data: HashMap<KeyBytes, ValueByte> = HashMap::with_capacity(num_kvs);
-
-        for i in 0..num_kvs {
-            let current_key_idx = start_key + i as u64;
-            let key_str = pad_zero(current_key_idx);
-            let value_str = format!("value_{}", current_key_idx);
-            let key_bytes = KeyBytes::from(key_str.as_bytes());
-            let value_bytes = ValueByte::from(value_str.as_bytes());
-            kvs_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
-            expected_data.insert(key_bytes, value_bytes);
-        }
-
-        let r = writer.put(kvs_to_write);
+        let (r, expected_data) = write_kvs(&mut writer, start_key, num_kvs);
         let _ = r.recv();
-        wait_for_compact(db, config);
+        wait_for_compact(db, config, manual_trigger);
         expected_data
     }
 
@@ -971,11 +969,13 @@ mod test {
         }
     }
 
-    fn wait_for_compact(db: &mut LsmDB<Memstore>, config: crate::db::Config) {
+    fn wait_for_compact(db: &mut LsmDB<Memstore>, config: crate::db::Config, manual_trigger: bool) {
         let initial_compact_count = db.statistic.compact_count.load(Ordering::SeqCst);
 
-        // Trigger compaction manually.
-        db.trigger_compact();
+        if manual_trigger {
+            // Trigger compaction manually.
+            db.trigger_compact();
+        }
 
         // Loop and wait for compact_count to increase by at least one.
         let mut loop_count = 0;
@@ -997,6 +997,165 @@ mod test {
         }
     }
 
+    /// Helper function to prepare KV operations and send them to the writer.
+    fn write_kvs(
+        writer: &mut DBWriter,
+        start_key: u64,
+        num_kvs: usize,
+    ) -> (Receiver<()>, HashMap<KeyBytes, ValueByte>) {
+        let mut kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_kvs);
+        let mut expected_data: HashMap<KeyBytes, ValueByte> = HashMap::with_capacity(num_kvs);
+
+        for i in 0..num_kvs {
+            let current_key_idx = start_key + i as u64;
+            let key_str = pad_zero(current_key_idx);
+            let value_str = format!("{}{}", "value_", current_key_idx);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            expected_data.insert(key_bytes, value_bytes);
+        }
+
+        let r = writer.put(kvs_to_write);
+        (r, expected_data)
+    }
+
+    /// Tests the backpressure mechanism where writes are blocked if too many immutable memtables are pending.
+    /// It verifies that writes resume after compaction clears the pending memtables.
+    #[test]
+    fn test_backpressure() {
+        // Setup: Config with small memtable limit, imm_size_limit = 2, auto_compact = false
+        let mut config = crate::db::Config::config_for_test();
+        config.lsm_storage_config.memtable_size_limit = 1000; // Small limit for testing
+        config.imm_size_limit = 2; // Allow only one immutable memtable before backpressure
+        config.auto_compact = false; // Disable auto-compaction for manual control
+        config.thread_sleep_time = 10; // Shorter sleep time for faster test feedback
+
+        let mut db = LsmDB::<Memstore>::new_with_memstore(config);
+        let mut writer = db.get_writer();
+
+        let kvs_per_batch = 50; // Each KV is roughly 20 bytes (key+value+metadata), 50 KVs = 1KB
+        let mut total_expected_data: HashMap<KeyBytes, ValueByte> = HashMap::new();
+
+        // 1. Write first batch: Fills memtable and freezes it. imm_num = 1.
+        info!("Test backpressure: Writing first batch");
+        let mut w = db.get_writer();
+        let (r, kvs1_data) = write_kvs(&mut w, 0, kvs_per_batch);
+        total_expected_data.extend(kvs1_data);
+        // Add a small sleep to allow the writer thread to process the request and freeze memtable
+        std::thread::sleep(std::time::Duration::from_millis(
+            config.thread_sleep_time * 2,
+        ));
+        // After this, one immutable memtable should exist.
+        assert_eq!(
+            db.get_reader().snapshot.immtable_num(),
+            1,
+            "Expected 1 immutable memtable after first write"
+        );
+        assert_eq!(
+            db.check_memtable_size(),
+            0,
+            "Active memtable should be empty after freeze"
+        );
+
+        // 2. Write second batch: Fills new memtable and freezes it. imm_num becomes 2.
+        // This will cause the write worker to enter backpressure sleep.
+        info!("Test backpressure: Writing second batch, expecting backpressure");
+        let mut kvs2_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(kvs_per_batch);
+        for i in kvs_per_batch..(kvs_per_batch * 2) {
+            let key_str = pad_zero(i as u64);
+            let value_str = format!("value_backpressure_{}", i);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs2_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            total_expected_data.insert(key_bytes, value_bytes);
+        }
+        let r2 = writer.put(kvs2_to_write);
+        // Do not wait for r2.recv() here, as it's expected to block the worker.
+        // The worker thread will process it and then block when it tries to freeze
+        // a *third* memtable and immtable_num() is already 2 >= imm_size_limit (1).
+
+        // Give the writer a moment to process the second batch and hit backpressure
+        std::thread::sleep(std::time::Duration::from_millis(
+            config.thread_sleep_time * 2,
+        ));
+        assert_eq!(
+            db.get_reader().snapshot.immtable_num(),
+            2,
+            "Expected 2 immutable memtables after second write"
+        );
+
+        // 3. Initiate a third write, which should immediately block the worker
+        // if the previous writes pushed it into backpressure.
+        info!("Test backpressure: Initiating third write, expecting it to block.");
+        let mut kvs3_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(1);
+        let key_str = pad_zero((kvs_per_batch * 2) as u64);
+        let value_str = format!("value_backpressure_{}", kvs_per_batch * 2);
+        let key_bytes = KeyBytes::from(key_str.as_bytes());
+        let value_bytes = ValueByte::from(value_str.as_bytes());
+        kvs3_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+        total_expected_data.insert(key_bytes, value_bytes);
+
+        let r3 = writer.put(kvs3_to_write);
+
+        // Verify the third write is blocked (or the write worker is in backpressure loop)
+        let blocked_timeout = std::time::Duration::from_millis(config.thread_sleep_time * 5);
+        let start_time = Instant::now();
+        let r3_result = r3.recv_timeout(blocked_timeout);
+        assert!(
+            r3_result.is_err(),
+            "Third write should be blocked due to backpressure, but it completed: {:?}",
+            r3_result
+        );
+        assert!(
+            start_time.elapsed() >= blocked_timeout,
+            "Third write was not blocked for the expected duration."
+        );
+        info!("Third write is blocked as expected.");
+
+        // 4. Trigger manual compaction
+        info!("Test backpressure: Triggering manual compaction.");
+        db.trigger_compact();
+        wait_for_compact(&mut db, config, false);
+        info!("Test backpressure: Compaction finished.");
+
+        // Verify the previously blocked second and third writes complete
+        r2.recv()
+            .expect("Second write should complete after compaction");
+        r3.recv()
+            .expect("Third write should complete after compaction");
+        info!("All pending writes completed after compaction.");
+
+        // Check levels: should have tables
+        assert!(
+            db.tables_count() > 0,
+            "After compaction, tables should exist in levels"
+        );
+
+        // Verify all data by read from a fresh reader
+        info!("Test backpressure: Verifying all data.");
+        let final_reader = db.get_reader();
+        for (key, expected_val) in total_expected_data.iter() {
+            let result = final_reader.query(KeyVec::from(key.clone().as_ref()));
+            match result {
+                Some(kv_op) => {
+                    if let OpType::Write(actual_value) = kv_op.op {
+                        assert_eq!(
+                            actual_value.as_ref(),
+                            expected_val.as_ref(),
+                            "Final check: Value mismatch for key {:?}",
+                            key
+                        );
+                    } else {
+                        panic!("Final check: Expected Write op, got {:?}", kv_op.op);
+                    }
+                }
+                None => panic!("Final check: Key {:?} not found", key),
+            }
+        }
+        info!("Test backpressure: All data verified successfully.");
+    }
+
     /// Tests basic put and query functionality.
     /// It writes a large number of key-value pairs, waits for compaction,
     /// and then queries all keys to ensure data integrity and retrieval.
@@ -1015,7 +1174,7 @@ mod test {
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
 
         let num_kvs = 1000;
-        let expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs);
+        let expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs, true);
 
         assert_eq!(
             db.table_num_in_levels().len(),
