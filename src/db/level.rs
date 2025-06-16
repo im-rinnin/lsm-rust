@@ -376,6 +376,16 @@ impl<T: Store> LevelStorege<T> {
         return self.config.level_zero_num_limit * self.config.level_ratio.pow(level_depth as u32);
     }
 
+    pub fn need_compact(&self) -> bool {
+        for level_depth in 0..self.levels.len() {
+            let max_tables = self.max_table_in_level(level_depth);
+            if self.levels[level_depth].sstables.len() > max_tables {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Initiates the compaction process across all levels of the LSM storage.
     ///
     /// This function iterates through each level, identifies if compaction is needed
@@ -2079,6 +2089,100 @@ mod test {
             super::TableChangeLog::<Filestore>::from_file(file_for_read3, store_id);
         let retrieved_changes_empty_batch = log_reopened_empty_batch.get_all_changes().unwrap();
         assert_eq!(retrieved_changes_empty_batch.len(), 3); // Should still be 3, as empty batch adds no changes
+    }
+
+    /// Tests the `need_compact` method to ensure it correctly identifies when compaction is needed.
+    #[test]
+    fn test_need_compact() {
+        // Setup: Use a test config for LevelStorege
+        let config = LevelStoregeConfig::config_for_test(); // level_zero_num_limit = 2, level_ratio = 2
+
+        // Case 1: Empty storage - no compaction needed
+        let empty_storage = LevelStorege::<Memstore>::new(vec![], config);
+        assert!(
+            !empty_storage.need_compact(),
+            "Empty storage should not need compaction"
+        );
+
+        // Case 2: Level 0 below limit (1 table, limit is 2)
+        let table_a = Arc::new(create_test_table_with_id(0..10, 1u64));
+        let level0_one_table = Level::new(vec![table_a.clone()], true);
+        let storage_one_table = LevelStorege::new(vec![level0_one_table], config);
+        assert!(
+            !storage_one_table.need_compact(),
+            "Level 0 with 1 table should not need compaction"
+        );
+
+        // Case 3: Level 0 at limit (2 tables, limit is 2)
+        let table_b = Arc::new(create_test_table_with_id(10..20, 2u64));
+        let level0_at_limit = Level::new(vec![table_a.clone(), table_b.clone()], true);
+        let storage_at_limit = LevelStorege::new(vec![level0_at_limit], config);
+        assert!(
+            !storage_at_limit.need_compact(),
+            "Level 0 with 2 tables should not need compaction"
+        );
+
+        // Case 4: Level 0 exceeds limit (3 tables, limit is 2) - should need compaction
+        let table_c = Arc::new(create_test_table_with_id(20..30, 3u64));
+        let level0_exceeds_limit = Level::new(vec![table_a, table_b, table_c], true);
+        let storage_exceeds_limit = LevelStorege::new(vec![level0_exceeds_limit], config);
+        assert!(
+            storage_exceeds_limit.need_compact(),
+            "Level 0 with 3 tables should need compaction"
+        );
+
+        // Case 5: Multiple levels, one exceeds limit
+        // Level 0 (1 table, limit 2) - OK
+        // Level 1 (limit: 2 * 2^1 = 4)
+        // Level 1 with 5 tables - needs compaction
+        let table_d = Arc::new(create_test_table_with_id(30..40, 4u64));
+        let table_e = Arc::new(create_test_table_with_id(40..50, 5u64));
+        let table_f = Arc::new(create_test_table_with_id(50..60, 6u64));
+        let table_g = Arc::new(create_test_table_with_id(60..70, 7u64));
+        let table_h = Arc::new(create_test_table_with_id(70..80, 8u64)); // 5th table for L1
+
+        let level0_ok = Level::new(vec![table_d.clone()], true);
+        let level1_exceeds_limit =
+            Level::new(vec![table_d, table_e, table_f, table_g, table_h], false);
+        let storage_multi_level_needs_compact =
+            LevelStorege::new(vec![level0_ok, level1_exceeds_limit], config);
+        assert!(
+            storage_multi_level_needs_compact.need_compact(),
+            "Multi-level storage with L1 exceeding limit should need compaction"
+        );
+
+        // Case 6: Multiple levels, all within limits
+        // Level 0 (1 table, limit 2) - OK
+        // Level 1 (limit: 4) with 3 tables - OK
+        let table_i = Arc::new(create_test_table_with_id(80..90, 9u64));
+        let table_j = Arc::new(create_test_table_with_id(90..100, 10u64));
+        let table_k = Arc::new(create_test_table_with_id(100..110, 11u64));
+
+        let level0_ok_2 = Level::new(vec![table_i.clone()], true);
+        let level1_ok = Level::new(vec![table_i, table_j, table_k], false);
+        let storage_multi_level_ok = LevelStorege::new(vec![level0_ok_2, level1_ok], config);
+        assert!(
+            !storage_multi_level_ok.need_compact(),
+            "Multi-level storage with all levels within limits should not need compaction"
+        );
+
+        // Case 7: Level 0 does not exist, but subsequent levels might.
+        // `levels` vector might be `[empty_level1, empty_level2]` if they were initialized.
+        // The current implementation ensures `levels.len()` means the highest depth.
+        let storage_no_level0 = LevelStorege::<Memstore>::new(
+            vec![
+                Level::new(vec![], true), // Level 0 exists but is empty
+                Level::new(
+                    vec![Arc::new(create_test_table_with_id(0..10, 100u64))],
+                    false,
+                ), // Level 1 exists, 1 table, limit 4
+            ],
+            config,
+        );
+        assert!(
+            !storage_no_level0.need_compact(),
+            "Storage with empty L0 and valid L1 should not need compaction"
+        );
     }
 
     #[test]
