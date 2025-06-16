@@ -312,7 +312,8 @@ impl<T: Store> LevelStorege<T> {
         let new_table_id = *next_sstable_id;
         *next_sstable_id += 1;
 
-        let mut table_builder = TableBuilder::new_with_id_config(new_table_id,self.config.table_config);
+        let mut table_builder =
+            TableBuilder::new_with_id_config(new_table_id, self.config.table_config);
 
         // Fill the table builder with data from the iterator
         // Use a loop to handle potential errors or specific logic if `fill` isn't suitable
@@ -332,7 +333,8 @@ impl<T: Store> LevelStorege<T> {
                 // Create a new builder for the next table.
                 let new_table_id = *next_sstable_id;
                 *next_sstable_id += 1;
-                table_builder = TableBuilder::new_with_id_config(new_table_id,self.config.table_config);
+                table_builder =
+                    TableBuilder::new_with_id_config(new_table_id, self.config.table_config);
 
                 // Add the operation that didn't fit into the previous builder to the new one.
                 // This should always succeed on a fresh builder unless the single op is too large.
@@ -607,7 +609,8 @@ impl<T: Store> LevelStorege<T> {
         let mut compacted_tables = Vec::new();
 
         if let Some(mut op) = kv_iter_agg.next() {
-            let mut table_builder = TableBuilder::new_with_id_config(*store_id_start,self.config.table_config);
+            let mut table_builder =
+                TableBuilder::new_with_id_config(*store_id_start, self.config.table_config);
             *store_id_start += 1;
 
             loop {
@@ -622,7 +625,8 @@ impl<T: Store> LevelStorege<T> {
                     });
                     compacted_tables.push(Arc::new(new_table_reader));
 
-                    table_builder = TableBuilder::new_with_id_config(*store_id_start,self.config.table_config);
+                    table_builder =
+                        TableBuilder::new_with_id_config(*store_id_start, self.config.table_config);
                     *store_id_start += 1;
                     if !table_builder.add(op.clone()) {
                         panic!("Error: Single KVOperation is too large to fit in a new table block during compaction. Operation ID: {}", op.id);

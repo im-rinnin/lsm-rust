@@ -296,17 +296,6 @@ impl<T: Store> LsmDB<T> {
                 }
             }
 
-            {
-                // Acquire write lock for potential modifications (freeze and compact)
-                let mut lsm_storage_guard = current.write().unwrap();
-
-                // Check memtable size and freeze if needed
-                if lsm_storage_guard.memtable_size()
-                    >= config.lsm_storage_config.memtable_size_limit
-                {
-                    lsm_storage_guard.freeze_memtable();
-                }
-            }
             let mut lsm_storage_clone = current.read().unwrap().clone();
 
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -350,7 +339,7 @@ impl<T: Store> LsmDB<T> {
     fn write_worker(
         stop: Arc<Mutex<bool>>,
         request_queue_r: Receiver<WriteRequest>,
-        current_lsm_state: Arc<RwLock<LsmStorage<T>>>,
+        current_lsm: Arc<RwLock<LsmStorage<T>>>,
         mut logfile: LogFile<T>,
         mut next_op_id: Arc<AtomicU64>,
         c: Config,
@@ -397,12 +386,32 @@ impl<T: Store> LsmDB<T> {
                 Self::process_single_buffered_request(
                     request,
                     &mut logfile,
-                    &current_lsm_state,
+                    &current_lsm,
                     &next_op_id,
                 );
             }
             total_buffered_size = 0; // Reset total size after processing the batch
             first_request_time = None;
+
+            // Freeze memtable if it reaches the size limit
+            {
+                let mut lsm_storage_guard = current_lsm.write().unwrap();
+                if lsm_storage_guard.memtable_size() >= c.lsm_storage_config.memtable_size_limit {
+                    info!("Memtable size exceeded in write worker, freezing memtable.");
+                    lsm_storage_guard.freeze_memtable();
+
+                    // Check immutable memtable count and wait if it exceeds the limit
+                    while lsm_storage_guard.immtable_num() >= c.imm_size_limit {
+                        drop(lsm_storage_guard); // Release write lock before sleeping
+                        info!(
+                            "Too many immutable memtables ({}), waiting for compaction...",
+                            c.imm_size_limit
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(c.thread_sleep_time));
+                        lsm_storage_guard = current_lsm.write().unwrap(); // Re-acquire lock
+                    }
+                }
+            }
             // No sleep here, as work was done, we can immediately check for more work
         }
         // Note: The loop as written never exits. A mechanism to stop the worker is needed.
@@ -517,6 +526,7 @@ mod test {
     use crate::db::{store::Memstore, LsmDB};
     use std::mem::size_of;
     use std::sync::atomic::Ordering;
+    use tracing::{info, Level};
 
     use crate::db::block::test::pad_zero;
     use crate::db::key::{KeyVec, ValueVec};
