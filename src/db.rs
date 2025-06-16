@@ -1,6 +1,5 @@
 #![allow(unused)]
 use std::default;
-use std::env::set_var;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 use std::thread::{self, JoinHandle};
@@ -79,6 +78,7 @@ struct LsmDB<T: Store> {
     thread_handls: Vec<JoinHandle<()>>,
     trigger_compact: Sender<()>,
     statistic: Arc<DBStatistic>,
+    config: Config,
 }
 const SLEEP_TIME: u64 = 10;
 #[derive(Clone, Copy)]
@@ -164,6 +164,7 @@ impl LsmDB<Memstore> {
             thread_handls: vec![],
             trigger_compact: trigger_s,
             statistic: Arc::new(DBStatistic::default()),
+            config,
         };
 
         // Prepare data needed for the writer thread
@@ -244,6 +245,18 @@ impl<T: Store> LsmDB<T> {
         DBWriter {
             queue: self.request_queue_s.clone(),
         }
+    }
+    pub fn need_freeze(&self) -> bool {
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.memtable_size() >= self.config.lsm_storage_config.memtable_size_limit
+    }
+    pub fn need_dump(&self) -> bool {
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.immtable_num() > 0
+    }
+    pub fn need_compact(&self) -> bool {
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.need_compact()
     }
 
     pub fn current_op_id(&self) -> OpId {
@@ -539,6 +552,7 @@ mod test {
     use std::mem::size_of;
     use std::sync::atomic::Ordering;
     use tracing::{info, Level};
+    use tracing_subscriber::filter::Targets;
 
     use crate::db::block::test::pad_zero;
     use crate::db::key::{KeyVec, ValueVec};
@@ -556,12 +570,11 @@ mod test {
         config: Config,
         start_key: u64,
         num_kvs: usize,
-        manual_trigger: bool,
     ) -> HashMap<KeyBytes, ValueByte> {
         let mut writer = db.get_writer();
         let (r, expected_data) = write_kvs(&mut writer, start_key, num_kvs);
         let _ = r.recv();
-        wait_for_compact(db, config, manual_trigger);
+        wait_for_compact(db, config);
         expected_data
     }
 
@@ -966,13 +979,11 @@ mod test {
         }
     }
 
-    fn wait_for_compact(db: &mut LsmDB<Memstore>, config: crate::db::Config, manual_trigger: bool) {
+    fn wait_for_compact(db: &mut LsmDB<Memstore>, config: crate::db::Config) {
         let initial_compact_count = db.statistic.compact_count.load(Ordering::SeqCst);
 
-        if manual_trigger {
-            // Trigger compaction manually.
-            db.trigger_compact();
-        }
+        // Trigger compaction manually.
+        db.trigger_compact();
 
         // Loop and wait for compact_count to increase by at least one.
         let mut loop_count = 0;
@@ -1112,8 +1123,7 @@ mod test {
 
         // 4. Trigger manual compaction
         info!("Test backpressure: Triggering manual compaction.");
-        db.trigger_compact();
-        wait_for_compact(&mut db, config, false);
+        wait_for_compact(&mut db, config);
         info!("Test backpressure: Compaction finished.");
 
         // Verify the previously blocked second and third writes complete
@@ -1153,6 +1163,147 @@ mod test {
         info!("Test backpressure: All data verified successfully.");
     }
 
+    // write/delete date use unordered key
+    // use const seed
+    // create 2000 kvs and shuffle it
+    // write them to db and then random delete 500
+    // write/delete date use unordered key
+    // create 2000 kvs and shuffle it
+    // write them to db and then random delete 500
+    // check it by get
+    #[test]
+    fn test_random_write_delete() {
+        let mut config = crate::db::Config::config_for_test();
+        config.lsm_storage_config.memtable_size_limit = 40000;
+        config.auto_compact = true; // Let auto-compact run in background
+        config.thread_sleep_time = 10;
+        let mut db = LsmDB::<Memstore>::new_with_memstore(config);
+        let mut writer = db.get_writer();
+
+        let total_kvs = 2000;
+        let num_to_delete = 500;
+
+        let mut all_kvs: Vec<(KeyBytes, OpType)> = Vec::with_capacity(total_kvs);
+        let mut expected_data_after_write: HashMap<KeyBytes, ValueByte> =
+            HashMap::with_capacity(total_kvs);
+
+        // 1. Generate and write initial KVs
+        for i in 0..total_kvs {
+            let key_str = pad_zero(i as u64);
+            let value_str = format!("value_{}", i);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            all_kvs.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            expected_data_after_write.insert(key_bytes, value_bytes);
+        }
+
+        // Shuffle all_kvs for unordered writes
+        use rand::rngs::StdRng;
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng; // Add this import
+
+        // Use a fixed seed for reproducibility
+        let mut rng = StdRng::seed_from_u64(12345);
+        all_kvs.shuffle(&mut rng);
+
+        info!("Writing {} random KVs in batches of 100...", total_kvs);
+        let batch_size = 100;
+        for chunk in all_kvs.chunks(batch_size) {
+            let r_write_batch = writer.put(chunk.to_vec());
+            r_write_batch.recv().expect("Random write batch failed");
+        }
+        info!("Initial writes completed.");
+
+        // 2. Select keys to delete and perform deletes
+        let mut keys_to_delete: Vec<KeyBytes> = Vec::with_capacity(num_to_delete);
+        let mut all_keys: Vec<KeyBytes> = expected_data_after_write.keys().cloned().collect();
+        all_keys.shuffle(&mut rng);
+
+        for i in 0..num_to_delete {
+            let key = all_keys.pop().unwrap(); // Get a random key to delete
+            keys_to_delete.push(key.clone());
+            expected_data_after_write.remove(&key); // Remove from expected map
+        }
+
+        info!("Deleting {} random KVs in batches of 10...", num_to_delete);
+        let delete_batch_size = 10;
+        for chunk in keys_to_delete.chunks(delete_batch_size) {
+            let mut delete_ops: Vec<(KeyBytes, OpType)> = Vec::with_capacity(chunk.len());
+            for key in chunk.iter() {
+                delete_ops.push((key.clone(), OpType::Delete));
+            }
+            let r_delete_batch = writer.put(delete_ops);
+            r_delete_batch.recv().expect("Random delete batch failed");
+        }
+        info!("Delete operations completed.");
+
+        info!("Waiting for all background operations to complete...");
+        let mut loop_count = 0;
+        loop {
+            if !db.need_freeze() && !db.need_dump() && !db.need_compact() {
+                break;
+            }
+            loop_count += 1;
+            if loop_count > 50 {
+                // Add a timeout to prevent infinite loops in case of test issues
+                panic!("Timeout waiting for background operations to complete.");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(config.thread_sleep_time));
+        }
+        info!("All background operations completed.");
+
+        // 3. Verify data consistency
+        info!("Verifying data consistency after writes and deletes.");
+        let reader = db.get_reader();
+
+        // Check keys that should still exist
+        for (key, expected_val) in expected_data_after_write.iter() {
+            let result = reader.query(KeyVec::from(key.as_ref()));
+            match result {
+                Some(kv_op) => {
+                    if let OpType::Write(actual_value) = kv_op.op {
+                        assert_eq!(
+                            actual_value.as_ref(),
+                            expected_val.as_ref(),
+                            "Remaining key {:?} value mismatch",
+                            key
+                        );
+                    } else {
+                        panic!(
+                            "Expected Write op for remaining key {:?}, got {:?}",
+                            key, kv_op.op
+                        );
+                    }
+                }
+                None => panic!("Remaining key {:?} not found", key),
+            }
+        }
+        info!(
+            "Verified {} remaining keys.",
+            expected_data_after_write.len()
+        );
+
+        // Check keys that should have been deleted
+        for key in keys_to_delete.iter() {
+            let result = reader.query(KeyVec::from(key.as_ref()));
+            assert!(result.is_none(), "Deleted key {:?} found unexpectedly", key);
+        }
+        info!("Verified {} deleted keys are absent.", num_to_delete);
+
+        // Assert total count matches
+        assert_eq!(
+            db.tables_count(),
+            db.tables_count(),
+            "Table count in levels mismatch with reported total"
+        );
+        assert_eq!(
+            expected_data_after_write.len(),
+            total_kvs - num_to_delete,
+            "Final expected data map size mismatch"
+        );
+        info!("Random write/delete test completed successfully.");
+    }
+
     /// Tests basic put and query functionality.
     /// It writes a large number of key-value pairs, waits for compaction,
     /// and then queries all keys to ensure data integrity and retrieval.
@@ -1160,7 +1311,6 @@ mod test {
     fn test_basic_put_and_query() {
         // create lsmdb use memstore 2 level ratio  2 zero level file
         // The Config::config_for_test() sets memtable_size_limit and imm_size_limit.
-        // level_ratio is part of LsmStorageConfig, which is default 10.
         let mut config = Config::config_for_test();
         config.auto_compact = false;
         config
@@ -1171,7 +1321,7 @@ mod test {
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
 
         let num_kvs = 1000;
-        let expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs, true);
+        let expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs);
 
         assert_eq!(
             db.table_num_in_levels().len(),
