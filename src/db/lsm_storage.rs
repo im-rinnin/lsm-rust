@@ -21,19 +21,16 @@ use super::level;
 use super::level::LevelStoregeConfig;
 use super::level::TableChange;
 use super::store::StoreId;
+use super::table::TableConfig;
 
 #[derive(Clone, Copy)]
 pub struct LsmStorageConfig {
-    pub block_size: usize,
-    pub sstable_size: usize,
     pub memtable_size_limit: usize,
     pub level_config: LevelStoregeConfig,
 }
 impl Default for LsmStorageConfig {
     fn default() -> Self {
         LsmStorageConfig {
-            block_size: 4096,              // 4kb
-            sstable_size: 4 * 1024 * 1024, //4M
             level_config: LevelStoregeConfig::default(),
             memtable_size_limit: 2 * 1024 * 1024, //4MB
         }
@@ -42,10 +39,8 @@ impl Default for LsmStorageConfig {
 impl LsmStorageConfig {
     pub fn config_for_test() -> Self {
         LsmStorageConfig {
-            block_size: 128,
-            sstable_size: 512, //4M
             level_config: LevelStoregeConfig::config_for_test(),
-            memtable_size_limit: 512, //4MB
+            memtable_size_limit: 1024,
         }
     }
 }
@@ -85,37 +80,38 @@ impl<T: Store> LsmStorage<T> {
     }
 
     pub fn log_lsm_debug_info(&self) {
-        db_log::enable_log();
-        // Print active memtable size
-        tracing::debug!(
-            "LsmStorage Debug Info:\n  Active Memtable Size: {} bytes",
-            self.m.get_size()
-        );
+        let mut debug_info = String::new();
+        debug_info.push_str("LsmStorage Debug Info:\n");
 
-        // Print immutable memtable info
+        // Active memtable size
+        debug_info.push_str(&format!(
+            "  Active Memtable Size: {} bytes\n",
+            self.m.get_size()
+        ));
+
+        // Immutable memtable info
         let imm_tables_num = self.imm.len();
         let imm_tables_size: usize = self.imm.iter().map(|mem| mem.get_size()).sum();
-        tracing::debug!(
-            "  Immutable Memtables: {} (Total Size: {} bytes)",
-            imm_tables_num,
-            imm_tables_size
-        );
+        debug_info.push_str(&format!(
+            "  Immutable Memtables: {} (Total Size: {} bytes)\n",
+            imm_tables_num, imm_tables_size
+        ));
 
-        // Print information for tables in each level
-        let mut levels_log_info = String::from("  Levels:\n");
+        // Information for tables in each level
+        debug_info.push_str("  Levels:\n");
         let levels_info = self.current.get_tables_level();
         for (level_idx, level_tables) in levels_info.iter().enumerate() {
-            levels_log_info.push_str(&format!(
+            debug_info.push_str(&format!(
                 "    Level {}: ({} tables)\n",
                 level_idx,
                 level_tables.len()
             ));
             if level_tables.is_empty() {
-                levels_log_info.push_str("      [Empty]\n");
+                debug_info.push_str("      [Empty]\n");
             } else {
                 for table in level_tables {
                     let (first_key, last_key) = table.key_range();
-                    levels_log_info.push_str(&format!(
+                    debug_info.push_str(&format!(
                         "      Table ID: {}, Key Range: [\"{}\" -> \"{}\"]\n",
                         table.store_id(),
                         first_key.to_string(),
@@ -124,7 +120,7 @@ impl<T: Store> LsmStorage<T> {
                 }
             }
         }
-        tracing::debug!("{}", levels_log_info);
+        tracing::info!("{}", debug_info);
     }
     pub fn compact_level(&mut self, next_store_id: &mut StoreId) -> Vec<TableChange> {
         self.current.compact_storage(next_store_id)
@@ -256,12 +252,7 @@ mod test {
     /// It inserts a key-value pair and then retrieves it to verify correctness.
     #[test]
     fn test_put() {
-        let config = LsmStorageConfig {
-            block_size: 4096,
-            sstable_size: 1024 * 1024,
-            memtable_size_limit: 1024, // Small capacity for testing
-            level_config: LevelStoregeConfig::default(),
-        };
+        let config = LsmStorageConfig::config_for_test();
         let lsm = LsmStorage::<Memstore>::new(config);
 
         let key: KeyVec = "test_key".as_bytes().into();
@@ -300,12 +291,7 @@ mod test {
     /// that `get` can find keys in different levels and handles non-existent keys correctly.
     #[test]
     fn test_get_from_level() {
-        let config = LsmStorageConfig {
-            block_size: 4096,
-            sstable_size: 1024 * 1024,
-            memtable_size_limit: 1024,
-            level_config: LevelStoregeConfig::default(),
-        };
+        let config = LsmStorageConfig::config_for_test();
 
         // Create a dummy table for Level 0
         let table_lvl0 = crate::db::table::test::create_test_table_with_id_offset(0..100, 1000); // keys "000000" to "000099", OpIds 1000-1099
@@ -373,12 +359,7 @@ mod test {
     /// and where a key was deleted in the active memtable after existing in an immutable one.
     #[test]
     fn test_get_from_imm_memtable() {
-        let config = LsmStorageConfig {
-            block_size: 4096,
-            sstable_size: 1024 * 1024,
-            memtable_size_limit: 1024,
-            level_config: LevelStoregeConfig::default(),
-        };
+        let config = LsmStorageConfig::config_for_test();
         let mut lsm = LsmStorage::<Memstore>::new(config);
 
         // Insert data into active memtable
@@ -514,12 +495,7 @@ mod test {
     /// memtable correctly hide previous values for the same key within that memtable.
     #[test]
     fn test_get_from_memtable() {
-        let config = LsmStorageConfig {
-            block_size: 4096,
-            sstable_size: 1024 * 1024,
-            memtable_size_limit: 1024, // Small capacity for testing
-            level_config: LevelStoregeConfig::default(),
-        };
+        let config = LsmStorageConfig::config_for_test();
         let lsm = LsmStorage::<Memstore>::new(config);
 
         let key1: KeyVec = "key_active_1".as_bytes().into();
@@ -593,12 +569,7 @@ mod test {
 
     #[test]
     fn test_dump_imm_memtable() {
-        let config = LsmStorageConfig {
-            block_size: 4096,
-            sstable_size: 1024 * 1024,
-            memtable_size_limit: 1024, // Small capacity
-            level_config: LevelStoregeConfig::config_for_test(),
-        };
+        let config = LsmStorageConfig::config_for_test();
         let mut lsm = LsmStorage::<Memstore>::new(config);
         let mut next_sstable_id: u64 = 100;
 

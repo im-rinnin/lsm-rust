@@ -15,7 +15,7 @@ use crate::db::{
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
@@ -251,10 +251,36 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
 }
 
 use crate::db::block::BlockBuilder;
+#[derive(Clone, Copy)]
+pub struct TableConfig {
+    block_num_limit: usize,
+}
+impl TableConfig {
+    pub fn new(table_size: usize) -> Self {
+        TableConfig {
+            block_num_limit: table_size / DATA_BLOCK_SIZE,
+        }
+    }
+    pub fn new_for_test() -> Self {
+        TableConfig {
+            block_num_limit: 1024 * 1024 / DATA_BLOCK_SIZE,
+        }
+    }
+    pub fn set_table_size(&mut self, size: usize) {
+        self.block_num_limit = size / DATA_BLOCK_SIZE;
+    }
+}
+impl Default for TableConfig {
+    fn default() -> Self {
+        TableConfig {
+            block_num_limit: BLOCK_COUNT_LIMIT,
+        }
+    }
+}
 pub struct TableBuilder<T: Store> {
     store: T,
     block_metas: Vec<BlockMeta>,
-    block_num_limit: usize,
+    config: TableConfig,
     current_block_first_key: Option<KeyBytes>,
     block_builder: BlockBuilder,
 }
@@ -264,17 +290,17 @@ impl<T: Store> TableBuilder<T> {
         Self {
             store,
             block_metas: Vec::new(),
-            block_num_limit: BLOCK_COUNT_LIMIT,
+            config: TableConfig::default(),
             current_block_first_key: None,
             block_builder: BlockBuilder::new(),
         }
     }
-    pub fn new_with_id_and_block_count_limit(store_id: StoreId, block_num_limit: usize) -> Self {
+    pub fn new_with_id_config(store_id: StoreId, c: TableConfig) -> Self {
         debug!(id = store_id, "table_builder new with store");
         Self {
             store: open_store(store_id),
             block_metas: Vec::new(),
-            block_num_limit,
+            config: c,
             current_block_first_key: None,
             block_builder: BlockBuilder::new(),
         }
@@ -285,7 +311,7 @@ impl<T: Store> TableBuilder<T> {
         Self {
             store: open_store(store_id),
             block_metas: Vec::new(),
-            block_num_limit: BLOCK_COUNT_LIMIT,
+            config: TableConfig::default(),
             current_block_first_key: None,
             block_builder: BlockBuilder::new(),
         }
@@ -311,7 +337,8 @@ impl<T: Store> TableBuilder<T> {
             self.flush_current_block();
 
             // Check if we've reached the overall block limit for the table.
-            if self.block_metas.len() >= self.block_num_limit {
+            if self.block_metas.len() >= self.config.block_num_limit {
+                info!(block_limit = self.config.block_num_limit, "block_num_limit");
                 return false; // Cannot add more blocks to this table.
             }
 

@@ -230,20 +230,14 @@ impl<T: Store> Level<T> {
 
 pub struct LevelStorege<T: Store> {
     levels: Vec<Level<T>>,
-    //level table increase ratio betweent two level.
-    //level n+1 table len =level n table len *ratio
-    level_zero_num_limit: usize,
-    level_ratio: usize,
-    max_input_table_in_compact: usize,
+    config: LevelStoregeConfig,
 }
 
 impl<T: Store> Clone for LevelStorege<T> {
     fn clone(&self) -> Self {
         LevelStorege {
             levels: self.levels.clone(),
-            level_zero_num_limit: self.level_zero_num_limit,
-            level_ratio: self.level_ratio,
-            max_input_table_in_compact: self.max_input_table_in_compact,
+            config: self.config.clone(),
         }
     }
 }
@@ -252,6 +246,7 @@ pub struct LevelStoregeConfig {
     pub level_zero_num_limit: usize,
     pub level_ratio: usize,
     pub max_input_table_num_in_compact: usize,
+    pub table_config: TableConfig,
 }
 
 impl Default for LevelStoregeConfig {
@@ -260,6 +255,7 @@ impl Default for LevelStoregeConfig {
             level_zero_num_limit: DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
             level_ratio: 4,
             max_input_table_num_in_compact: MAX_INPUT_TABLE_IN_COMPACT,
+            table_config: TableConfig::default(),
         }
     }
 }
@@ -270,6 +266,7 @@ impl LevelStoregeConfig {
             level_zero_num_limit: 2,
             level_ratio: 2,
             max_input_table_num_in_compact: MAX_INPUT_TABLE_IN_COMPACT,
+            table_config: TableConfig::new_for_test(),
         }
     }
 }
@@ -278,9 +275,7 @@ impl<T: Store> LevelStorege<T> {
     pub fn new(tables: Vec<Level<T>>, config: LevelStoregeConfig) -> Self {
         LevelStorege {
             levels: tables,
-            level_zero_num_limit: config.level_zero_num_limit,
-            level_ratio: config.level_ratio,
-            max_input_table_in_compact: config.max_input_table_num_in_compact,
+            config,
         }
     }
     // return table number in every level, table number in level[0]=vec[0]
@@ -317,7 +312,7 @@ impl<T: Store> LevelStorege<T> {
         let new_table_id = *next_sstable_id;
         *next_sstable_id += 1;
 
-        let mut table_builder = TableBuilder::new_with_id(new_table_id);
+        let mut table_builder = TableBuilder::new_with_id_config(new_table_id,self.config.table_config);
 
         // Fill the table builder with data from the iterator
         // Use a loop to handle potential errors or specific logic if `fill` isn't suitable
@@ -337,7 +332,7 @@ impl<T: Store> LevelStorege<T> {
                 // Create a new builder for the next table.
                 let new_table_id = *next_sstable_id;
                 *next_sstable_id += 1;
-                table_builder = TableBuilder::new_with_id(new_table_id);
+                table_builder = TableBuilder::new_with_id_config(new_table_id,self.config.table_config);
 
                 // Add the operation that didn't fit into the previous builder to the new one.
                 // This should always succeed on a fresh builder unless the single op is too large.
@@ -376,7 +371,7 @@ impl<T: Store> LevelStorege<T> {
 
     // Calculate the maximum number of tables allowed in a given level.
     fn max_table_in_level(&self, level_depth: usize) -> usize {
-        return self.level_zero_num_limit * self.level_ratio.pow(level_depth as u32);
+        return self.config.level_zero_num_limit * self.config.level_ratio.pow(level_depth as u32);
     }
 
     /// Initiates the compaction process across all levels of the LSM storage.
@@ -612,7 +607,7 @@ impl<T: Store> LevelStorege<T> {
         let mut compacted_tables = Vec::new();
 
         if let Some(mut op) = kv_iter_agg.next() {
-            let mut table_builder = TableBuilder::new_with_id(*store_id_start);
+            let mut table_builder = TableBuilder::new_with_id_config(*store_id_start,self.config.table_config);
             *store_id_start += 1;
 
             loop {
@@ -627,7 +622,7 @@ impl<T: Store> LevelStorege<T> {
                     });
                     compacted_tables.push(Arc::new(new_table_reader));
 
-                    table_builder = TableBuilder::new_with_id(*store_id_start);
+                    table_builder = TableBuilder::new_with_id_config(*store_id_start,self.config.table_config);
                     *store_id_start += 1;
                     if !table_builder.add(op.clone()) {
                         panic!("Error: Single KVOperation is too large to fit in a new table block during compaction. Operation ID: {}", op.id);
@@ -765,7 +760,7 @@ impl<T: Store> LevelStorege<T> {
         let mut tables_to_compact = Vec::new();
         let mut positions_to_remove: Vec<usize> = store_id_positions
             .into_iter()
-            .take(self.max_input_table_in_compact)
+            .take(self.config.max_input_table_num_in_compact)
             .map(|(_, pos)| pos)
             .collect();
 

@@ -1,12 +1,19 @@
 #![allow(unused)]
+use std::default;
+use std::env::set_var;
 use std::sync::atomic::Ordering;
+use std::sync::RwLock;
+use std::thread::{self, JoinHandle};
 use std::{
     path::PathBuf,
     sync::{atomic::AtomicU64, Arc, Condvar, Mutex},
+    time::{Duration, Instant}, // Required for wait_timeout and Instant
     usize,
 };
+mod db_log;
 
-use common::{KVOpertion, OpId};
+use anyhow::Result;
+use common::{KVOpertion, OpId, OpType};
 use key::{KeyBytes, KeySlice, KeyVec, ValueByte, ValueSlice, ValueVec};
 
 mod store;
@@ -16,7 +23,7 @@ mod common;
 mod db_meta;
 mod key;
 mod level;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 mod logfile;
 mod lsm_storage;
 mod memtable;
@@ -24,19 +31,188 @@ mod snapshot;
 mod table;
 use level::TableChangeLog;
 use logfile::LogFile;
-use lsm_storage::LsmStorage;
-use store::{Store, StoreId};
+use lsm_storage::{LsmStorage, LsmStorageConfig};
+use store::{Memstore, Store, StoreId};
+use tracing::info;
+
 const START_WRITE_REQUEST_QUEUE_LEN: usize = 100;
+const WRITE_TIMEOUT_MS: u128 = 10; // Timeout in milliseconds
+
+struct WriteRequest {
+    data: Vec<(KeyBytes, OpType)>,
+    done: Sender<()>,
+}
+impl WriteRequest {
+    fn new(data: Vec<(KeyBytes, OpType)>) -> (Self, Receiver<()>) {
+        let (s, r) = bounded(1);
+        let res = WriteRequest { data, done: s };
+        (res, r)
+    }
+    pub fn get_size(&self) -> usize {
+        let mut total_size = 0;
+        for (key, op_type) in &self.data {
+            // Size of key data + size of u64 for key length prefix
+            let mut item_size = key.len() + std::mem::size_of::<u64>();
+            // Size of u8 for OpType discriminant
+            item_size += std::mem::size_of::<u8>();
+            if let OpType::Write(v) = op_type {
+                // Size of value data + size of u64 for value length prefix
+                item_size += v.len() + std::mem::size_of::<u64>();
+            }
+            total_size += item_size;
+        }
+        total_size
+    }
+}
+
+#[derive(Default)]
+struct DBStatistic {
+    pub compact_count: AtomicU64,
+}
 struct LsmDB<T: Store> {
     current_max_op_id: Arc<AtomicU64>,
-    current_max_sstable_id: AtomicU64, // dont need to save to file
-    // The Condvar/Mutex pair for signaling write completion.
-    write_done_cv: Arc<Mutex<Arc<(Condvar, Mutex<bool>)>>>,
-    current: Arc<Mutex<Arc<LsmStorage<T>>>>,
-    logfile: Arc<Mutex<LogFile<T>>>,
-    level_meta_log: Arc<Mutex<TableChangeLog<T>>>,
-    request_queue_r: Receiver<KVOpertion>,
-    request_queue_s: Sender<KVOpertion>,
+    // The current state of the LSM tree, wrapped for concurrent access and modification.
+    current: Arc<RwLock<LsmStorage<T>>>,
+    request_queue_r: Receiver<WriteRequest>,
+    request_queue_s: Sender<WriteRequest>,
+    stop_flag: Arc<Mutex<bool>>, // Added to control worker threads shutdown
+    thread_handls: Vec<JoinHandle<()>>,
+    trigger_compact: Sender<()>,
+    statistic: Arc<DBStatistic>,
+}
+const SLEEP_TIME: u64 = 10;
+#[derive(Clone, Copy)]
+pub struct Config {
+    pub lsm_storage_config: LsmStorageConfig,
+    pub request_queue_len: usize,
+    pub imm_size_limit: usize,
+    pub thread_sleep_time: u64,
+    pub request_queue_size: usize,
+    pub auto_compact: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            lsm_storage_config: LsmStorageConfig::default(),
+            request_queue_len: 500,
+            imm_size_limit: 2,
+            thread_sleep_time: 100,
+            request_queue_size: 1000,
+            auto_compact: true,
+        }
+    }
+}
+impl Config {
+    fn config_for_test() -> Self {
+        let mut c = Self::default();
+        c.lsm_storage_config = LsmStorageConfig::config_for_test();
+        c.request_queue_size = 200;
+        c
+    }
+}
+
+impl<T: Store> Drop for LsmDB<T> {
+    fn drop(&mut self) {
+        info!("close db start drop");
+        // Signal worker threads to stop
+        let mut stop = self.stop_flag.lock().expect("fail to get lock on flah");
+        *stop = true;
+        drop(stop); // Release the lock before joining threads
+
+        // Wait for all worker threads to finish
+        for handle in self.thread_handls.drain(..) {
+            let _ = handle.join(); // Ignore join errors for now, consider logging in production
+        }
+        info!("close db end drop");
+    }
+}
+
+impl LsmDB<Memstore> {
+    pub fn new_with_memstore(config: Config) -> Self {
+        // Create the initial LsmStorage, wrapped in Arc<RwLock<...>>
+        let initial_lsm_storage = Arc::new(RwLock::new(LsmStorage::new(config.lsm_storage_config)));
+
+        // Create LogFile and TableChangeLog with unique Memstore instances
+        let logfile_store_id = 0;
+        let logfile = LogFile::<Memstore>::open(logfile_store_id);
+
+        let level_meta_log_store_id = 1; // Use a different ID from logfile
+        let level_meta_log = TableChangeLog::<Memstore>::from(level_meta_log_store_id);
+
+        // Create the channel for write requests
+        let (s, r) = crossbeam_channel::bounded(config.request_queue_len);
+
+        // Initialize atomic counters
+        let current_max_op_id = Arc::new(AtomicU64::new(0));
+
+        // Initialize the write completion signaling mechanism
+        let initial_cv_pair = (Condvar::new(), Mutex::new(0));
+        let write_done_cv = Arc::new(RwLock::new(initial_cv_pair));
+
+        // Create the stop flag for worker threads
+        let stop_flag = Arc::new(Mutex::new(false));
+
+        // Construct the LsmDB instance
+        let (trigger_s, trigger_r) = unbounded();
+        let mut res = LsmDB {
+            current_max_op_id,
+            current: initial_lsm_storage, // Use the already wrapped initial state
+            request_queue_r: r,
+            request_queue_s: s,
+            stop_flag: stop_flag.clone(), // Store a clone in the LsmDB instance
+            thread_handls: vec![],
+            trigger_compact: trigger_s,
+            statistic: Arc::new(DBStatistic::default()),
+        };
+
+        // Prepare data needed for the writer thread
+        let writer_queue_r = res.request_queue_r.clone();
+        let writer_lsm_state = res.current.clone();
+        // Note: logfile is moved into the thread closure below.
+
+        let w_stop_flag = stop_flag.clone(); // Clone for writer thread
+        let max_op = res.current_max_op_id.clone();
+        let h = thread::spawn(move || {
+            LsmDB::write_worker(
+                w_stop_flag,
+                writer_queue_r,
+                writer_lsm_state,
+                logfile,
+                max_op,
+                config,
+            );
+        });
+        res.thread_handls.push(h);
+
+        // Prepare data for the compaction thread
+        let compaction_lsm_state = res.current.clone();
+        let compaction_config = config; // Clone or copy config if needed, struct is Copy
+        let mut next_sstable_id_start_value: StoreId = 0; // Start after logfile and meta log
+                                                          // todo: load next_sstable_id from storage
+
+        // Start dump_and_compact_thread in a new thread
+        let c_stop_flag = stop_flag.clone(); // Clone for compaction thread
+        let statistic = res.statistic.clone();
+        let h = thread::spawn(move || {
+            LsmDB::dump_and_compact_thread(
+                compaction_lsm_state,
+                level_meta_log,              // level_meta_log is moved into the thread
+                next_sstable_id_start_value, // Passed by value, matches 'mut StoreId' signature
+                c_stop_flag,
+                compaction_config,
+                trigger_r,
+                statistic,
+            );
+        });
+        res.thread_handls.push(h);
+
+        res
+    }
+
+    fn trigger_compact(&mut self) {
+        self.trigger_compact.send(()).unwrap();
+    }
 }
 
 impl<T: Store> LsmDB<T> {
@@ -46,157 +222,839 @@ impl<T: Store> LsmDB<T> {
     pub fn open(dir: PathBuf) -> Self {
         unimplemented!()
     }
+
+    pub fn table_num_in_levels(&self) -> Vec<usize> {
+        // Acquire read lock to get the LsmStorage
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.table_num_in_levels()
+        // Lock is released when guard goes out of scope
+    }
+
     pub fn get_reader(&self) -> DBReader<T> {
-        unimplemented!()
+        let cloned_lsm_storage = self.current.read().unwrap().clone();
+
+        let current_op_id = self.current_max_op_id.load(Ordering::SeqCst);
+        DBReader {
+            // DBReader holds an Arc to the *cloned* LsmStorage state
+            snapshot: cloned_lsm_storage,
+            id: current_op_id,
+        }
     }
     pub fn get_writer(&self) -> DBWriter {
         DBWriter {
-            max_op: self.current_max_op_id.clone(),
             queue: self.request_queue_s.clone(),
-            write_done_cv: self.write_done_cv.clone(),
         }
     }
 
-    fn check_memtable_size(&self) {}
-    fn dump_and_compact_thread(lsm: LsmStorage<T>) {
-        // loop
-        // sleep
-        // check if db end, return
-        // check metable size
-        // dump memtable if needed
-        // update current and meta
-        // check level zeor size
-        // do compact if needed
-        // update current and meta
-        // back to loop
+    pub fn current_op_id(&self) -> OpId {
+        self.current_max_op_id.load(Ordering::SeqCst)
     }
 
-    fn start_compact_thread(&self) {}
-    fn write_worker(&mut self, stop: Mutex<bool>) {
+    pub fn print_debug_info(&self) {
+        self.current.read().unwrap().log_lsm_debug_info();
+    }
+
+    fn check_memtable_size(&self) -> usize {
+        // Acquire read lock
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.memtable_size()
+        // Lock released
+    }
+    fn dump_and_compact_thread(
+        current: Arc<RwLock<LsmStorage<T>>>,
+        mut meta: TableChangeLog<Memstore>,
+        mut next_sstable_id: StoreId,
+        stop: Arc<Mutex<bool>>,
+        config: Config,
+        run_job: Receiver<()>,
+        statistic: Arc<DBStatistic>,
+    ) {
+        loop {
+            // Check if stop signal is received
+            let stop_flag = stop.lock().unwrap();
+            if *stop_flag {
+                info!("compact thread exit");
+                break; // Exit the loop if stop flag is true
+            }
+            drop(stop_flag); // Release the mutex guard
+
+            // Wait for a manual compaction trigger or timeout
+            let res = run_job.recv_timeout(Duration::from_millis(config.thread_sleep_time));
+            match res {
+                Ok(()) => {
+                    info!("receive manual compact");
+                    // Manual compaction triggered, proceed with compaction logic below
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !config.auto_compact {
+                        continue;
+                    }
+                    // time out , proceed with compaction logic below
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break; // Exit loop if the trigger mechanism is broken.
+                }
+            }
+
+            {
+                // Acquire write lock for potential modifications (freeze and compact)
+                let mut lsm_storage_guard = current.write().unwrap();
+
+                // Check memtable size and freeze if needed
+                if lsm_storage_guard.memtable_size()
+                    >= config.lsm_storage_config.memtable_size_limit
+                {
+                    lsm_storage_guard.freeze_memtable();
+                }
+            }
+            let mut lsm_storage_clone = current.read().unwrap().clone();
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                info!("before dump and compact");
+                lsm_storage_clone.log_lsm_debug_info();
+            }
+
+            // Dump all immutable memtables until none are left
+            while lsm_storage_clone.immtable_num() > 0 {
+                lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
+            }
+
+            // Check level zero size and compact if needed
+            // Get the current number of tables in level 0, defaulting to 0 if level 0 doesn't exist yet
+            let table_changes = lsm_storage_clone.compact_level(&mut next_sstable_id);
+            if table_changes.len() > 0 {
+                meta.append(table_changes); // Persist changes to the TableChangeLog
+            }
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                info!("after dump and compact");
+                lsm_storage_clone.log_lsm_debug_info();
+            }
+
+            // update currrent
+            *current.write().unwrap() = lsm_storage_clone;
+            statistic.compact_count.fetch_add(1, Ordering::SeqCst);
+            info!("compact finish");
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        self.table_num_in_levels().len()
+    }
+    fn tables_count(&self) -> usize {
+        // Acquire read lock
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.table_num_in_levels().iter().sum()
+        // Lock released
+    }
+    fn write_worker(
+        stop: Arc<Mutex<bool>>,
+        request_queue_r: Receiver<WriteRequest>,
+        current_lsm_state: Arc<RwLock<LsmStorage<T>>>,
+        mut logfile: LogFile<T>,
+        mut next_op_id: Arc<AtomicU64>,
+        c: Config,
+    ) {
         // This function needs more context like START_WRITE_REQUEST_QUEUE_LEN,
         // how to handle sleep/wake, and the exact mechanism for CV swapping.
         // The implementation below is a basic structure based on the comments.
         // It assumes a loop and basic locking, but details need refinement.
 
-        loop {
-            // Placeholder for sleep logic
-            std::thread::sleep(std::time::Duration::from_millis(100)); // Example sleep
+        let mut first_request_time: Option<Instant> = None; // Track time of first request in batch window
+        let mut buffered_requests: Vec<WriteRequest> = Vec::new(); // Buffer for incoming requests
+        let mut total_buffered_size = 0; // Total size of requests in buffered_requests
 
+        loop {
             // Check if stop signal is received
             let stop_flag = stop.lock().unwrap();
             if *stop_flag {
                 break; // Exit the loop if stop flag is true
             }
-            // Drop the guard explicitly after checking the flag
-            drop(stop_flag);
+            drop(stop_flag); // Release the mutex guard
 
-            let queue_len = self.request_queue_r.len();
-            if queue_len < START_WRITE_REQUEST_QUEUE_LEN {
-                continue;
-            } // Needs constant definition
-
-            // CV swapping logic: Clone the old CV, replace with a new one
-            let old_cv_pair; // To hold the CV pair for notification
-            {
-                let mut cv_guard = self.write_done_cv.lock().unwrap();
-                // Clone the current Arc to notify waiters later
-                old_cv_pair = cv_guard.clone();
-                // Create and set a new CV pair for future writers
-                let new_cv_pair = Arc::new((Condvar::new(), Mutex::new(false)));
-                *cv_guard = new_cv_pair;
-                // MutexGuard is dropped here, releasing the lock
+            // Try to receive and buffer new requests
+            while let Ok(request) = request_queue_r.try_recv() {
+                total_buffered_size += request.get_size();
+                buffered_requests.push(request);
             }
 
-            let mut ops_to_write = Vec::new();
-            // Drain the queue or receive multiple items
-            while let Ok(op) = self.request_queue_r.try_recv() {
-                ops_to_write.push(op);
-                // Potentially break if too many ops are collected or after a timeout
+            let proceed_to_write = Self::should_proceed_to_write_logic(
+                total_buffered_size,
+                &mut first_request_time,
+                c,
+            );
+
+            if !proceed_to_write {
+                // If conditions for writing are not met, sleep before checking again
+                std::thread::sleep(std::time::Duration::from_millis(SLEEP_TIME));
+                continue; // Skip the write phase for this iteration
             }
 
-            if ops_to_write.is_empty() {
-                // If no ops were received, we don't need to notify anyone with the old CV.
-                // The new CV is already in place for the next batch.
-                continue; // Go back to sleep/wait
+            // --- Proceed with writing ---
+            // Process all buffered requests
+            // Use `drain(..)` to process and empty the buffer
+            for request in buffered_requests.drain(..) {
+                Self::process_single_buffered_request(
+                    request,
+                    &mut logfile,
+                    &current_lsm_state,
+                    &next_op_id,
+                );
             }
-
-            // Write to log file
-            {
-                let mut logfile_guard = self.logfile.lock().unwrap();
-                logfile_guard.append(&ops_to_write); // Clone ops for memtable write
-            } // Logfile lock released
-
-            // Write to memtable
-            {
-                let current_lsm_guard = self.current.lock().unwrap();
-                for op in ops_to_write {
-                    // Assuming LsmStorage has a method like `put` or `insert`
-                    // This might need adjustment based on LsmStorage's actual API
-                    current_lsm_guard.put(op); // Error handling needed
-                }
-            } // LsmStorage lock released
-
-            // Notify client threads using the old CV pair that was cloned earlier
-            let (cv, lock) = &*old_cv_pair;
-            let mut completed = lock.lock().unwrap();
-            *completed = true;
-            cv.notify_all();
+            total_buffered_size = 0; // Reset total size after processing the batch
+            first_request_time = None;
+            // No sleep here, as work was done, we can immediately check for more work
         }
         // Note: The loop as written never exits. A mechanism to stop the worker is needed.
     }
-}
 
+    fn process_single_buffered_request(
+        request: WriteRequest,
+        logfile: &mut LogFile<T>,
+        current_lsm_state: &Arc<RwLock<LsmStorage<T>>>,
+        next_op_id: &Arc<AtomicU64>,
+    ) {
+        let (kvs, finishi) = (request.data, request.done);
+
+        if kvs.is_empty() {
+            let _ = finishi.send(()); // Still send signal for empty requests
+            return;
+        }
+
+        let mut ops_to_write = Vec::new();
+        let mut current_id = next_op_id.load(Ordering::SeqCst);
+        for kv in kvs {
+            ops_to_write.push(KVOpertion {
+                id: current_id,
+                key: kv.0,
+                op: kv.1,
+            });
+            current_id += 1;
+        }
+        logfile.append(&ops_to_write);
+
+        {
+            let lsm_storage_guard = current_lsm_state.read().unwrap();
+            for op in ops_to_write {
+                lsm_storage_guard.put(op);
+            }
+        }
+        next_op_id.store(current_id, Ordering::SeqCst);
+        let _ = finishi.send(());
+    }
+
+    /// Determines whether the write worker should proceed with writing a batch of requests.
+    /// It considers the queue length and a timeout for pending requests.
+    /// Returns a tuple: (should_write, updated_first_request_time).
+    fn should_proceed_to_write_logic(
+        request_size: usize,
+        mut first_request_time: &mut Option<Instant>, // Pass mutable Option<Instant>
+        c: Config,
+    ) -> bool {
+        let mut proceed_to_write = false;
+        // Use the passed-in first_request_time
+        if request_size >= c.request_queue_size {
+            proceed_to_write = true;
+            *first_request_time = None; // Reset timer when writing due to queue length
+        } else if request_size > 0 {
+            // Only check time if there's something in the queue
+            match first_request_time {
+                None => {
+                    // First request arrived since last write, start the timer
+                    *first_request_time = Some(Instant::now());
+                }
+                Some(start_time) => {
+                    // Timer already running, check if timeout reached
+                    if start_time.elapsed().as_millis() >= WRITE_TIMEOUT_MS {
+                        proceed_to_write = true;
+                        *first_request_time = None; // Reset timer after writing due to timeout
+                    }
+                }
+            }
+        } else {
+            // Queue is empty, reset the timer
+            *first_request_time = None;
+        }
+        proceed_to_write
+    }
+}
 pub struct DBWriter {
-    max_op: Arc<AtomicU64>,
-    queue: Sender<KVOpertion>,
-    write_done_cv: Arc<Mutex<Arc<(Condvar, Mutex<bool>)>>>,
+    queue: Sender<WriteRequest>,
 }
 impl DBWriter {
-    pub fn write(&mut self, kvs: Vec<(&KeyVec, &ValueVec)>) -> OpId {
-        // Fetch current max op id and increment by kvs len
-        let start_op_id = self.max_op.fetch_add(kvs.len() as u64, Ordering::SeqCst);
-        let end_op_id = start_op_id + kvs.len() as u64;
+    pub fn put(&mut self, kvs: Vec<(KeyBytes, OpType)>) -> Receiver<()> {
+        let (request, r) = WriteRequest::new(kvs);
 
-        // Get and lock the current write_done_cv pair
-        let cv_pair_arc = {
-            let cv_guard = self.write_done_cv.lock().unwrap();
-            cv_guard.clone() // Clone the Arc to hold onto the specific CV pair
-        };
-        let (cv, lock) = &*cv_pair_arc;
+        self.queue
+            .send(request)
+            .expect("Failed to send KVOpertion to queue");
 
-        // Prepare the completed flag for waiting
-        let mut completed = lock.lock().unwrap();
-        assert!(!*completed);
-
-        // Submit write requests to the queue
-        for (i, (key, value)) in kvs.into_iter().enumerate() {
-            let op_id = start_op_id + i as u64;
-            let op = KVOpertion::new(
-                op_id,
-                key.clone(),
-                common::OpType::Write(ValueByte::from(value.as_ref())),
-            );
-            self.queue
-                .send(op)
-                .expect("Failed to send KVOpertion to queue");
-        }
-
-        // Wait for the worker thread to complete the write operation
-        while !*completed {
-            completed = cv.wait(completed).unwrap();
-        }
-
-        // Return the max op_id in this write operation
-        end_op_id - 1 // The last OpId in the range [start_op_id, end_op_id)
+        r
     }
 }
 pub struct DBReader<T: Store> {
-    current: Arc<LsmStorage<T>>,
+    snapshot: LsmStorage<T>,
+    id: u64, // Represents the max_op_id at the time the reader was created
 }
 impl<T: Store> DBReader<T> {
+    pub fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
     pub fn query(&self, key: KeyVec) -> Option<KVOpertion> {
-        unimplemented!()
+        // Create a KeyQuery using the reader's snapshot op_id.
+        let query = common::KeyQuery {
+            key: key.as_ref().into(), // Convert KeyVec to KeyBytes
+            op_id: self.id,           // Use the snapshot OpId from the reader
+        };
+        // self.current is an Arc<LsmStorage<T>> holding the cloned state
+        self.snapshot.get(&query)
     }
 }
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::{Config, KeyBytes, OpType, ValueByte, WriteRequest};
+    use crate::db::db_log;
+    use crate::db::{store::Memstore, LsmDB};
+    use std::mem::size_of;
+    use std::sync::atomic::Ordering;
+
+    use crate::db::block::test::pad_zero;
+    use crate::db::key::{KeyVec, ValueVec};
+    use core::panic;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant}, // Add Instant and Duration for timing
+    };
+
+    // Helper function to write KVs and wait for compaction
+    fn write_kvs_and_wait_for_compact(
+        db: &mut LsmDB<Memstore>,
+        config: Config,
+        start_key: u64,
+        num_kvs: usize,
+    ) -> HashMap<KeyBytes, ValueByte> {
+        let mut writer = db.get_writer();
+        let mut kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_kvs);
+        let mut expected_data: HashMap<KeyBytes, ValueByte> = HashMap::with_capacity(num_kvs);
+
+        for i in 0..num_kvs {
+            let current_key_idx = start_key + i as u64;
+            let key_str = pad_zero(current_key_idx);
+            let value_str = format!("value_{}", current_key_idx);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            expected_data.insert(key_bytes, value_bytes);
+        }
+
+        let r = writer.put(kvs_to_write);
+        let _ = r.recv();
+        wait_for_compact(db, config);
+        expected_data
+    }
+
+    #[test]
+    fn test_multiple_thread_write_and_read_in_orderd_batch() {
+        // Setup: Create DB with default test configuration
+        let mut config = crate::db::Config::config_for_test();
+        config.lsm_storage_config.memtable_size_limit = 40000;
+        let db = Arc::new(LsmDB::<Memstore>::new_with_memstore(config));
+
+        let num_writer_threads = 3;
+        let kvs_per_thread = 3000;
+        let num_batches_per_thread = 3;
+        let kvs_per_batch = kvs_per_thread / num_batches_per_thread;
+        let total_kvs = num_writer_threads * kvs_per_thread;
+
+        let expected_data: Arc<Mutex<HashMap<KeyBytes, ValueByte>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut handles = vec![];
+
+        for thread_idx in 0..num_writer_threads {
+            let db_clone = db.clone();
+            let expected_data_clone = expected_data.clone();
+
+            let handle = thread::spawn(move || {
+                let mut writer = db_clone.get_writer();
+                let start_key_idx = thread_idx * kvs_per_thread;
+
+                for batch_idx in 0..num_batches_per_thread {
+                    let mut kvs_to_write_batch: Vec<(KeyBytes, OpType)> =
+                        Vec::with_capacity(kvs_per_batch);
+                    let mut batch_expected_data: HashMap<KeyBytes, ValueByte> = HashMap::new();
+
+                    for i in 0..kvs_per_batch {
+                        let current_kv_idx = start_key_idx + batch_idx * kvs_per_batch + i;
+                        let key_str = pad_zero(current_kv_idx as u64);
+                        let value_str = format!("value_t{}_b{}_k{}", thread_idx, batch_idx, i);
+                        let key_bytes = KeyBytes::from(key_str.as_bytes());
+                        let value_bytes = ValueByte::from(value_str.as_bytes());
+
+                        kvs_to_write_batch
+                            .push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+                        batch_expected_data.insert(key_bytes, value_bytes);
+                    }
+
+                    // Write batch
+                    let r = writer.put(kvs_to_write_batch);
+                    r.recv().expect(&format!(
+                        "Write batch failed for thread {} batch {}",
+                        thread_idx, batch_idx
+                    ));
+
+                    // Update global expected data
+                    expected_data_clone
+                        .lock()
+                        .unwrap()
+                        .extend(batch_expected_data.clone());
+
+                    // Check by read after each write batch
+                    let reader_after_batch = db_clone.get_reader();
+                    for (key, expected_val) in batch_expected_data.iter() {
+                        let result = reader_after_batch.query(KeyVec::from(key.clone().as_ref()));
+                        match result {
+                            Some(kv_op) => {
+                                if let OpType::Write(actual_value) = kv_op.op {
+                                    assert_eq!(
+                                        actual_value.as_ref(),
+                                        expected_val.as_ref(),
+                                        "Value mismatch for key {:?} after batch write (thread {}, batch {})",
+                                        key, thread_idx, batch_idx
+                                    );
+                                } else {
+                                    panic!("Expected Write op, got {:?}", kv_op.op);
+                                }
+                            }
+                            None => panic!(
+                                "Key {:?} not found after batch write (thread {}, batch {})",
+                                key, thread_idx, batch_idx
+                            ),
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all writer threads to finish
+        for handle in handles {
+            handle.join().expect("Writer thread panicked");
+        }
+
+        // Wait until compaction finishes (give it ample time)
+        // The SLEEP_TIME is 100ms, so 10 * 100ms = 1 second should be enough for a few cycles.
+        // For larger data sets or slower machines, this might need adjustment.
+        std::thread::sleep(std::time::Duration::from_millis(super::SLEEP_TIME * 10));
+
+        // Check all data by read from a fresh reader
+        let final_reader = db.get_reader();
+        let expected_map = expected_data.lock().unwrap();
+        assert_eq!(
+            final_reader.snapshot.immtable_num(),
+            0,
+            "Immutable memtables should be empty after compaction"
+        );
+        assert!(
+            final_reader
+                .snapshot
+                .table_num_in_levels()
+                .iter()
+                .sum::<usize>()
+                > 0,
+            "Tables should exist in levels"
+        );
+
+        let mut ves: Vec<KeyBytes> = vec![];
+
+        let mut count = 00;
+        for (key, expected_val) in expected_map.iter() {
+            count += 1;
+            let result = final_reader.query(KeyVec::from(key.clone().as_ref()));
+            match result {
+                Some(kv_op) => {
+                    if let OpType::Write(actual_value) = kv_op.op {
+                        assert_eq!(
+                            actual_value.as_ref(),
+                            expected_val.as_ref(),
+                            "Final check: Value mismatch for key {:?}",
+                            key
+                        );
+                    } else {
+                        panic!("Final check: Expected Write op, got {:?}", kv_op.op);
+                    }
+                }
+                None => panic!("Final check: Key {:?} not found", key),
+                //     None => {
+                //         ves.push(key);
+                //     }
+            }
+        }
+        ves.sort();
+        if ves.len() > 0 {
+            panic!("error")
+        }
+        assert_eq!(
+            expected_map.len(),
+            total_kvs as usize,
+            "Total number of keys in expected map should match total KVs written"
+        );
+    }
+
+    #[test]
+    fn test_write_request_get_size() {
+        let mut data = Vec::new();
+
+        // Case 1: Write operation
+        let key1 = KeyBytes::from("key1".as_bytes());
+        let value1 = ValueByte::from("value1".as_bytes());
+        data.push((key1.clone(), OpType::Write(value1.clone())));
+        // Expected size for (key1, value1):
+        // key_len (u64) + key_data + op_type (u8) + value_len (u64) + value_data
+        // 8 + 4 + 1 + 8 + 6 = 27
+
+        // Case 2: Delete operation
+        let key2 = KeyBytes::from("key2".as_bytes());
+        data.push((key2.clone(), OpType::Delete));
+        // Expected size for (key2, Delete):
+        // key_len (u64) + key_data + op_type (u8)
+        // 8 + 4 + 1 = 13
+
+        let (request, _) = WriteRequest::new(data);
+        let actual_size = request.get_size();
+
+        // Calculate expected size manually
+        let expected_size_key1_write =
+            size_of::<u64>() + key1.len() + size_of::<u8>() + size_of::<u64>() + value1.len();
+        let expected_size_key2_delete = size_of::<u64>() + key2.len() + size_of::<u8>();
+
+        let total_expected_size = expected_size_key1_write + expected_size_key2_delete;
+
+        assert_eq!(
+            actual_size, total_expected_size,
+            "WriteRequest size mismatch"
+        );
+    }
+
+    #[test]
+    fn test_delete() {
+        // Setup: Create DB with default test configuration
+        let config = crate::db::Config::config_for_test();
+        let db = LsmDB::<Memstore>::new_with_memstore(config);
+        let mut writer = db.get_writer();
+
+        let key_str = "test_key_to_delete";
+        let value_str = "test_value";
+        let key_bytes = KeyBytes::from(key_str.as_bytes());
+        let value_bytes = ValueByte::from(value_str.as_bytes());
+
+        // 1. Write the key-value pair
+        let kvs_to_write = vec![(key_bytes.clone(), OpType::Write(value_bytes.clone()))];
+        let r1 = writer.put(kvs_to_write);
+        r1.recv().expect("Write failed to complete");
+
+        // Verify it's found after write
+        let reader_after_write = db.get_reader();
+        let query_key_vec = KeyVec::from(key_str.as_bytes());
+        let result_after_write = reader_after_write.query(query_key_vec.clone());
+        assert!(
+            result_after_write.is_some(),
+            "Key should be found immediately after write"
+        );
+        if let Some(kv_op) = result_after_write {
+            if let OpType::Write(actual_value) = kv_op.op {
+                assert_eq!(
+                    actual_value.as_ref(),
+                    value_bytes.as_ref(),
+                    "Value mismatch after write"
+                );
+            } else {
+                panic!("Expected Write op, got {:?}", kv_op.op);
+            }
+        }
+
+        // 2. Delete the key
+        let kvs_to_delete = vec![(key_bytes.clone(), OpType::Delete)];
+        let r2 = writer.put(kvs_to_delete);
+        r2.recv().expect("Delete failed to complete");
+
+        // 3. Query for the key and assert it should not be found
+        let reader_after_delete = db.get_reader();
+        let result_after_delete = reader_after_delete.query(query_key_vec.clone());
+        assert!(
+            result_after_delete.is_none(),
+            "Key should not be found after deletion"
+        );
+    }
+    #[test]
+    fn test_snapshot_read() {
+        // Setup: Create DB with default test configuration
+        let config = crate::db::Config::config_for_test();
+        let db = LsmDB::<Memstore>::new_with_memstore(config);
+        let mut writer = db.get_writer();
+
+        // 1. Write first batch of KVs
+        let num_kvs_first_batch = 50;
+        let mut kvs_to_write_first: Vec<(KeyBytes, OpType)> =
+            Vec::with_capacity(num_kvs_first_batch);
+        let mut expected_data_first: HashMap<KeyBytes, ValueByte> = HashMap::new();
+
+        for i in 0..num_kvs_first_batch {
+            let key_str = pad_zero(i as u64);
+            let value_str = format!("value_first_{}", i);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs_to_write_first.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            expected_data_first.insert(key_bytes, value_bytes);
+        }
+        let r1 = writer.put(kvs_to_write_first);
+        r1.recv().expect("First write failed to complete");
+
+        // 2. Get current op id as old_id
+        let old_id = db.current_op_id();
+
+        // 3. Write second batch of KVs
+        let num_kvs_second_batch = 50;
+        let mut kvs_to_write_second: Vec<(KeyBytes, OpType)> =
+            Vec::with_capacity(num_kvs_second_batch);
+        let mut expected_data_second: HashMap<KeyBytes, ValueByte> = HashMap::new();
+
+        for i in num_kvs_first_batch..(num_kvs_first_batch + num_kvs_second_batch) {
+            let key_str = pad_zero(i as u64);
+            let value_str = format!("value_second_{}", i);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs_to_write_second.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            expected_data_second.insert(key_bytes, value_bytes);
+        }
+        let r2 = writer.put(kvs_to_write_second);
+        r2.recv().expect("Second write failed to complete");
+
+        // 4. Use old_id to query: only old kvs can be found
+        let mut reader = db.get_reader();
+        reader.set_id(old_id - 1); // Set the reader's snapshot ID as last written id
+
+        // Verify first batch keys (should be found)
+        for i in 0..num_kvs_first_batch {
+            let key_str = pad_zero(i as u64);
+            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let result = reader.query(query_key_vec.clone());
+
+            let query_key_bytes = KeyBytes::from(key_str.as_bytes());
+            let expected_value = expected_data_first.get(&query_key_bytes);
+
+            match (result, expected_value) {
+                (Some(kv_op), Some(expected_val)) => {
+                    if let OpType::Write(actual_value) = kv_op.op {
+                        assert_eq!(
+                            actual_value.as_ref(),
+                            expected_val.inner().as_ref(),
+                            "Value mismatch for key {} in first batch",
+                            key_str
+                        );
+                    } else {
+                        panic!(
+                            "Expected Write op for key {} in first batch, got {:?}",
+                            key_str, kv_op.op
+                        );
+                    }
+                }
+                (None, Some(_)) => panic!(
+                    "Key {} from first batch not found by snapshot reader",
+                    key_str
+                ),
+                _ => panic!("Unexpected result for key {} from first batch", key_str),
+            }
+        }
+
+        // Verify second batch keys (should NOT be found)
+        for i in num_kvs_first_batch..(num_kvs_first_batch + num_kvs_second_batch) {
+            let key_str = pad_zero(i as u64);
+            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let result = reader.query(query_key_vec.clone());
+
+            assert!(
+                result.is_none(),
+                "Key {} from second batch unexpectedly found by snapshot reader (id: {})",
+                key_str,
+                reader.id
+            );
+        }
+    }
+    #[test]
+    fn test_compact() {
+        // Setup: Create DB with small memtable limit to trigger compaction
+        let mut config = crate::db::Config::config_for_test();
+        config.lsm_storage_config.memtable_size_limit = 1024; // Small limit
+        config.imm_size_limit = 1; // Allow only one immutable memtable before dump
+        let mut db = LsmDB::<Memstore>::new_with_memstore(config);
+
+        // Write Data: Write enough data to exceed the memtable limit
+        let mut writer = db.get_writer();
+        let num_kvs = 50; // Enough KVs to likely exceed 1024 bytes
+        let mut kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_kvs);
+        let mut expected_data: HashMap<KeyBytes, ValueByte> = HashMap::with_capacity(num_kvs);
+
+        for i in 0..num_kvs {
+            let key_str = pad_zero(i as u64);
+            let value_str = format!("value_compact_{}", i); // Use distinct values
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
+            expected_data.insert(key_bytes, value_bytes);
+        }
+        let r = writer.put(kvs_to_write);
+        r.recv().expect("Write failed to complete"); // Wait for write to finish
+
+        // Initial Check: Ensure no tables exist in levels yet (data in memtable)
+        // Note: Depending on timing, the memtable might already be frozen.
+        // A more robust check might be needed if the write worker is very fast.
+        // For simplicity, we assume the compaction thread hasn't run yet.
+        assert_eq!(
+            db.tables_count(),
+            0,
+            "Initially, there should be no tables in levels"
+        );
+
+        // start compact
+        db.trigger_compact();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Check Levels: Ensure tables were created by compaction/dump
+        assert!(
+            db.tables_count() > 0,
+            "After waiting, tables should exist in levels due to dump/compaction"
+        );
+
+        // Verify Data: Check some keys
+        let reader = db.get_reader();
+        for i in (0..num_kvs).step_by(5) {
+            // Check a subset of keys
+            let key_str = pad_zero(i as u64);
+            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let result = reader.query(query_key_vec.clone());
+
+            let query_key_bytes = KeyBytes::from(key_str.as_bytes());
+            let expected_value = expected_data.get(&query_key_bytes);
+
+            match (result, expected_value) {
+                (Some(kv_op), Some(expected_val)) => {
+                    if let OpType::Write(actual_value) = kv_op.op {
+                        assert_eq!(
+                            actual_value.as_ref(),
+                            expected_val.inner().as_ref(),
+                            "Value mismatch for key {} after compaction",
+                            key_str
+                        );
+                    } else {
+                        panic!(
+                            "Expected Write op for key {} after compaction, got {:?}",
+                            key_str, kv_op.op
+                        );
+                    }
+                }
+                (None, Some(_)) => panic!("Key {} not found after compaction", key_str),
+                (Some(_), None) => panic!("Unexpected key {} found after compaction", key_str),
+                (None, None) => panic!("Key {} not found (and not expected?)", key_str), // Should not happen
+            }
+        }
+    }
+
+    fn wait_for_compact(db: &mut LsmDB<Memstore>, config: crate::db::Config) {
+        let initial_compact_count = db.statistic.compact_count.load(Ordering::SeqCst);
+
+        // Trigger compaction manually.
+        db.trigger_compact();
+
+        // Loop and wait for compact_count to increase by at least one.
+        let mut loop_count = 0;
+        loop {
+            let current_compact_count = db.statistic.compact_count.load(Ordering::SeqCst);
+            if current_compact_count > initial_compact_count {
+                break;
+            }
+            loop_count += 1;
+            if loop_count > 10 {
+                panic!(
+                    "wait_for_compact loop exceeded 10 iterations without compaction. \
+                    Initial: {}, Current: {}",
+                    initial_compact_count, current_compact_count
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(config.thread_sleep_time));
+            // Prevent busy-waiting
+        }
+    }
+
+    /// Tests basic put and query functionality.
+    /// It writes a large number of key-value pairs, waits for compaction,
+    /// and then queries all keys to ensure data integrity and retrieval.
+    #[test]
+    fn test_basic_put_and_query() {
+        // create lsmdb use memstore 2 level ratio  2 zero level file
+        // The Config::config_for_test() sets memtable_size_limit and imm_size_limit.
+        // level_ratio is part of LsmStorageConfig, which is default 10.
+        let mut config = Config::config_for_test();
+        config.auto_compact = false;
+        config
+            .lsm_storage_config
+            .level_config
+            .table_config
+            .set_table_size(10 * 1024);
+        let mut db = LsmDB::<Memstore>::new_with_memstore(config);
+
+        let num_kvs = 1000;
+        let expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs);
+
+        assert_eq!(
+            db.table_num_in_levels().len(),
+            2,
+            "DB should have 2 levels after compaction and dump"
+        );
+
+        let reader = db.get_reader(); // Snapshot reader
+
+        let start_time = Instant::now(); // Record start time for read loop
+        for i in 0..num_kvs {
+            let key_str = pad_zero(i as u64);
+            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let result = reader.query(query_key_vec.clone()); // query expects KeyVec
+
+            // HashMap uses KeyBytes, so convert for lookup
+            let query_key_bytes = KeyBytes::from(key_str.as_bytes());
+            let expected_value = expected_data.get(&query_key_bytes);
+
+            match (result, expected_value) {
+                (Some(kv_op), Some(expected_val)) => {
+                    if let OpType::Write(actual_value) = kv_op.op {
+                        assert_eq!(
+                            actual_value.as_ref(),
+                            expected_val.inner().as_ref(), // Access inner Bytes and then as_ref()
+                            "Value mismatch for key {}",
+                            key_str
+                        );
+                    } else {
+                        panic!(
+                            "Expected a Write operation for key {}, but got {:?}",
+                            key_str, kv_op.op
+                        );
+                    }
+                }
+                (None, Some(_)) => {
+                    panic!("Key {} was expected to be found but was not.", key_str);
+                }
+                (Some(_), None) => {
+                    panic!("Key {} was not expected to be found but was.", key_str);
+                }
+                (None, None) => {
+                    // This case should not happen for initial writes.
+                    panic!(
+                        "Key {} was not found, but was expected to be present.",
+                        key_str
+                    );
+                }
+            }
+        }
+    }
+}
