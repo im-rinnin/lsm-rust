@@ -250,9 +250,19 @@ impl<T: Store> LsmDB<T> {
         let lsm_storage_guard = self.current.read().unwrap();
         lsm_storage_guard.memtable_size() >= self.config.lsm_storage_config.memtable_size_limit
     }
+    pub fn memtable_size(&self) -> usize {
+        // Acquire read lock to get the LsmStorage
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.memtable_size()
+        // Lock is released when guard goes out of scope
+    }
     pub fn need_dump(&self) -> bool {
         let lsm_storage_guard = self.current.read().unwrap();
         lsm_storage_guard.immtable_num() > 0
+    }
+    pub fn imm_memtable_count(&self) -> usize {
+        let lsm_storage_guard = self.current.read().unwrap();
+        lsm_storage_guard.immtable_num()
     }
     pub fn need_compact(&self) -> bool {
         let lsm_storage_guard = self.current.read().unwrap();
@@ -1321,7 +1331,7 @@ mod test {
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
 
         let num_kvs = 1000;
-        let expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs);
+        let mut expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs);
 
         assert_eq!(
             db.table_num_in_levels().len(),
@@ -1329,7 +1339,33 @@ mod test {
             "DB should have 2 levels after compaction and dump"
         );
 
-        let reader = db.get_reader(); // Snapshot reader
+        // Write more data after the first compaction to ensure memtable and immutable memtables are used during reads
+        info!("write more data after compact");
+        let num_kvs_second_batch = 30;
+        // write to immutable
+        let (r_second, expected_data_second_batch) =
+            write_kvs(&mut db.get_writer(), num_kvs as u64, num_kvs_second_batch);
+        r_second
+            .recv()
+            .expect("Second write batch failed to complete");
+        // write to memtable
+        let num_kvs_third_batch = 1;
+        let (r_third, expected_data_second_batch) =
+            write_kvs(&mut db.get_writer(), num_kvs as u64, num_kvs_third_batch);
+        r_third
+            .recv()
+            .expect("Second write batch failed to complete");
+        expected_data.extend(expected_data_second_batch);
+        assert!(
+            db.memtable_size() > 0,
+            "Active memtable should not be empty after second batch write"
+        );
+        assert!(
+            db.imm_memtable_count() > 0,
+            "Immutable memtables should exist after second batch write"
+        );
+
+        let reader = db.get_reader(); // Snapshot reader. This reader will see the newly written data.
 
         let start_time = Instant::now(); // Record start time for read loop
         for i in 0..num_kvs {
