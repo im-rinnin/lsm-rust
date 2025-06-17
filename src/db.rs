@@ -39,10 +39,10 @@ const WRITE_TIMEOUT_MS: u128 = 10; // Timeout in milliseconds
 
 struct WriteRequest {
     data: Vec<(KeyBytes, OpType)>,
-    done: Sender<()>,
+    done: Sender<OpId>,
 }
 impl WriteRequest {
-    fn new(data: Vec<(KeyBytes, OpType)>) -> (Self, Receiver<()>) {
+    fn new(data: Vec<(KeyBytes, OpType)>) -> (Self, Receiver<OpId>) {
         let (s, r) = bounded(1);
         let res = WriteRequest { data, done: s };
         (res, r)
@@ -460,7 +460,7 @@ impl<T: Store> LsmDB<T> {
         let (kvs, finishi) = (request.data, request.done);
 
         if kvs.is_empty() {
-            let _ = finishi.send(()); // Still send signal for empty requests
+            let _ = finishi.send(next_op_id.load(Ordering::SeqCst)); // Send current max OpId as no new ops were written
             return;
         }
 
@@ -483,7 +483,7 @@ impl<T: Store> LsmDB<T> {
             }
         }
         next_op_id.store(current_id, Ordering::SeqCst);
-        let _ = finishi.send(());
+        let _ = finishi.send(current_id - 1); // Send the last OpId of the processed batch
     }
 
     /// Determines whether the write worker should proceed with writing a batch of requests.
@@ -525,7 +525,7 @@ pub struct DBWriter {
     queue: Sender<WriteRequest>,
 }
 impl DBWriter {
-    pub fn put(&mut self, kvs: Vec<(KeyBytes, OpType)>) -> Receiver<()> {
+    pub fn put(&mut self, kvs: Vec<(KeyBytes, OpType)>) -> Receiver<OpId> {
         let (request, r) = WriteRequest::new(kvs);
 
         self.queue
@@ -555,6 +555,7 @@ impl<T: Store> DBReader<T> {
 }
 #[cfg(test)]
 mod test {
+    use super::common::OpId;
     use super::{Config, DBWriter, KeyBytes, OpType, ValueByte, WriteRequest};
     use crate::db::db_log;
     use crate::db::{store::Memstore, LsmDB};
@@ -1020,7 +1021,7 @@ mod test {
         writer: &mut DBWriter,
         start_key: u64,
         num_kvs: usize,
-    ) -> (Receiver<()>, HashMap<KeyBytes, ValueByte>) {
+    ) -> (Receiver<OpId>, HashMap<KeyBytes, ValueByte>) {
         let mut kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_kvs);
         let mut expected_data: HashMap<KeyBytes, ValueByte> = HashMap::with_capacity(num_kvs);
 
@@ -1171,6 +1172,50 @@ mod test {
             }
         }
         info!("Test backpressure: All data verified successfully.");
+    }
+
+    #[test]
+    fn test_write_request_opid_return() {
+        let config = crate::db::Config::config_for_test();
+        let db = LsmDB::<Memstore>::new_with_memstore(config);
+        let mut writer = db.get_writer();
+
+        let initial_op_id = db.current_op_id();
+
+        // Prepare a batch of KVs
+        let num_kvs_in_batch = 5;
+        let mut kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_kvs_in_batch);
+        for i in 0..num_kvs_in_batch {
+            let key_str = format!("key_opid_test_{}", i);
+            let value_str = format!("value_opid_test_{}", i);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            kvs_to_write.push((key_bytes, OpType::Write(value_bytes)));
+        }
+
+        // Send the write request and wait for the OpId
+        let r = writer.put(kvs_to_write);
+        let received_op_id = r.recv().expect("Failed to receive OpId from write request");
+
+        // The OpId returned should be the last OpId of the batch.
+        // Since current_op_id is incremented *after* the batch,
+        // (current_op_id - 1) is the last OpId of the previous batch.
+        // So, initial_op_id + num_kvs_in_batch - 1 should be the expected OpId.
+        let expected_op_id = initial_op_id + num_kvs_in_batch as u64 - 1;
+
+        assert_eq!(
+            received_op_id, expected_op_id,
+            "Received OpId mismatch with expected last OpId of the batch"
+        );
+
+        // Verify the db's current_op_id is correctly updated
+        assert_eq!(
+            db.current_op_id(),
+            initial_op_id + num_kvs_in_batch as u64,
+            "DB's current_op_id not updated correctly"
+        );
+
+        info!("test_write_request_opid_return completed successfully.");
     }
 
     // write/delete date use unordered key
