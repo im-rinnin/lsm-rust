@@ -560,12 +560,16 @@ mod test {
     use crate::db::db_log;
     use crate::db::{store::Memstore, LsmDB};
     use crossbeam_channel::Receiver;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use std::mem::size_of;
     use std::sync::atomic::Ordering;
-    use tracing::{info, Level};
+    use std::sync::RwLock;
+    use tracing::{info, warn, Level};
     use tracing_subscriber::filter::Targets;
 
     use crate::db::block::test::pad_zero;
+    use crate::db::common::KVOpertion; // Added for test_mutiple_thread_random_operaiton
     use crate::db::key::{KeyVec, ValueVec};
     use core::panic;
     use std::{
@@ -1453,5 +1457,257 @@ mod test {
                 }
             }
         }
+    }
+
+    //3 thread do write delete get in random order
+    //
+    //create db enable auto compact
+    //create a thread safe hashmap call data_states, contains all data latest state map<arc<mutex(key,optype)>>
+    //fill db with init data key from [0..1000],set them to hashmap data_states
+    //start 3 thread random pick key in range 0..3000, pick random operaiotn (write/put/get),do it, compare result with data_states(if read),update data_states
+    // wait for every thread do 1000 operaiotn
+    #[test]
+    fn test_mutiple_thread_random_operaiton() {
+        let mut config = crate::db::Config::config_for_test();
+        config.lsm_storage_config.memtable_size_limit = 40000;
+        config.auto_compact = true; // Let auto-compact run in background
+        config.thread_sleep_time = 10;
+        let mut db = LsmDB::<Memstore>::new_with_memstore(config);
+        let mut writer = db.get_writer();
+
+        // data_states: HashMap where each value is an Arc<Mutex<Option<KVOpertion>>>
+        // The outer Mutex protects the HashMap itself (adding/removing keys).
+        // The inner Mutex protects the KVOpertion for a specific key.
+        let data_states: Arc<RwLock<HashMap<KeyBytes, Arc<Mutex<Option<KVOpertion>>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // 1. Initial data population (keys 0..1000)
+        let num_initial_kvs = 1000;
+        let mut initial_kvs_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(num_initial_kvs);
+        for i in 0..num_initial_kvs {
+            let key_str = pad_zero(i as u64);
+            let value_str = format!("initial_value_{}", i);
+            let key_bytes = KeyBytes::from(key_str.as_bytes());
+            let value_bytes = ValueByte::from(value_str.as_bytes());
+            initial_kvs_to_write.push((key_bytes, OpType::Write(value_bytes)));
+        }
+        info!("Writing initial {} KVs to DB...", num_initial_kvs);
+        let r_initial = writer.put(initial_kvs_to_write.clone());
+        r_initial.recv().expect("Initial write failed to complete");
+
+        // Populate data_states based on initial write
+        {
+            let mut data_states_guard = data_states.write().unwrap();
+            let current_max_op_id_after_init = db.current_op_id();
+            // The OpId for the first key in the batch is `current_max_op_id - batch_size`.
+            let mut initial_op_id_base = current_max_op_id_after_init - num_initial_kvs as u64;
+
+            for (key_bytes, op_type) in initial_kvs_to_write {
+                let op_id = initial_op_id_base;
+                initial_op_id_base += 1;
+                let new_kv_op = KVOpertion::new(op_id, KeyVec::from(key_bytes.as_ref()), op_type);
+                data_states_guard.insert(key_bytes, Arc::new(Mutex::new(Some(new_kv_op))));
+            }
+        }
+        info!("Initial KVs populated in DB and data_states.");
+
+        // 2. Multi-threaded random operations
+        let num_threads = 20;
+        let ops_per_thread = 100;
+        let total_random_keys = 3000; // Keys from 0 to 2999
+
+        let mut handles = vec![];
+
+        let db = Arc::new(db);
+        for thread_idx in 0..num_threads {
+            let db_clone = db.clone();
+            let data_states_clone = data_states.clone();
+
+            let handle = thread::spawn(move || {
+                let mut writer = db_clone.get_writer();
+                let mut rng = StdRng::seed_from_u64(thread_idx as u64 + 123); // Seed per thread for distinct sequences
+
+                for ops_done_in_thread in 0..ops_per_thread {
+                    let key_idx = rng.gen_range(0..total_random_keys);
+                    let key_str = pad_zero(key_idx as u64);
+                    let key_bytes = KeyBytes::from(key_str.as_bytes());
+
+                    // 0=get, 1=write, 2=delete
+                    let op_choice = rng.gen_range(0..3);
+
+                    match op_choice {
+                        0 => {
+                            // GET operation
+                            let data_states_guard = data_states_clone.read().unwrap(); // Read access to the HashMap
+                            let key_entry_mutex_option = data_states_guard.get(&key_bytes);
+
+                            if let Some(key_entry_mutex) = key_entry_mutex_option {
+                                let data_state_entry_guard = key_entry_mutex.lock().unwrap();
+                                let current_reader = db_clone.get_reader(); // Snapshot reader for this query
+                                let db_result =
+                                    current_reader.query(KeyVec::from(key_bytes.as_ref()));
+                                if let Some(expected_kv) = &*data_state_entry_guard {
+                                    if expected_kv.id <= current_reader.id {
+                                        match (&expected_kv.op, db_result) {
+                                            (OpType::Write(expected_val), Some(actual_kv)) => {
+                                                if let OpType::Write(actual_val) = actual_kv.op {
+                                                    assert_eq!(actual_val.as_ref(), expected_val.as_ref(),
+                                                        "GET (visible): Value mismatch for key {:?}. Reader ID: {}, Expected OpId: {}",
+                                                        key_bytes, current_reader.id, expected_kv.id);
+                                                } else {
+                                                    panic!("GET (visible): Expected write, but found non-write op {:?} for key {:?}",
+                                                           actual_kv.op, key_bytes);
+                                                }
+                                            }
+                                            (OpType::Delete, None) => { /* Correct */ }
+                                            (OpType::Write(_), None) => {
+                                                panic!("GET (visible): Key {:?} expected to be found (Write), but not found by reader (id {}). Expected OpId: {}",
+                                                       key_bytes, current_reader.id, expected_kv.id);
+                                            }
+                                            (OpType::Delete, Some(actual_kv)) => {
+                                                panic!("GET (visible): Key {:?} expected to be deleted (visible Delete), but found {:?}. Reader ID: {}",
+                                                       key_bytes, actual_kv.op, current_reader.id);
+                                            }
+                                        }
+                                    } else {
+                                        // expected_kv.id > current_reader.id (not visible)
+                                        if let Some(actual_kv) = db_result {
+                                            if actual_kv.id >= expected_kv.id {
+                                                panic!(
+                                                    "GET (not visible): Key {:?} found with OpId {} >= latest expected OpId {} (not visible by reader id {})",
+                                                    key_bytes, actual_kv.id, expected_kv.id, current_reader.id
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // `key_entry_mutex` holds `None`
+                                    assert!(db_result.is_none(),
+                                        "GET: Key {:?} not expected (data_states `None`) but found in DB: {:?}", key_bytes, db_result);
+                                }
+                            } else {
+                                let current_reader = db_clone.get_reader(); // Snapshot reader for this query
+                                let db_result =
+                                    current_reader.query(KeyVec::from(key_bytes.as_ref()));
+                                // Key not present in `data_states` HashMap
+                                assert!(db_result.is_none(),
+                                    "GET: Key {:?} not expected (not in data_states map) but found in DB: {:?}", key_bytes, db_result);
+                            }
+                        }
+                        _ => {
+                            // WRITE (1) or DELETE (2) operation
+                            let value_str = format!(
+                                "value_t{}_o{}_k{}",
+                                thread_idx, ops_done_in_thread, key_idx
+                            );
+                            let value_bytes = ValueByte::from(value_str.as_bytes());
+                            let op_type = if op_choice == 1 {
+                                OpType::Write(value_bytes)
+                            } else {
+                                OpType::Delete
+                            };
+
+                            let key_entry_mutex = {
+                                let mut data_states_guard = data_states_clone.write().unwrap(); // Write access to the HashMap (for entry/insert)
+                                data_states_guard
+                                    .entry(key_bytes.clone())
+                                    .or_insert_with(|| Arc::new(Mutex::new(None)))
+                                    .clone()
+                            };
+
+                            let mut data_state_entry_guard = key_entry_mutex.lock().unwrap();
+
+                            let kvs_to_send = vec![(key_bytes.clone(), op_type.clone())];
+                            let r_op = writer.put(kvs_to_send);
+
+                            let committed_op_id = r_op.recv().expect(&format!(
+                                "Thread {} operation {} failed to receive OpId for key {:?}",
+                                thread_idx, ops_done_in_thread, key_bytes
+                            ));
+                            let new_kv_op = KVOpertion::new(
+                                committed_op_id,
+                                KeyVec::from(key_bytes.as_ref()),
+                                op_type,
+                            );
+                            *data_state_entry_guard = Some(new_kv_op);
+                        }
+                    }
+                }
+                info!(
+                    "Thread {} finished {} operations.",
+                    thread_idx, ops_per_thread
+                );
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Worker thread panicked");
+        }
+
+        let mut loop_count = 0;
+        loop {
+            if !db.need_freeze() && !db.need_dump() && !db.need_compact() {
+                break;
+            }
+            loop_count += 1;
+            if loop_count > 500 {
+                panic!(
+                    "Timeout waiting for background operations to complete. Freeze: {}, Dump: {}, Compact: {}",
+                    db.need_freeze(), db.need_dump(), db.need_compact()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(config.thread_sleep_time));
+        }
+        info!("Final background tasks completed.");
+
+        info!(
+            "Starting final verification against data_states (total keys: {}).",
+            data_states.read().unwrap().len() // Read access to the HashMap
+        );
+        let final_reader = db.get_reader();
+        let data_states_final_guard = data_states.read().unwrap(); // Read access to the HashMap
+
+        for (key_bytes, key_entry_mutex) in data_states_final_guard.iter() {
+            let data_state_entry_guard = key_entry_mutex.lock().unwrap();
+            let db_result = final_reader.query(KeyVec::from(key_bytes.as_ref()));
+
+            match (&*data_state_entry_guard, db_result) {
+                (Some(expected_kv), Some(actual_kv)) => {
+                    assert_eq!(
+                        actual_kv.key.as_ref(),
+                        expected_kv.key.as_ref(),
+                        "Final check: Key mismatch for {:?}",
+                        key_bytes
+                    );
+                    assert_eq!(
+                        actual_kv.op, expected_kv.op,
+                        "Final check: OpType mismatch for {:?}",
+                        key_bytes
+                    );
+                    assert_eq!(
+                        actual_kv.id, expected_kv.id,
+                        "Final check: OpId mismatch for key {:?}. Actual ID: {}, Expected ID: {}",
+                        key_bytes, actual_kv.id, expected_kv.id
+                    );
+                }
+                (Some(expected_kv), None) => {
+                    if matches!(expected_kv.op, OpType::Write(_)) {
+                        panic!("Final check: Key {:?} expected to be found (Write), but not found. Expected: {:?}", key_bytes, expected_kv);
+                    }
+                }
+                (None, Some(actual_kv)) => {
+                    panic!(
+                        "Final check: Key {:?} not expected (data_states `None`) but found: {:?}",
+                        key_bytes, actual_kv
+                    );
+                }
+                (None, None) => { /* Correct */ }
+            }
+        }
+        info!(
+            "Final verification completed successfully for {} keys.",
+            data_states_final_guard.len()
+        );
     }
 }
