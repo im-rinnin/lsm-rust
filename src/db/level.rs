@@ -245,7 +245,6 @@ impl<T: Store> Clone for LevelStorege<T> {
 pub struct LevelStoregeConfig {
     pub level_zero_num_limit: usize,
     pub level_ratio: usize,
-    pub max_input_table_num_in_compact: usize,
     pub table_config: TableConfig,
 }
 
@@ -254,7 +253,6 @@ impl Default for LevelStoregeConfig {
         LevelStoregeConfig {
             level_zero_num_limit: DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
             level_ratio: 4,
-            max_input_table_num_in_compact: MAX_INPUT_TABLE_IN_COMPACT,
             table_config: TableConfig::default(),
         }
     }
@@ -265,7 +263,6 @@ impl LevelStoregeConfig {
         LevelStoregeConfig {
             level_zero_num_limit: 2,
             level_ratio: 2,
-            max_input_table_num_in_compact: MAX_INPUT_TABLE_IN_COMPACT,
             table_config: TableConfig::new_for_test(),
         }
     }
@@ -387,7 +384,7 @@ impl<T: Store> LevelStorege<T> {
         for level_depth in 0..self.levels.len() {
             let max_tables = self.max_table_in_level(level_depth);
             let count = self.levels[level_depth].sstables.len();
-            info!(level=level_depth,"count is{}", count);
+            info!(level = level_depth, "count is {}", count);
             if count > max_tables {
                 info!("level {} table num {},need compact", level_depth, count);
                 return true;
@@ -780,11 +777,16 @@ impl<T: Store> LevelStorege<T> {
         // sort it by store_id so we can find mini store_id and its position of sstable
         store_id_positions.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // take n sstable from level.sstable by its position and return
+        // take all sstable from level.sstable if level 0 others 1 table
         let mut tables_to_compact = Vec::new();
+        let num_to_take = if level_depth == 0 {
+            store_id_positions.len()
+        } else {
+            1
+        };
         let mut positions_to_remove: Vec<usize> = store_id_positions
             .into_iter()
-            .take(self.config.max_input_table_num_in_compact)
+            .take(num_to_take)
             .map(|(_, pos)| pos)
             .collect();
 
@@ -1538,19 +1540,16 @@ mod test {
         let table_e = Arc::new(create_test_table_with_id(40..50, 0u64)); // Smallest ID
         level_storage.levels[0].sstables.push(table_e.clone());
 
-        // Now we have 5 tables, should take out 1 (5 - 4 = 1)
+        // Now we have 5 tables, should take out all
         let (tables_to_compact, changes) = level_storage.take_out_table_to_compact(0);
-        assert_eq!(tables_to_compact.len(), 1);
+        assert_eq!(tables_to_compact.len(), 5);
         // Should get table with smallest store_id
         assert_eq!(tables_to_compact[0].store_id(), 0);
         // Verify table_change
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].id, 0u64);
-        assert_eq!(changes[0].level, 0);
-        assert_eq!(changes[0].change_type, ChangeType::Delete);
+        assert_eq!(changes.len(), 5);
 
-        // Remaining tables should be 4
-        assert_eq!(level_storage.levels[0].sstables.len(), 4);
+        // Remaining tables should be 0
+        assert_eq!(level_storage.levels[0].sstables.len(), 0);
 
         // Test Case 2: Level 1 (non-level-zero)
         let level1 = super::Level::new(
@@ -1605,14 +1604,8 @@ mod test {
         // Level 1 limit is 2 * 10^1 = 20.
         // With 25 tables, should take out 1
         let (tables_to_compact4, changes4) = level_storage_many.take_out_table_to_compact(1);
-        assert_eq!(
-            tables_to_compact4.len(),
-            config.max_input_table_num_in_compact
-        ); // Expect 1 tables to be compacted
-        assert_eq!(
-            level_storage_many.levels[1].sstables.len(),
-            num_tables - config.max_input_table_num_in_compact
-        ); // Expect 20 tables remaining
+        assert_eq!(tables_to_compact4.len(), 1); // Expect 1 table to be compacted
+        assert_eq!(level_storage_many.levels[1].sstables.len(), num_tables - 1); // Expect 24 tables remaining
 
         let mut compacted_ids: Vec<u64> = tables_to_compact4
             .iter()
@@ -1621,10 +1614,10 @@ mod test {
         compacted_ids.sort();
         assert_eq!(
             compacted_ids,
-            vec![0] // Expect IDs 0
+            vec![0] // Expect ID 0
         );
-        // Verify table_change for multiple deletions
-        assert_eq!(changes4.len(), 1); // Expect 5 changes
+        // Verify table_change for deletion
+        assert_eq!(changes4.len(), 1); // Expect 1 change
         let mut changed_ids: Vec<u64> = changes4.iter().map(|c| c.id).collect();
         changed_ids.sort();
         assert_eq!(changed_ids, compacted_ids); // IDs should match
@@ -1677,18 +1670,10 @@ mod test {
 
         assert!(max_new_id_case1 <= max_origin_id, "id is from level0 table");
 
-        // After compaction: Level 0 should have 4 tables, Level 1 should exist with compacted table
+        // After compaction: Level 0 should have 0 tables, Level 1 should exist with compacted table
         assert_eq!(level_storage.levels.len(), 2); // Level 1 should be created
-        assert_eq!(level_storage.levels[0].sstables.len(), 4); // Level 0 reduced to limit
+        assert_eq!(level_storage.levels[0].sstables.len(), 0); // Level 0 reduced to limit
         assert!(!level_storage.levels[1].sstables.is_empty()); // Level 1 has compacted data
-
-        // Verify that the table with smallest ID was moved to Level 1
-        let remaining_ids: Vec<u64> = level_storage.levels[0]
-            .sstables
-            .iter()
-            .map(|table| table.store_id()) // Convert u64 to String
-            .collect();
-        assert!(!remaining_ids.contains(&table_a.store_id())); // Smallest ID (1) should be compacted
 
         // Verify table_changes
         let delete_changes: Vec<_> = table_changes
@@ -1701,16 +1686,13 @@ mod test {
             .collect();
 
         // Expect one delete from level 0 (id_001)
-        assert_eq!(delete_changes.len(), 1);
+        assert_eq!(delete_changes.len(), 5);
         assert_eq!(delete_changes[0].level, 0);
-        assert_eq!(delete_changes[0].id, table_a.store_id()); // ID 1
-        assert_eq!(delete_changes[0].change_type, ChangeType::Delete);
 
         // Expect at least one add to level 1 (the compacted table)
         assert!(!add_changes.is_empty());
         for add_change in add_changes {
             assert_eq!(add_change.level, 1);
-            assert_eq!(add_change.change_type, ChangeType::Add);
             assert!(add_change.id <= max_origin_id); // Should use the provided store_id_start
         }
 

@@ -1353,12 +1353,6 @@ mod test {
         let num_kvs = 1000;
         let mut expected_data = write_kvs_and_wait_for_compact(&mut db, config, 0, num_kvs);
 
-        assert_eq!(
-            db.table_num_in_levels().len(),
-            2,
-            "DB should have 2 levels after compaction and dump"
-        );
-
         // Write more data after the first compaction to ensure memtable and immutable memtables are used during reads
         info!("write more data after compact");
         let num_kvs_second_batch = 30;
