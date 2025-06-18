@@ -278,6 +278,13 @@ impl<T: Store> LevelStorege<T> {
             config,
         }
     }
+    // level zero table size reach limit
+    pub fn level_zero_need_reach_limit(&self) -> bool {
+        if self.levels.is_empty() {
+            return false;
+        }
+        self.levels[0].sstables.len() > self.config.level_zero_num_limit
+    }
     // return table number in every level, table number in level[0]=vec[0]
     pub fn table_num_in_levels(&self) -> Vec<usize> {
         self.levels
@@ -379,7 +386,10 @@ impl<T: Store> LevelStorege<T> {
     pub fn need_compact(&self) -> bool {
         for level_depth in 0..self.levels.len() {
             let max_tables = self.max_table_in_level(level_depth);
-            if self.levels[level_depth].sstables.len() > max_tables {
+            let count = self.levels[level_depth].sstables.len();
+            info!(level=level_depth,"count is{}", count);
+            if count > max_tables {
+                info!("level {} table num {},need compact", level_depth, count);
                 return true;
             }
         }

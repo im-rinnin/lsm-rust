@@ -83,6 +83,9 @@ impl<T: Store> LsmStorage<T> {
     pub fn need_compact(&self) -> bool {
         self.current.need_compact()
     }
+    pub fn level_zero_reach_limit(&self) -> bool {
+        self.current.level_zero_need_reach_limit()
+    }
 
     pub fn log_lsm_debug_info(&self) {
         if !tracing::event_enabled!(tracing::Level::INFO) {

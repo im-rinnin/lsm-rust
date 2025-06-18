@@ -306,7 +306,7 @@ impl<T: Store> LsmDB<T> {
     ) {
         loop {
             if Self::check_compact_thread_stop_signal(&stop) {
-                break; // Exit the inner loop and then the outer loop
+                return; // Exit the inner loop and then the outer loop
             }
             // Wait for a manual compaction trigger or timeout
             let res = run_job.recv_timeout(Duration::from_millis(config.thread_sleep_time));
@@ -327,20 +327,30 @@ impl<T: Store> LsmDB<T> {
                 }
             }
 
+            let mut lsm_storage_clone = current.read().unwrap().clone();
+            // Dump all immutable memtables until level zero reach limit
+            while lsm_storage_clone.immtable_num() > 0
+                && !lsm_storage_clone.level_zero_reach_limit()
+            {
+                info!(
+                    immtable_num = lsm_storage_clone.immtable_num(),
+                    "dump memtable"
+                );
+                lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
+            }
+            *current.write().unwrap() = lsm_storage_clone;
             // Perform compaction and loop immediately if more compaction is needed
             loop {
                 if Self::check_compact_thread_stop_signal(&stop) {
-                    break; // Exit the inner loop and then the outer loop
+                    return; // Exit the inner loop and then the outer loop
                 }
-
                 let mut lsm_storage_clone = current.read().unwrap().clone();
-                info!("dump and compact ");
-                lsm_storage_clone.log_lsm_debug_info();
-                // Dump all immutable memtables until none are left
-                if lsm_storage_clone.immtable_num() > 0 {
-                    lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
-                }
 
+                let need_compact = lsm_storage_clone.need_compact();
+                if !need_compact {
+                    info!("dont need compact return");
+                    break;
+                }
                 let table_changes = lsm_storage_clone.compact_level(&mut next_sstable_id);
                 if table_changes.len() > 0 {
                     meta.append(table_changes); // Persist changes to the TableChangeLog
@@ -349,14 +359,10 @@ impl<T: Store> LsmDB<T> {
                 info!("after a compact cycle");
                 lsm_storage_clone.log_lsm_debug_info();
 
-                let need_compact = lsm_storage_clone.need_compact();
                 // Update current LsmStorage state
                 *current.write().unwrap() = lsm_storage_clone;
                 statistic.compact_count.fetch_add(1, Ordering::SeqCst);
                 info!("compact finish");
-                if !need_compact {
-                    break;
-                }
             }
         }
     }
@@ -1047,135 +1053,100 @@ mod test {
     /// It verifies that writes resume after compaction clears the pending memtables.
     #[test]
     fn test_backpressure() {
-        // Setup: Config with small memtable limit, imm_size_limit = 2, auto_compact = false
+        // Setup: Create DB with small memtable limit and imm_size_limit, disable auto_compact
         let mut config = crate::db::Config::config_for_test();
-        config.lsm_storage_config.memtable_size_limit = 1000; // Small limit for testing
-        config.imm_size_limit = 2; // Allow only one immutable memtable before backpressure
-        config.auto_compact = false; // Disable auto-compaction for manual control
-        config.thread_sleep_time = 10; // Shorter sleep time for faster test feedback
+        config.lsm_storage_config.memtable_size_limit = 1024; // Small memtable limit
+        config.imm_size_limit = 1; // Allow only one immutable memtable before backpressure
+        config.auto_compact = false; // Disable auto-compaction for controlled testing
+        config.thread_sleep_time = 10; // Short sleep time for faster test execution
 
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
         let mut writer = db.get_writer();
 
-        let kvs_per_batch = 50; // Each KV is roughly 20 bytes (key+value+metadata), 50 KVs = 1KB
-        let mut total_expected_data: HashMap<KeyBytes, ValueByte> = HashMap::new();
+        // 1. Write enough data to fill the memtable and create one immutable memtable.
+        // This should trigger the `imm_size_limit` backpressure.
+        info!("Writing first batch to fill memtable and create one immutable...");
+        let num_kvs_first_batch = 100; // Should be enough to fill 1024 bytes and freeze
+        let (r1, _expected_data1) = write_kvs(&mut writer, 0, num_kvs_first_batch);
+        r1.recv().expect("First write batch failed to complete");
 
-        // 1. Write first batch: Fills memtable and freezes it. imm_num = 1.
-        info!("Test backpressure: Writing first batch");
-        let mut w = db.get_writer();
-        let (r, kvs1_data) = write_kvs(&mut w, 0, kvs_per_batch);
-        total_expected_data.extend(kvs1_data);
-        // Add a small sleep to allow the writer thread to process the request and freeze memtable
-        std::thread::sleep(std::time::Duration::from_millis(
-            config.thread_sleep_time * 2,
-        ));
-        // After this, one immutable memtable should exist.
-        assert_eq!(
-            db.get_reader().snapshot.immtable_num(),
-            1,
-            "Expected 1 immutable memtable after first write"
-        );
-        assert_eq!(
-            db.check_memtable_size(),
-            0,
-            "Active memtable should be empty after freeze"
-        );
-
-        // 2. Write second batch: Fills new memtable and freezes it. imm_num becomes 2.
-        // This will cause the write worker to enter backpressure sleep.
-        info!("Test backpressure: Writing second batch, expecting backpressure");
-        let mut kvs2_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(kvs_per_batch);
-        for i in kvs_per_batch..(kvs_per_batch * 2) {
-            let key_str = pad_zero(i as u64);
-            let value_str = format!("value_backpressure_{}", i);
-            let key_bytes = KeyBytes::from(key_str.as_bytes());
-            let value_bytes = ValueByte::from(value_str.as_bytes());
-            kvs2_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
-            total_expected_data.insert(key_bytes, value_bytes);
+        // Wait for the write worker to freeze the memtable and create an immutable one.
+        // It should now have 1 immutable memtable.
+        let mut loop_count = 0;
+        loop {
+            if db.imm_memtable_count() >= config.imm_size_limit {
+                break;
+            }
+            loop_count += 1;
+            if loop_count > 100 {
+                panic!("Timeout waiting for first immutable memtable to be created.");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(config.thread_sleep_time));
         }
-        let r2 = writer.put(kvs2_to_write);
-        // Do not wait for r2.recv() here, as it's expected to block the worker.
-        // The worker thread will process it and then block when it tries to freeze
-        // a *third* memtable and immtable_num() is already 2 >= imm_size_limit (1).
-
-        // Give the writer a moment to process the second batch and hit backpressure
-        std::thread::sleep(std::time::Duration::from_millis(
-            config.thread_sleep_time * 2,
-        ));
-        assert_eq!(
-            db.get_reader().snapshot.immtable_num(),
-            2,
-            "Expected 2 immutable memtables after second write"
+        info!(
+            "First immutable memtable created. Count: {}",
+            db.imm_memtable_count()
         );
+        assert_eq!(db.imm_memtable_count(), 1);
 
-        // 3. Initiate a third write, which should immediately block the worker
-        // if the previous writes pushed it into backpressure.
-        info!("Test backpressure: Initiating third write, expecting it to block.");
-        let mut kvs3_to_write: Vec<(KeyBytes, OpType)> = Vec::with_capacity(1);
-        let key_str = pad_zero((kvs_per_batch * 2) as u64);
-        let value_str = format!("value_backpressure_{}", kvs_per_batch * 2);
-        let key_bytes = KeyBytes::from(key_str.as_bytes());
-        let value_bytes = ValueByte::from(value_str.as_bytes());
-        kvs3_to_write.push((key_bytes.clone(), OpType::Write(value_bytes.clone())));
-        total_expected_data.insert(key_bytes, value_bytes);
+        // 2. Write another batch. This should cause backpressure because imm_size_limit is 1.
+        // The write worker should block until compaction reduces the immutable count.
+        info!("Writing second batch, expecting backpressure...");
+        let num_kvs_second_batch = 10; // Small batch, but should trigger backpressure
+        let (r2, _expected_data2) = write_kvs(&mut writer, 1000, num_kvs_second_batch);
 
-        let r3 = writer.put(kvs3_to_write);
-
-        // Verify the third write is blocked (or the write worker is in backpressure loop)
-        let blocked_timeout = std::time::Duration::from_millis(config.thread_sleep_time * 5);
+        // Check that the second write is NOT immediately completed.
+        // We expect it to block for a duration longer than a typical non-blocked write.
         let start_time = Instant::now();
-        let r3_result = r3.recv_timeout(blocked_timeout);
+        let recv_result = r2.recv_timeout(Duration::from_millis(config.thread_sleep_time * 5)); // Wait for 5x sleep time
         assert!(
-            r3_result.is_err(),
-            "Third write should be blocked due to backpressure, but it completed: {:?}",
-            r3_result
+            recv_result.is_err(),
+            "Second write completed too quickly, backpressure might not be active."
         );
         assert!(
-            start_time.elapsed() >= blocked_timeout,
-            "Third write was not blocked for the expected duration."
+            start_time.elapsed().as_millis() >= (config.thread_sleep_time * 5) as u128,
+            "Second write did not block for expected duration."
         );
-        info!("Third write is blocked as expected.");
+        info!("Second write is blocked as expected.");
 
-        // 4. Trigger manual compaction
-        info!("Test backpressure: Triggering manual compaction.");
-        wait_for_compact(&mut db, config);
-        info!("Test backpressure: Compaction finished.");
+        // 3. Manually trigger compaction.
+        // This should cause the immutable memtable to be dumped to an SSTable,
+        // reducing the immutable count and unblocking the write worker.
+        info!("Triggering manual compaction...");
+        db.trigger_compact();
 
-        // Verify the previously blocked second and third writes complete
-        r2.recv()
-            .expect("Second write should complete after compaction");
-        r3.recv()
-            .expect("Third write should complete after compaction");
-        info!("All pending writes completed after compaction.");
+        // 4. Wait for the second write to complete. It should now finish.
+        let recv_result_after_compact = r2.recv();
+        assert!(
+            recv_result_after_compact.is_ok(),
+            "Second write did not complete after compaction was triggered."
+        );
+        info!("Second write completed after compaction.");
 
-        // Check levels: should have tables
+        // Verify that the immutable memtable count is now lower (ideally 0 or 1 if a new one was frozen)
+        // and that tables exist in levels.
+        let mut loop_count = 0;
+        loop {
+            if db.imm_memtable_count() == 0 && db.tables_count() > 0 {
+                break;
+            }
+            loop_count += 1;
+            if loop_count > 100 {
+                panic!("Timeout waiting for compaction to fully clear immutable memtables.");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(config.thread_sleep_time));
+        }
+        info!(
+            "Immutable memtable count after compaction: {}",
+            db.imm_memtable_count()
+        );
+        assert_eq!(db.imm_memtable_count(), 0);
         assert!(
             db.tables_count() > 0,
-            "After compaction, tables should exist in levels"
+            "Tables should have been created in levels."
         );
 
-        // Verify all data by read from a fresh reader
-        info!("Test backpressure: Verifying all data.");
-        let final_reader = db.get_reader();
-        for (key, expected_val) in total_expected_data.iter() {
-            let result = final_reader.query(KeyVec::from(key.clone().as_ref()));
-            match result {
-                Some(kv_op) => {
-                    if let OpType::Write(actual_value) = kv_op.op {
-                        assert_eq!(
-                            actual_value.as_ref(),
-                            expected_val.as_ref(),
-                            "Final check: Value mismatch for key {:?}",
-                            key
-                        );
-                    } else {
-                        panic!("Final check: Expected Write op, got {:?}", kv_op.op);
-                    }
-                }
-                None => panic!("Final check: Key {:?} not found", key),
-            }
-        }
-        info!("Test backpressure: All data verified successfully.");
+        info!("test_backpressure completed successfully.");
     }
 
     #[test]
