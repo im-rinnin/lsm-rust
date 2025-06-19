@@ -130,6 +130,13 @@ impl<'a> KViterAgg<'a> {
 
 impl<'a> Iterator for KViterAgg<'a> {
     type Item = KVOpertion;
+    /// Advances the iterator and returns the next key-value operation.
+    /// This method implements a merge-sort-like logic:
+    /// It identifies the smallest key among all iterators. If keys are equal,
+    /// it prioritizes the operation with the highest `OpId` (latest write).
+    /// After selecting an operation, it invalidates any other operations
+    /// with the exact same key from different iterators to ensure that
+    /// only the most recent operation for a given key is yielded.
     fn next(&mut self) -> Option<Self::Item> {
         let mut has_next = false;
         for (i, n) in self.iters_next.iter_mut().enumerate() {

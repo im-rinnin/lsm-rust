@@ -85,7 +85,7 @@ const SLEEP_TIME: u64 = 10;
 pub struct Config {
     pub lsm_storage_config: LsmStorageConfig,
     pub request_queue_len: usize,
-    pub imm_size_limit: usize,
+    pub imm_num_limit: usize,
     pub thread_sleep_time: u64,
     pub request_queue_size: usize,
     pub auto_compact: bool,
@@ -96,7 +96,7 @@ impl Default for Config {
         Config {
             lsm_storage_config: LsmStorageConfig::default(),
             request_queue_len: 500,
-            imm_size_limit: 2,
+            imm_num_limit: 2,
             thread_sleep_time: 100,
             request_queue_size: 1000,
             auto_compact: true,
@@ -438,11 +438,11 @@ impl<T: Store> LsmDB<T> {
                     lsm_storage_guard.freeze_memtable();
 
                     // Check immutable memtable count and wait if it exceeds the limit
-                    while lsm_storage_guard.immtable_num() >= c.imm_size_limit {
+                    while lsm_storage_guard.immtable_num() >= c.imm_num_limit {
                         drop(lsm_storage_guard); // Release write lock before sleeping
                         info!(
                             "Too many immutable memtables ({}), waiting for compaction...",
-                            c.imm_size_limit
+                            c.imm_num_limit
                         );
                         std::thread::sleep(std::time::Duration::from_millis(c.thread_sleep_time));
                         lsm_storage_guard = current_lsm.write().unwrap(); // Re-acquire lock
@@ -926,7 +926,7 @@ mod test {
         // Setup: Create DB with small memtable limit to trigger compaction
         let mut config = crate::db::Config::config_for_test();
         config.lsm_storage_config.memtable_size_limit = 1024; // Small limit
-        config.imm_size_limit = 1; // Allow only one immutable memtable before dump
+        config.imm_num_limit = 1; // Allow only one immutable memtable before dump
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
 
         // Write Data: Write enough data to exceed the memtable limit
@@ -1056,7 +1056,7 @@ mod test {
         // Setup: Create DB with small memtable limit and imm_size_limit, disable auto_compact
         let mut config = crate::db::Config::config_for_test();
         config.lsm_storage_config.memtable_size_limit = 1024; // Small memtable limit
-        config.imm_size_limit = 1; // Allow only one immutable memtable before backpressure
+        config.imm_num_limit = 1; // Allow only one immutable memtable before backpressure
         config.auto_compact = false; // Disable auto-compaction for controlled testing
         config.thread_sleep_time = 10; // Short sleep time for faster test execution
 
@@ -1074,7 +1074,7 @@ mod test {
         // It should now have 1 immutable memtable.
         let mut loop_count = 0;
         loop {
-            if db.imm_memtable_count() >= config.imm_size_limit {
+            if db.imm_memtable_count() >= config.imm_num_limit {
                 break;
             }
             loop_count += 1;
@@ -1434,9 +1434,10 @@ mod test {
     #[test]
     fn test_mutiple_thread_random_operaiton() {
         let mut config = crate::db::Config::config_for_test();
-        config.lsm_storage_config.memtable_size_limit = 40000;
+        config.lsm_storage_config.memtable_size_limit = 10000;
+        config.imm_num_limit = 10;
         config.auto_compact = true; // Let auto-compact run in background
-        config.thread_sleep_time = 10;
+        config.thread_sleep_time = 1;
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
         let mut writer = db.get_writer();
 
@@ -1478,7 +1479,7 @@ mod test {
 
         // 2. Multi-threaded random operations
         let num_threads = 20;
-        let ops_per_thread = 100;
+        let ops_per_thread = 1000;
         let total_random_keys = 3000; // Keys from 0 to 2999
 
         let mut handles = vec![];
@@ -1640,6 +1641,11 @@ mod test {
             match (&*data_state_entry_guard, db_result) {
                 (Some(expected_kv), Some(actual_kv)) => {
                     assert_eq!(
+                        actual_kv.id, expected_kv.id,
+                        "Final check: OpId mismatch for key {:?}. Actual ID: {}, Expected ID: {}",
+                        key_bytes, actual_kv.id, expected_kv.id
+                    );
+                    assert_eq!(
                         actual_kv.key.as_ref(),
                         expected_kv.key.as_ref(),
                         "Final check: Key mismatch for {:?}",
@@ -1649,11 +1655,6 @@ mod test {
                         actual_kv.op, expected_kv.op,
                         "Final check: OpType mismatch for {:?}",
                         key_bytes
-                    );
-                    assert_eq!(
-                        actual_kv.id, expected_kv.id,
-                        "Final check: OpId mismatch for key {:?}. Actual ID: {}, Expected ID: {}",
-                        key_bytes, actual_kv.id, expected_kv.id
                     );
                 }
                 (Some(expected_kv), None) => {

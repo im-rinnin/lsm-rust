@@ -15,6 +15,9 @@ pub struct Memtable {
 
 pub struct MemtableIterator<'a> {
     inner_iter: crossbeam_skiplist::map::Iter<'a, (KeyBytes, OpId), OpType>,
+    // This field stores the current entry that has been "peeked" from `inner_iter`
+    // but not yet processed (i.e., its key group hasn't been fully deduplicated).
+    peeked_entry: Option<Entry<'a, (KeyBytes, OpId), OpType>>,
 }
 
 impl Memtable {
@@ -57,8 +60,11 @@ impl Memtable {
     }
 
     pub fn to_iter<'a>(&'a self) -> MemtableIterator<'a> {
+        let mut iter = self.table.iter();
+        let first_entry = iter.next(); // Pre-fetch the very first item
         MemtableIterator {
-            inner_iter: self.table.iter(),
+            inner_iter: iter,
+            peeked_entry: first_entry,
         }
     }
 
@@ -76,22 +82,65 @@ impl<'a> Iterator for MemtableIterator<'a> {
     type Item = KVOpertion;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner_iter.next().map(|entry| {
-            let (key_bytes, op_id) = entry.key();
-            let op_type = entry.value();
-            // Clone the key and op_type as KVOpertion takes ownership
-            KVOpertion {
-                id: *op_id,
-                key: key_bytes.clone(),
-                op: op_type.clone(),
+        // Get the current candidate entry. If `peeked_entry` is `None`, try to fetch from `inner_iter`.
+        let mut best_entry = match self.peeked_entry.take() {
+            Some(entry) => entry,
+            None => {
+                // If `peeked_entry` was `None`, try to get the next from the underlying iterator.
+                // If that's also `None`, then the iterator is exhausted.
+                self.inner_iter.next()?
             }
+        };
+
+        // Establish the key we are currently processing.
+        // We clone here to own the KeyBytes, so it doesn't borrow `best_entry`.
+        // This allows `best_entry` to be reassigned later without borrow conflicts.
+        let current_group_key = best_entry.key().0.clone();
+
+        // Loop to find the last (max OpId) entry for this `current_group_key`.
+        loop {
+            // Try to get the next raw entry from the inner iterator.
+            match self.inner_iter.next() {
+                Some(next_raw_entry) => {
+                    // Compare the key of the `next_raw_entry` with our `current_group_key`.
+                    if next_raw_entry.key().0 == current_group_key {
+                        // Same key: this `next_raw_entry` is newer (due to SkipMap's OpId sorting),
+                        // so it becomes the new `best_entry` for this key group.
+                        best_entry = next_raw_entry;
+                        // Continue the loop to find even newer versions of this same key.
+                    } else {
+                        // Different key encountered.
+                        // `best_entry` now holds the latest operation for the *previous* key group.
+                        // `next_raw_entry` is the first operation of the *new* key group.
+                        // Store `next_raw_entry` in `peeked_entry` for the *next* call to `next()`.
+                        self.peeked_entry = Some(next_raw_entry);
+                        break; // Exit inner loop; we've found our `best_entry` to return.
+                    }
+                }
+                None => {
+                    // Inner iterator exhausted. No more items.
+                    self.peeked_entry = None; // Explicitly clear, as nothing follows.
+                    break; // Exit inner loop; `best_entry` is the final one.
+                }
+            }
+        }
+
+        // Convert the `best_entry` (which is the latest for its key group)
+        // into the `KVOpertion` to be returned.
+        Some(KVOpertion {
+            id: best_entry.key().1,
+            key: best_entry.key().0.clone(), // Clone the KeyBytes for ownership
+            op: best_entry.value().clone(),  // Clone the OpType for ownership
         })
     }
 }
 
 #[cfg(test)]
 mod test {
+    use tracing::info;
+
     use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
+    use crate::db::db_log;
     use crate::db::key::{KeyBytes, KeyVec};
 
     fn get_next_id(id: &mut OpId) -> OpId {
@@ -337,6 +386,112 @@ mod test {
     }
 
     #[test]
+    fn test_iter_order() {
+        let m = Memtable::new(TEST_MEMTABLE_CAPACITY);
+        let mut id = 0;
+
+        // Insert data in an "unordered" way to test the SkipMap's internal sorting
+        // and the iterator's deduplication logic.
+        // We expect (key, op_id) to be the sorting order.
+        let mut inserted_ops = Vec::new();
+
+        let mut add_op = |m: &Memtable, key: &str, value: &str, op_id_gen: &mut OpId| {
+            let op_id = get_next_id(op_id_gen);
+            let op_type = OpType::Write(value.as_bytes().into());
+            let op = KVOpertion::new(op_id, key.as_bytes().into(), op_type.clone());
+            m.insert(op).unwrap();
+            inserted_ops.push((key.to_string(), op_id, op_type));
+        };
+
+        // Key "b", op_id 0
+        add_op(&m, "b", "val_b_0", &mut id);
+        // Key "a", op_id 1
+        add_op(&m, "a", "val_a_1", &mut id);
+        // Key "c", op_id 2
+        add_op(&m, "c", "val_c_2", &mut id);
+        // Key "b", op_id 3 (newer version of "b")
+        add_op(&m, "b", "val_b_3", &mut id);
+        // Key "a", op_id 4 (newer version of "a")
+        add_op(&m, "a", "val_a_4", &mut id);
+        // Key "a", op_id 5 (even newer version of "a")
+        add_op(&m, "a", "val_a_5", &mut id);
+        // Key "d", op_id 6, Delete
+        let op_id_delete_d = get_next_id(&mut id);
+        let op = KVOpertion::new(op_id_delete_d, "d".as_bytes().into(), OpType::Delete);
+        m.insert(op).unwrap();
+        // Key "d", op_id 7, Write (after delete)
+        add_op(&m, "d", "val_d_7", &mut id);
+        inserted_ops.push(("d".to_string(), op_id_delete_d, OpType::Delete));
+
+        // Sort the expected data by (key, op_id) to match the SkipMap's internal order
+        inserted_ops.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut actual_iter_data: Vec<(String, OpId, OpType)> = Vec::new();
+        for entry in m.to_iter() {
+            actual_iter_data.push((entry.key.to_string(), entry.id, entry.op.clone()));
+        }
+
+        // The MemtableIterator deduplicates keys, returning only the latest OpId for each key.
+        // So, `actual_iter_data` should contain only the final state for each unique key.
+        // We need to process `inserted_ops` to get the 'expected' deduplicated and sorted list.
+
+        let mut expected_deduplicated_data: Vec<KVOpertion> = Vec::new();
+        for (key_str, op_id, op_type) in inserted_ops {
+            let key = KeyBytes::from(key_str.as_bytes());
+            let op = KVOpertion::new(op_id, KeyVec::from(key.clone().as_ref()), op_type);
+
+            // Find if this key already exists in the result, and replace if new op_id is higher
+            let mut found = false;
+            for existing_op in &mut expected_deduplicated_data {
+                if existing_op.key == key {
+                    // This relies on `inserted_ops` being sorted by key, then op_id,
+                    // so the last one encountered for a key will be the latest.
+                    *existing_op = op.clone();
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                expected_deduplicated_data.push(op);
+            }
+        }
+        // Ensure final expected data is also sorted by key, then OpId (though OpId should be unique for a key now)
+        expected_deduplicated_data.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.id.cmp(&b.id)));
+
+        assert_eq!(actual_iter_data.len(), expected_deduplicated_data.len());
+
+        for (i, actual) in actual_iter_data.iter().enumerate() {
+            let expected = &expected_deduplicated_data[i];
+            assert_eq!(
+                actual.0,
+                expected.key.to_string(),
+                "Key mismatch at index {}",
+                i
+            );
+            assert_eq!(
+                actual.1, expected.id,
+                "OpId mismatch for key {} at index {}",
+                actual.0, i
+            );
+            match (&actual.2, &expected.op) {
+                (OpType::Write(v1), OpType::Write(v2)) => {
+                    assert_eq!(v1, v2, "Value mismatch for key {} at index {}", actual.0, i)
+                }
+                (OpType::Delete, OpType::Delete) => {}
+                _ => panic!("OpType mismatch for key {} at index {}", actual.0, i),
+            }
+        }
+
+        // Additionally, test specific expected final values
+        let mut iter = m.to_iter();
+        assert_eq!(iter.next().unwrap().key.to_string(), "a");
+        assert_eq!(iter.next().unwrap().key.to_string(), "b");
+        assert_eq!(iter.next().unwrap().key.to_string(), "c");
+        assert_eq!(iter.next().unwrap().key.to_string(), "d");
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
     fn test_iterator() {
         let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         let mut id = 0;
@@ -347,6 +502,8 @@ mod test {
             (1, OpType::Write(1.to_string().as_bytes().into())),
             (4, OpType::Write(4.to_string().as_bytes().into())),
             (0, OpType::Write(0.to_string().as_bytes().into())),
+            (2, OpType::Delete),
+            (3, OpType::Write(100.to_string().as_bytes().into())),
         ];
 
         let mut expected_iter_data: Vec<(String, OpId, OpType)> = Vec::new();
@@ -358,25 +515,9 @@ mod test {
             m.insert(op).unwrap();
         }
 
-        // delete 2
-        let op_id_delete_2 = get_next_id(&mut id);
-        let op = KVOpertion::new(
-            op_id_delete_2,
-            2.to_string().as_bytes().into(),
-            OpType::Delete,
-        );
-        expected_iter_data.push((2.to_string(), op_id_delete_2, op.op.clone()));
-        m.insert(op).unwrap();
-
-        // overwirte 3 to 100
-        let op_id_overwrite_3 = get_next_id(&mut id);
-        let op = KVOpertion::new(
-            op_id_overwrite_3,
-            3.to_string().as_bytes().into(),
-            OpType::Write(100.to_string().as_bytes().into()),
-        );
-        expected_iter_data.push((3.to_string(), op_id_overwrite_3, op.op.clone()));
-        m.insert(op).unwrap();
+        // remvoe duplicate 2 and 3
+        expected_iter_data.remove(0);
+        expected_iter_data.remove(0);
 
         // Sort expected data by (key, op_id) to match SkipMap iteration order
         expected_iter_data.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
