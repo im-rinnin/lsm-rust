@@ -1,8 +1,26 @@
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Write,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    vec,
+};
 
+use once_cell::sync::Lazy;
 use tracing::info;
 
 pub type StoreId = u64;
+pub const PRIVATE_STORE_ID_MAX: u64 = 100000;
+static STORE_ID_OFFSET: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(PRIVATE_STORE_ID_MAX));
+pub fn fetch_add_store_id() -> u64 {
+    STORE_ID_OFFSET.fetch_add(PRIVATE_STORE_ID_MAX, Ordering::SeqCst)
+}
+static MEM_POOL: Lazy<Arc<Mutex<HashMap<StoreId, Arc<Mutex<Vec<u8>>>>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 // append only data store
 pub trait Store {
     fn flush(&mut self);
@@ -20,7 +38,7 @@ pub trait Store {
 }
 
 pub struct Memstore {
-    store: Vec<u8>,
+    store: Arc<Mutex<Vec<u8>>>,
     id: StoreId,
 }
 pub struct Filestore {
@@ -29,53 +47,59 @@ pub struct Filestore {
     filename: String,
 }
 
-impl Memstore {}
-
 impl Store for Memstore {
     fn close(self) {}
     fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self {
         Self::open(id)
     }
+
     fn open(id: StoreId) -> Self {
-        Memstore {
-            store: Vec::new(),
-            id,
-        }
+        let store = if id < PRIVATE_STORE_ID_MAX {
+            Arc::new(Mutex::new(vec![]))
+        } else {
+            let mut pool = MEM_POOL.lock().unwrap();
+            pool.entry(id)
+                .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+                .clone()
+        };
+        Memstore { store, id }
     }
     fn id(&self) -> StoreId {
         self.id
     }
 
     fn len(&self) -> usize {
-        self.store.len()
+        self.store.lock().unwrap().len()
     }
     fn flush(&mut self) {}
     fn append(&mut self, data: &[u8]) {
-        self.store.extend_from_slice(data);
+        self.store.lock().unwrap().extend_from_slice(data);
     }
     fn read_at(&self, buf: &mut [u8], offset: usize) {
-        let _end_offset = offset + buf.len();
-        if offset >= self.store.len() {
+        let store_guard = self.store.lock().unwrap();
+        let store_len = store_guard.len();
+        if offset >= store_len {
             // If offset is beyond current data, fill buffer with zeros
             buf.fill(0);
             return;
         }
-        let bytes_to_read = (self.store.len() - offset).min(buf.len());
-        buf[..bytes_to_read].copy_from_slice(&self.store[offset..offset + bytes_to_read]);
+        let bytes_to_read = (store_len - offset).min(buf.len());
+        buf[..bytes_to_read].copy_from_slice(&store_guard[offset..offset + bytes_to_read]);
         // If the buffer is larger than available data, pad the rest with zeros
         if bytes_to_read < buf.len() {
             buf[bytes_to_read..].fill(0);
         }
     }
     fn seek(&mut self, position: usize) {
-        let current_len = self.store.len();
+        let mut store_guard = self.store.lock().unwrap();
+        let current_len = store_guard.len();
         assert!(
             current_len <= position,
             "Seeking backwards is not allowed in append-only store logic"
         );
         if position > current_len {
             // Pad with zeros to reach the desired position
-            self.store.resize(position, 0);
+            store_guard.resize(position, 0);
         }
         // For Vec<u8>, 'seeking' just means ensuring its length is at least 'position'.
         // Subsequent appends will start from 'position'.
@@ -171,10 +195,13 @@ impl Store for Filestore {
 
 #[cfg(test)]
 mod test {
+    use crate::db::store::{fetch_add_store_id, PRIVATE_STORE_ID_MAX};
+
     use super::Filestore;
     use std::{
         fs::File,
         io::{Read, Write},
+        mem,
         str::FromStr,
     };
     use tempfile::NamedTempFile;
@@ -187,7 +214,7 @@ mod test {
         let mut m = Memstore::open(id);
         let data = b"0123456789abcdef";
         m.append(data);
-        let original_len = m.store.len();
+        let original_len = m.len();
         assert_eq!(original_len, data.len());
 
         // Read from offset 5, length 4
@@ -195,13 +222,13 @@ mod test {
         m.read_at(&mut read_buf, 5);
         assert_eq!(&read_buf, b"5678");
         // Check length is not changed by read_at
-        assert_eq!(m.store.len(), original_len);
+        assert_eq!(m.len(), original_len);
 
         // Read from offset 0, length 10
         let mut read_buf_2 = [0u8; 10];
         m.read_at(&mut read_buf_2, 0);
         assert_eq!(&read_buf_2, b"0123456789");
-        assert_eq!(m.store.len(), original_len);
+        assert_eq!(m.len(), original_len);
     }
     #[test]
     fn test_write_at_memstore() {
@@ -209,17 +236,17 @@ mod test {
         let mut m = Memstore::open(id);
         let initial_data = b"initial";
         m.append(initial_data);
-        let initial_len = m.store.len();
+        let initial_len = m.len();
         assert_eq!(initial_len, initial_data.len());
 
         // Test seeking forward
         let seek_pos = initial_len + 10;
         m.seek(seek_pos);
-        assert_eq!(m.store.len(), seek_pos);
+        assert_eq!(m.len(), seek_pos);
 
         // Test seeking to current position (should work)
         m.seek(seek_pos);
-        assert_eq!(m.store.len(), seek_pos);
+        assert_eq!(m.len(), seek_pos);
     }
 
     #[test]
@@ -388,17 +415,35 @@ mod test {
     }
 
     #[test]
+    fn test_shared_and_private_memstore() {
+        let id = fetch_add_store_id();
+        let mut memstore = Memstore::open(id);
+        memstore.append("test".as_bytes());
+        assert_eq!(memstore.len(), 4);
+        drop(memstore);
+        let mut memstore = Memstore::open(id);
+        assert_eq!(memstore.len(), 4);
+
+        let mut memstore = Memstore::open(0);
+        memstore.append("test".as_bytes());
+        assert_eq!(memstore.len(), 4);
+        drop(memstore);
+        let id = 0;
+        let mut memstore = Memstore::open(id);
+        assert_eq!(memstore.len(), 0);
+    }
+    #[test]
     fn test_memstore_pad_in_write() {
         let id = 9u64; // Using a unique ID for this test
         let mut m = Memstore::open(id);
 
         // Write initial data
         m.append(b"initial");
-        assert_eq!(m.store.len(), 7);
+        assert_eq!(m.len(), 7);
 
         // Seek forward with padding
         m.seek(10);
-        assert_eq!(m.store.len(), 10);
+        assert_eq!(m.len(), 10);
 
         // Verify padding was written
         let mut buf = vec![0; 10];
@@ -407,6 +452,6 @@ mod test {
         assert_eq!(&buf[7..10], &[0u8; 3]);
 
         // Verify length is maintained
-        assert_eq!(m.store.len(), 10);
+        assert_eq!(m.len(), 10);
     }
 }

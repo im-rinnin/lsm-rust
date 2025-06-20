@@ -2201,7 +2201,7 @@ mod test {
 
     #[test]
     fn test_table_change_log_corrupted_checksum() {
-        let store_id = 1000;
+        let store_id = 100;
         let mut memstore = Memstore::open(store_id);
 
         // Manually create a valid TableChange and its encoded bytes

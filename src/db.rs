@@ -31,7 +31,8 @@ mod table;
 use level::TableChangeLog;
 use logfile::LogFile;
 use lsm_storage::{LsmStorage, LsmStorageConfig};
-use store::{Memstore, Store, StoreId};
+use once_cell::sync::Lazy;
+use store::{fetch_add_store_id, Memstore, Store, StoreId};
 use tracing::info;
 
 const START_WRITE_REQUEST_QUEUE_LEN: usize = 100;
@@ -133,11 +134,14 @@ impl LsmDB<Memstore> {
         // Create the initial LsmStorage, wrapped in Arc<RwLock<...>>
         let initial_lsm_storage = Arc::new(RwLock::new(LsmStorage::new(config.lsm_storage_config)));
 
+        let mut store_id = fetch_add_store_id();
         // Create LogFile and TableChangeLog with unique Memstore instances
-        let logfile_store_id = 0;
+        let logfile_store_id = store_id;
+        store_id += 1;
         let logfile = LogFile::<Memstore>::open(logfile_store_id);
 
-        let level_meta_log_store_id = 1; // Use a different ID from logfile
+        let level_meta_log_store_id = store_id; // Use a different ID from logfile
+        store_id += 1;
         let level_meta_log = TableChangeLog::<Memstore>::from(level_meta_log_store_id);
 
         // Create the channel for write requests
@@ -189,8 +193,9 @@ impl LsmDB<Memstore> {
         // Prepare data for the compaction thread
         let compaction_lsm_state = res.current.clone();
         let compaction_config = config; // Clone or copy config if needed, struct is Copy
-        let mut next_sstable_id_start_value: StoreId = 0; // Start after logfile and meta log
-                                                          // todo: load next_sstable_id from storage
+        let mut next_sstable_id_start_value: StoreId = store_id; // Start after logfile and meta log
+        store_id += 1;
+        // todo: load next_sstable_id from storage
 
         // Start dump_and_compact_thread in a new thread
         let c_stop_flag = stop_flag.clone(); // Clone for compaction thread
@@ -211,7 +216,7 @@ impl LsmDB<Memstore> {
         res
     }
 
-    fn trigger_compact(&mut self) {
+    pub fn trigger_compact(&mut self) {
         self.trigger_compact.send(()).unwrap();
     }
 }
