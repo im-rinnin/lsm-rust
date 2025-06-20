@@ -12,7 +12,10 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::Hasher;
 use tracing::info;
 
-use crate::db::{common::KViterAgg, key::KeyBytes};
+use crate::db::{
+    common::KViterAgg,
+    key::{self, KeyBytes},
+};
 use tracing::debug;
 
 use super::{
@@ -622,10 +625,27 @@ impl<T: Store> LevelStorege<T> {
             .map(|it| it as &mut dyn Iterator<Item = KVOpertion>)
             .collect();
 
-        let mut kv_iter_agg = KViterAgg::new(iterators_for_agg);
+        let kv_iter_agg = KViterAgg::new(iterators_for_agg);
         let mut compacted_tables = Vec::new();
 
-        if let Some(mut op) = kv_iter_agg.next() {
+        // Check if the target level is the deepest level (and not level 0)
+        let is_target_deepest_level = target_level > 0 && target_level == self.levels.len() - 1;
+
+        // If it's the deepest level, chain `skip_while` to filter out deletes.
+        let mut final_iter: Box<dyn Iterator<Item = KVOpertion>> = if is_target_deepest_level {
+            Box::new(kv_iter_agg.filter(|op| {
+                if op.op == OpType::Delete {
+                    debug!(key = %op.key.to_string(), op_id = op.id, "Skipping delete operation at deepest level during compaction");
+                    false // skip this delete operation
+                } else {
+                    true // keep this operation
+                }
+            }))
+        } else {
+            Box::new(kv_iter_agg) // Otherwise, use the original iterator without skipping deletes
+        };
+
+        if let Some(mut op) = final_iter.next() {
             let mut table_builder =
                 TableBuilder::new_with_id_config(*store_id_start, self.config.table_config);
             *store_id_start += 1;
@@ -650,7 +670,7 @@ impl<T: Store> LevelStorege<T> {
                     }
                 }
 
-                if let Some(next_op) = kv_iter_agg.next() {
+                if let Some(next_op) = final_iter.next() {
                     op = next_op;
                 } else {
                     // No more operations, flush the last builder
@@ -882,7 +902,9 @@ mod test {
 
     use crc32fast::Hasher;
 
-    use crate::db::common::{KVOpertion, OpId, OpType}; // OpType moved from helper
+    use crate::db::common::{KVOpertion, OpId, OpType};
+    use crate::db::db_log;
+    // OpType moved from helper
     use crate::db::key::{KeySlice, KeyVec};
     use crate::db::level::{ChangeType, Level, LevelStorege, TableChange, U32_SIZE};
     use crate::db::store::{Filestore, Store, StoreId};
@@ -2354,9 +2376,109 @@ mod test {
         );
     }
 
+    // Helper function for tests: creates a TableReader from a vector of KVOpertions with a specific ID.
+    fn create_test_table_from_kvs_with_id(kvs: Vec<KVOpertion>, id: u64) -> TableReader<Memstore> {
+        let mut table_builder = TableBuilder::new_with_id(id);
+        table_builder.fill_with_op(kvs.iter());
+        table_builder.flush()
+    }
+
     #[test]
-    fn test_compact_level_no_level() {
-        // create 3 table for compact input and
+    fn test_compact_level_to_depthest_level() {
+        // Create 3 tables, some with delete operations, some with overwrites
+        // Table 1: Writes (0, "0"), (1, "1"), Delete (2)
+        let table_1_data = vec![
+            KVOpertion::new(
+                10,
+                "0".as_bytes().into(),
+                OpType::Write("0".as_bytes().into()),
+            ),
+            KVOpertion::new(
+                11,
+                "1".as_bytes().into(),
+                OpType::Write("1".as_bytes().into()),
+            ),
+            KVOpertion::new(12, "2".as_bytes().into(), OpType::Delete),
+        ];
+        let table_1 = Arc::new(create_test_table_from_kvs_with_id(table_1_data, 101));
+
+        // Table 2: Delete (0), Write (1, "1_new"), Write (3, "3")
+        let table_2_data = vec![
+            KVOpertion::new(13, "0".as_bytes().into(), OpType::Delete), // Deletes "0" from table 1
+            KVOpertion::new(
+                14,
+                "1".as_bytes().into(),
+                OpType::Write("1_new".as_bytes().into()),
+            ), // Overwrites "1" from table 1
+            KVOpertion::new(
+                15,
+                "3".as_bytes().into(),
+                OpType::Write("3".as_bytes().into()),
+            ),
+        ];
+        let table_2 = Arc::new(create_test_table_from_kvs_with_id(table_2_data, 102));
+
+        // Table 3: Delete (3), Write (4, "4")
+        let table_3_data = vec![
+            KVOpertion::new(16, "3".as_bytes().into(), OpType::Delete), // Deletes "3" from table 2
+            KVOpertion::new(
+                17,
+                "4".as_bytes().into(),
+                OpType::Write("4".as_bytes().into()),
+            ),
+        ];
+        let table_3 = Arc::new(create_test_table_from_kvs_with_id(table_3_data, 103));
+
+        // Set up LevelStorage with these tables in Level 1 (it will be the deepest level initially)
+        let level0_empty = Level::new(vec![], true);
+        let level1 = Level::new(
+            vec![table_1.clone(), table_2.clone(), table_3.clone()],
+            false,
+        );
+        let mut level_storage = LevelStorege::new(
+            vec![level0_empty, level1],
+            LevelStoregeConfig::config_for_test(),
+        );
+
+        let input_tables = vec![table_1, table_2, table_3]; // These are the tables to compact
+        let mut store_id_start = 200; // Starting ID for new SSTables in target level
+
+        // Perform compaction to Level 1
+        let table_changes = level_storage.compact_level(&mut store_id_start, input_tables, 0); // Compacting from L0 to L1
+
+        // 3 tables were input, so 3 delete changes from the source level (level 0 here, implicitly, as input_tables are not part of level0 in this setup but treated as such by compact_level)
+        // Note: The `take_out_table_to_compact` is responsible for generating `Delete` changes for the source level.
+        // `compact_level` itself only generates `Add` changes for the target level after merging.
+        // For this test, we are passing the tables directly to `compact_level` as `input_tables`,
+        // so `compact_level` itself will not generate "delete" changes for these specific input tables
+        // from any level, only add new ones.
+        // If this test was for `compact_storage`, then `take_out_table_to_compact` would generate the deletes.
+        // Here, we focus on the *output* of compaction.
+
+        // The key check: check level 1, all delete KVOpertion will be discarded
+        let compacted_level = &level_storage.levels[1]; // Level 1 is the target level
+
+        // Expected keys: "1" (from "1_new"), "4" (from "4")
+        // "0" should be deleted
+        // "2" should be deleted
+        // "3" should be deleted
+        // Check for existing keys:
+        assert_level_find_and_check(&compacted_level, &KeySlice::from("0".as_bytes()), None); // Key "0" was deleted by newer op
+        assert_level_find_and_check(
+            &compacted_level,
+            &KeySlice::from("1".as_bytes()),
+            Some("1_new".as_bytes()),
+        ); // Key "1" was overwritten
+        assert_level_find_and_check(&compacted_level, &KeySlice::from("2".as_bytes()), None); // Key "2" was deleted
+        assert_level_find_and_check(&compacted_level, &KeySlice::from("3".as_bytes()), None); // Key "3" was deleted
+        assert_level_find_and_check(
+            &compacted_level,
+            &KeySlice::from("4".as_bytes()),
+            Some("4".as_bytes()),
+        ); // Key "4" was written
+
+        // Ensure no unexpected keys are present
+        assert_level_find_and_check(&compacted_level, &KeySlice::from("5".as_bytes()), None);
     }
 
     #[test]
