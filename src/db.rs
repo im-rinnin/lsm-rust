@@ -76,7 +76,8 @@ struct LsmDB<T: Store> {
     request_queue_r: Receiver<WriteRequest>,
     request_queue_s: Sender<WriteRequest>,
     stop_flag: Arc<Mutex<bool>>, // Added to control worker threads shutdown
-    thread_handls: Vec<JoinHandle<()>>,
+    writer_handle: Option<JoinHandle<()>>,
+    compaction_handle: Option<JoinHandle<()>>,
     trigger_compact: Sender<()>,
     statistic: Arc<DBStatistic>,
     config: Config,
@@ -121,9 +122,15 @@ impl<T: Store> Drop for LsmDB<T> {
         *stop = true;
         drop(stop); // Release the lock before joining threads
 
-        // Wait for all worker threads to finish
-        for handle in self.thread_handls.drain(..) {
-            let _ = handle.join(); // Ignore join errors for now, consider logging in production
+        // Wait for worker threads to finish
+        // need to stop writer first to freeze memtable and then dump imm memtable
+        let writer_join_result = self.writer_handle.take().unwrap().join();
+        if let Err(e) = writer_join_result {
+            info!("Writer thread panicked: {:?}", e);
+        }
+        let compaction_join_result = self.compaction_handle.take().unwrap().join();
+        if let Err(e) = compaction_join_result {
+            info!("Compaction thread panicked: {:?}", e);
         }
         info!("close db end drop");
     }
@@ -144,76 +151,80 @@ impl LsmDB<Memstore> {
         store_id += 1;
         let level_meta_log = TableChangeLog::<Memstore>::from(level_meta_log_store_id);
 
-        // Create the channel for write requests
-        let (s, r) = crossbeam_channel::bounded(config.request_queue_len);
-
         // Initialize atomic counters
         let current_max_op_id = Arc::new(AtomicU64::new(0));
-
-        // Initialize the write completion signaling mechanism
-        let initial_cv_pair = (Condvar::new(), Mutex::new(0));
-        let write_done_cv = Arc::new(RwLock::new(initial_cv_pair));
 
         // Create the stop flag for worker threads
         let stop_flag = Arc::new(Mutex::new(false));
 
-        // Construct the LsmDB instance
+        // Create the channel for write requests
+        let (s, r) = crossbeam_channel::bounded(config.request_queue_len);
+        let writer_queue_r = r.clone(); // Clone for writer thread
+
+        // Initialize atomic counters
+        let current_max_op_id = Arc::new(AtomicU64::new(0));
+        let max_op_for_writer = current_max_op_id.clone();
+
+        // Initialize DBStatistic once
+        let statistic = Arc::new(DBStatistic::default());
+        let statistic_for_compactor = statistic.clone();
+
+        // Prepare LsmStorage Arc for cloning to threads
+        let initial_lsm_storage_for_writer = initial_lsm_storage.clone();
+        let initial_lsm_storage_for_compactor = initial_lsm_storage.clone();
+
+        // Clone stop flag for threads
+        let w_stop_flag = stop_flag.clone();
+        let c_stop_flag = stop_flag.clone();
+
+        // config is Copy, so we can pass it by value or clone for threads
+        let writer_config = config;
+        let compaction_config = config;
+
+        // Determine next_sstable_id_start_value
+        let mut next_sstable_id_start_value: StoreId = store_id;
+        store_id += 1; // Increment for compaction thread's starting ID
+
+        // Create the channel for compaction triggers
         let (trigger_s, trigger_r) = unbounded();
-        let mut res = LsmDB {
-            current_max_op_id,
-            current: initial_lsm_storage, // Use the already wrapped initial state
-            request_queue_r: r,
-            request_queue_s: s,
-            stop_flag: stop_flag.clone(), // Store a clone in the LsmDB instance
-            thread_handls: vec![],
-            trigger_compact: trigger_s,
-            statistic: Arc::new(DBStatistic::default()),
-            config,
-        };
 
-        // Prepare data needed for the writer thread
-        let writer_queue_r = res.request_queue_r.clone();
-        let writer_lsm_state = res.current.clone();
-        // Note: logfile is moved into the thread closure below.
-
-        let w_stop_flag = stop_flag.clone(); // Clone for writer thread
-        let max_op = res.current_max_op_id.clone();
-        let h = thread::spawn(move || {
+        // Spawn writer thread
+        let writer_handle = Some(thread::spawn(move || {
             LsmDB::write_worker(
                 w_stop_flag,
                 writer_queue_r,
-                writer_lsm_state,
-                logfile,
-                max_op,
-                config,
+                initial_lsm_storage_for_writer,
+                logfile, // logfile is moved here
+                max_op_for_writer,
+                writer_config,
             );
-        });
-        res.thread_handls.push(h);
+        }));
 
-        // Prepare data for the compaction thread
-        let compaction_lsm_state = res.current.clone();
-        let compaction_config = config; // Clone or copy config if needed, struct is Copy
-        let mut next_sstable_id_start_value: StoreId = store_id; // Start after logfile and meta log
-        store_id += 1;
-        // todo: load next_sstable_id from storage
-
-        // Start dump_and_compact_thread in a new thread
-        let c_stop_flag = stop_flag.clone(); // Clone for compaction thread
-        let statistic = res.statistic.clone();
-        let h = thread::spawn(move || {
+        // Spawn compaction thread
+        let compaction_handle = Some(thread::spawn(move || {
             LsmDB::dump_and_compact_thread(
-                compaction_lsm_state,
-                level_meta_log,              // level_meta_log is moved into the thread
-                next_sstable_id_start_value, // Passed by value, matches 'mut StoreId' signature
+                initial_lsm_storage_for_compactor,
+                level_meta_log, // level_meta_log is moved here
+                next_sstable_id_start_value,
                 c_stop_flag,
                 compaction_config,
                 trigger_r,
-                statistic,
+                statistic_for_compactor,
             );
-        });
-        res.thread_handls.push(h);
+        }));
 
-        res
+        LsmDB {
+            current_max_op_id,
+            current: initial_lsm_storage,
+            request_queue_r: r,
+            request_queue_s: s,
+            stop_flag, // Ownership moved here
+            writer_handle,
+            compaction_handle,
+            trigger_compact: trigger_s,
+            statistic,
+            config,
+        }
     }
 
     pub fn trigger_compact(&mut self) {
@@ -370,6 +381,16 @@ impl<T: Store> LsmDB<T> {
                 info!("compact finish");
             }
         }
+        // dump all remaining immutable memtables at the end
+        {
+            info!("dump remaining imm memtable at end of compaction thread.");
+            let mut lsm_storage_clone = current.write().unwrap();
+            if lsm_storage_clone.immtable_num() > 0 {
+                info!("dump remaining imm memtable at end of compaction thread.");
+                lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
+            }
+            info!("compaction thread exiting.");
+        }
     }
 
     pub fn depth(&self) -> usize {
@@ -458,6 +479,16 @@ impl<T: Store> LsmDB<T> {
                 }
             }
             // No sleep here, as work was done, we can immediately check for more work
+        }
+        // freeze the memtable if it is not empty
+        {
+            info!("Freezing memtable at end of write worker.");
+            let mut lsm_storage_guard = current_lsm.write().unwrap();
+            if lsm_storage_guard.memtable_size() > 0 {
+                info!("Freezing memtable at end of write worker.");
+                lsm_storage_guard.freeze_memtable();
+            }
+            info!("Write worker exiting.");
         }
         // Note: The loop as written never exits. A mechanism to stop the worker is needed.
     }
