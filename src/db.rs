@@ -75,7 +75,8 @@ struct LsmDB<T: Store> {
     current: Arc<RwLock<LsmStorage<T>>>,
     request_queue_r: Receiver<WriteRequest>,
     request_queue_s: Sender<WriteRequest>,
-    stop_flag: Arc<Mutex<bool>>, // Added to control worker threads shutdown
+    writer_stop_flag: Arc<Mutex<bool>>, // Control shutdown of writer thread
+    compactor_stop_flag: Arc<Mutex<bool>>, // Control shutdown of compaction thread
     writer_handle: Option<JoinHandle<()>>,
     compaction_handle: Option<JoinHandle<()>>,
     trigger_compact: Sender<()>,
@@ -117,21 +118,48 @@ impl Config {
 impl<T: Store> Drop for LsmDB<T> {
     fn drop(&mut self) {
         info!("close db start drop");
-        // Signal worker threads to stop
-        let mut stop = self.stop_flag.lock().expect("fail to get lock on flah");
-        *stop = true;
-        drop(stop); // Release the lock before joining threads
+        // Signal writer thread to stop
+        let mut writer_stop = self
+            .writer_stop_flag
+            .lock()
+            .expect("fail to get lock on writer stop flag");
+        *writer_stop = true;
+        drop(writer_stop); // Release the lock before joining threads
 
-        // Wait for worker threads to finish
-        // need to stop writer first to freeze memtable and then dump imm memtable
+        // Wait for writer thread to finish
         let writer_join_result = self.writer_handle.take().unwrap().join();
         if let Err(e) = writer_join_result {
             info!("Writer thread panicked: {:?}", e);
         }
+
+        // Signal compaction thread to stop
+        let mut compactor_stop = self
+            .compactor_stop_flag
+            .lock()
+            .expect("fail to get lock on compactor stop flag");
+        *compactor_stop = true;
+
+        drop(compactor_stop); // Release the lock before joining threads
         let compaction_join_result = self.compaction_handle.take().unwrap().join();
         if let Err(e) = compaction_join_result {
             info!("Compaction thread panicked: {:?}", e);
         }
+        // Assert that the active and immutable memtables are empty after shutdown.
+        // This ensures all data has been persisted to disk or dropped.
+        let lsm_storage_guard = self
+            .current
+            .read()
+            .expect("Failed to acquire read lock on LsmStorage during drop");
+        assert_eq!(
+            lsm_storage_guard.memtable_size(),
+            0,
+            "Active memtable should be empty on DB drop"
+        );
+        assert_eq!(
+            lsm_storage_guard.immtable_num(),
+            0,
+            "Immutable memtables should be empty on DB drop"
+        );
         info!("close db end drop");
     }
 }
@@ -152,18 +180,16 @@ impl LsmDB<Memstore> {
         let level_meta_log = TableChangeLog::<Memstore>::from(level_meta_log_store_id);
 
         // Initialize atomic counters
-        let current_max_op_id = Arc::new(AtomicU64::new(0));
+        let initial_max_op_id = Arc::new(AtomicU64::new(0)); // Use a new variable name for clarity
+        let max_op_for_writer = initial_max_op_id.clone();
 
-        // Create the stop flag for worker threads
-        let stop_flag = Arc::new(Mutex::new(false));
+        // Create separate stop flags for writer and compactor threads
+        let writer_stop_flag_arc = Arc::new(Mutex::new(false));
+        let compactor_stop_flag_arc = Arc::new(Mutex::new(false));
 
         // Create the channel for write requests
         let (s, r) = crossbeam_channel::bounded(config.request_queue_len);
         let writer_queue_r = r.clone(); // Clone for writer thread
-
-        // Initialize atomic counters
-        let current_max_op_id = Arc::new(AtomicU64::new(0));
-        let max_op_for_writer = current_max_op_id.clone();
 
         // Initialize DBStatistic once
         let statistic = Arc::new(DBStatistic::default());
@@ -173,9 +199,9 @@ impl LsmDB<Memstore> {
         let initial_lsm_storage_for_writer = initial_lsm_storage.clone();
         let initial_lsm_storage_for_compactor = initial_lsm_storage.clone();
 
-        // Clone stop flag for threads
-        let w_stop_flag = stop_flag.clone();
-        let c_stop_flag = stop_flag.clone();
+        // Clone stop flags for threads
+        let w_stop_flag_for_thread = writer_stop_flag_arc.clone();
+        let c_stop_flag_for_thread = compactor_stop_flag_arc.clone();
 
         // config is Copy, so we can pass it by value or clone for threads
         let writer_config = config;
@@ -191,7 +217,7 @@ impl LsmDB<Memstore> {
         // Spawn writer thread
         let writer_handle = Some(thread::spawn(move || {
             LsmDB::write_worker(
-                w_stop_flag,
+                w_stop_flag_for_thread,
                 writer_queue_r,
                 initial_lsm_storage_for_writer,
                 logfile, // logfile is moved here
@@ -206,7 +232,7 @@ impl LsmDB<Memstore> {
                 initial_lsm_storage_for_compactor,
                 level_meta_log, // level_meta_log is moved here
                 next_sstable_id_start_value,
-                c_stop_flag,
+                c_stop_flag_for_thread,
                 compaction_config,
                 trigger_r,
                 statistic_for_compactor,
@@ -214,11 +240,12 @@ impl LsmDB<Memstore> {
         }));
 
         LsmDB {
-            current_max_op_id,
+            current_max_op_id: initial_max_op_id,
             current: initial_lsm_storage,
             request_queue_r: r,
             request_queue_s: s,
-            stop_flag, // Ownership moved here
+            writer_stop_flag: writer_stop_flag_arc, // Ownership moved here
+            compactor_stop_flag: compactor_stop_flag_arc, // Ownership moved here
             writer_handle,
             compaction_handle,
             trigger_compact: trigger_s,
@@ -300,12 +327,12 @@ impl<T: Store> LsmDB<T> {
         // Lock released
     }
 
-    /// Checks if the stop signal has been received for the compaction thread.
+    /// Checks if the stop signal has been received for a given thread.
     /// Returns `true` if the thread should stop, `false` otherwise.
-    fn check_compact_thread_stop_signal(stop: &Arc<Mutex<bool>>) -> bool {
-        let stop_flag_inner = stop.lock().unwrap();
+    fn check_stop_signal(stop_flag: &Arc<Mutex<bool>>) -> bool {
+        let stop_flag_inner = stop_flag.lock().unwrap();
         if *stop_flag_inner {
-            info!("thread received stop signal during in-loop compaction.");
+            info!("thread received stop signal.");
             return true; // Signal to exit the loop
         }
         false // Continue operation
@@ -315,14 +342,15 @@ impl<T: Store> LsmDB<T> {
         current: Arc<RwLock<LsmStorage<T>>>,
         mut meta: TableChangeLog<Memstore>,
         mut next_sstable_id: StoreId,
-        stop: Arc<Mutex<bool>>,
+        compactor_stop_flag: Arc<Mutex<bool>>, // Renamed parameter
         config: Config,
         run_job: Receiver<()>,
         statistic: Arc<DBStatistic>,
     ) {
         loop {
-            if Self::check_compact_thread_stop_signal(&stop) {
-                return; // Exit the inner loop and then the outer loop
+            if Self::check_stop_signal(&compactor_stop_flag) {
+                // Use the compactor_stop_flag
+                break;
             }
             // Wait for a manual compaction trigger or timeout
             let res = run_job.recv_timeout(Duration::from_millis(config.thread_sleep_time));
@@ -357,8 +385,9 @@ impl<T: Store> LsmDB<T> {
             *current.write().unwrap() = lsm_storage_clone;
             // Perform compaction and loop immediately if more compaction is needed
             loop {
-                if Self::check_compact_thread_stop_signal(&stop) {
-                    return; // Exit the inner loop and then the outer loop
+                if Self::check_stop_signal(&compactor_stop_flag) {
+                    // Use the compactor_stop_flag
+                    break; // Exit the inner loop and then the outer loop
                 }
                 let mut lsm_storage_clone = current.read().unwrap().clone();
 
@@ -381,13 +410,13 @@ impl<T: Store> LsmDB<T> {
                 info!("compact finish");
             }
         }
-        // dump all remaining immutable memtables at the end
+        // dump all remaining immutable memtables at the end, before thread exits
         {
             info!("dump remaining imm memtable at end of compaction thread.");
-            let mut lsm_storage_clone = current.write().unwrap();
-            if lsm_storage_clone.immtable_num() > 0 {
+            let mut lsm_storage = current.write().unwrap();
+            while lsm_storage.immtable_num() > 0 {
                 info!("dump remaining imm memtable at end of compaction thread.");
-                lsm_storage_clone.dump_imm_memtable(&mut next_sstable_id);
+                lsm_storage.dump_imm_memtable(&mut next_sstable_id);
             }
             info!("compaction thread exiting.");
         }
@@ -403,24 +432,20 @@ impl<T: Store> LsmDB<T> {
         // Lock released
     }
     fn write_worker(
-        stop: Arc<Mutex<bool>>,
+        writer_stop_flag: Arc<Mutex<bool>>, // Renamed parameter
         request_queue_r: Receiver<WriteRequest>,
         current_lsm: Arc<RwLock<LsmStorage<T>>>,
         mut logfile: LogFile<T>,
         mut next_op_id: Arc<AtomicU64>,
         c: Config,
     ) {
-        // This function needs more context like START_WRITE_REQUEST_QUEUE_LEN,
-        // how to handle sleep/wake, and the exact mechanism for CV swapping.
-        // The implementation below is a basic structure based on the comments.
-        // It assumes a loop and basic locking, but details need refinement.
-
         let mut first_request_time: Option<Instant> = None; // Track time of first request in batch window
         let mut buffered_requests: Vec<WriteRequest> = Vec::new(); // Buffer for incoming requests
         let mut total_buffered_size = 0; // Total size of requests in buffered_requests
 
         loop {
-            if Self::check_compact_thread_stop_signal(&stop) {
+            if Self::check_stop_signal(&writer_stop_flag) {
+                // Use the writer_stop_flag
                 break; // Exit the loop if stop signal is true
             }
 
@@ -472,7 +497,8 @@ impl<T: Store> LsmDB<T> {
                         );
                         std::thread::sleep(std::time::Duration::from_millis(c.thread_sleep_time));
                         lsm_storage_guard = current_lsm.write().unwrap(); // Re-acquire lock
-                        if Self::check_compact_thread_stop_signal(&stop) {
+                        if Self::check_stop_signal(&writer_stop_flag) {
+                            // Use the writer_stop_flag
                             break; // Exit the loop if stop signal is true
                         }
                     }
@@ -480,7 +506,7 @@ impl<T: Store> LsmDB<T> {
             }
             // No sleep here, as work was done, we can immediately check for more work
         }
-        // freeze the memtable if it is not empty
+        // freeze the memtable if it is not empty before thread exits
         {
             info!("Freezing memtable at end of write worker.");
             let mut lsm_storage_guard = current_lsm.write().unwrap();
@@ -490,7 +516,6 @@ impl<T: Store> LsmDB<T> {
             }
             info!("Write worker exiting.");
         }
-        // Note: The loop as written never exits. A mechanism to stop the worker is needed.
     }
 
     fn process_single_buffered_request(
