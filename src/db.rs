@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 use std::thread::{self, JoinHandle};
 use std::{
+    fs, // Required for file operations
+    io, // Required for io::Error
     path::PathBuf,
     sync::{atomic::AtomicU64, Arc, Condvar, Mutex},
     time::{Duration, Instant}, // Required for wait_timeout and Instant
@@ -14,6 +16,7 @@ mod db_log;
 use anyhow::Result;
 use common::{KVOpertion, OpId, OpType};
 use key::{KeyBytes, KeySlice, KeyVec, ValueByte, ValueSlice, ValueVec};
+use serde::{Deserialize, Serialize}; // Required for serialization/deserialization
 
 mod store;
 
@@ -84,7 +87,7 @@ struct LsmDB<T: Store> {
     config: Config,
 }
 const SLEEP_TIME: u64 = 10;
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct Config {
     pub lsm_storage_config: LsmStorageConfig,
     pub request_queue_len: usize,
@@ -112,6 +115,31 @@ impl Config {
         c.lsm_storage_config = LsmStorageConfig::config_for_test();
         c.request_queue_size = 200;
         c
+    }
+
+    /// Loads configuration from a specified store.
+    /// Note: This assumes the store contains a single, complete JSON representation of the config.
+    pub fn load_from_store<S: Store>(store: &S) -> io::Result<Self> {
+        let data_len = store.len();
+        if data_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Config store is empty",
+            ));
+        }
+        let mut data_buf = vec![0; data_len];
+        store.read_at(&mut data_buf, 0); // Read from offset 0
+
+        serde_json::from_slice(&data_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Writes the current configuration to a specified store.
+    /// store is append only and config is immutable so it's ok
+    pub fn write_to_store<S: Store>(&self, store: &mut S) -> io::Result<()> {
+        let _serialized = serde_json::to_vec_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -625,10 +653,12 @@ mod test {
     use super::common::OpId;
     use super::{Config, DBWriter, KeyBytes, OpType, ValueByte, WriteRequest};
     use crate::db::db_log;
+    use crate::db::store::Store;
     use crate::db::{store::Memstore, LsmDB};
     use crossbeam_channel::Receiver;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::io;
     use std::mem::size_of;
     use std::sync::atomic::Ordering;
     use std::sync::RwLock;
@@ -638,7 +668,6 @@ mod test {
     use crate::db::block::test::pad_zero;
     use crate::db::common::KVOpertion; // Added for test_mutiple_thread_random_operaiton
     use crate::db::key::{KeyVec, ValueVec};
-    use core::panic;
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
@@ -1735,6 +1764,69 @@ mod test {
         info!(
             "Final verification completed successfully for {} keys.",
             data_states_final_guard.len()
+        );
+    }
+
+    #[test]
+    fn test_config_load_from_store() {
+        // Case 1: Valid configuration in store
+        let original_config = Config::config_for_test(); // Use a test config for predictability
+        let serialized_config = serde_json::to_vec_pretty(&original_config)
+            .expect("Failed to serialize config for test");
+
+        let mut memstore_valid = Memstore::open(1); // Unique store ID
+        memstore_valid.append(&serialized_config);
+
+        let loaded_config = Config::load_from_store(&memstore_valid)
+            .expect("Failed to load valid config from store");
+
+        assert_eq!(
+            loaded_config.lsm_storage_config.memtable_size_limit,
+            original_config.lsm_storage_config.memtable_size_limit
+        );
+        assert_eq!(
+            loaded_config.request_queue_len,
+            original_config.request_queue_len
+        );
+        assert_eq!(loaded_config.imm_num_limit, original_config.imm_num_limit);
+        assert_eq!(
+            loaded_config.thread_sleep_time,
+            original_config.thread_sleep_time
+        );
+        assert_eq!(
+            loaded_config.request_queue_size,
+            original_config.request_queue_size
+        );
+        assert_eq!(loaded_config.auto_compact, original_config.auto_compact);
+        assert_eq!(
+            loaded_config
+                .lsm_storage_config
+                .level_config
+                .level_zero_num_limit,
+            original_config
+                .lsm_storage_config
+                .level_config
+                .level_zero_num_limit
+        );
+        // Add more assertions for nested structs if needed, or rely on derived PartialEq if it were implemented for all.
+
+        // Case 2: Empty store
+        let memstore_empty = Memstore::open(2); // Unique store ID
+        let load_result_empty = Config::load_from_store(&memstore_empty);
+        assert!(load_result_empty.is_err());
+        assert_eq!(
+            load_result_empty.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // Case 3: Corrupted data in store (not valid JSON)
+        let mut memstore_corrupted = Memstore::open(3); // Unique store ID
+        memstore_corrupted.append(b"this is not valid json");
+        let load_result_corrupted = Config::load_from_store(&memstore_corrupted);
+        assert!(load_result_corrupted.is_err());
+        assert_eq!(
+            load_result_corrupted.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 }

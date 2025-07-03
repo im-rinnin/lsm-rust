@@ -250,8 +250,9 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
     }
 }
 
+use serde::{Serialize, Deserialize};
 use crate::db::block::BlockBuilder;
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize,Debug)]
 pub struct TableConfig {
     block_num_limit: usize,
 }

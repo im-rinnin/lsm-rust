@@ -18,6 +18,7 @@ use crate::db::{
 };
 use tracing::debug;
 
+use serde::{Serialize, Deserialize};
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
     key::{KeySlice, KeyVec},
@@ -28,13 +29,13 @@ use super::{
 
 const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
 const MAX_INPUT_TABLE_IN_COMPACT: usize = 1;
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub enum ChangeType {
     Add,    // encode to 0
     Delete, // encode to 1
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableChange {
     level: usize,
     index: usize,
@@ -303,7 +304,7 @@ impl<T: Store> Clone for LevelStorege<T> {
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize,Debug)]
 pub struct LevelStoregeConfig {
     pub level_zero_num_limit: usize,
     pub level_ratio: usize,
@@ -2309,7 +2310,7 @@ mod test {
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
             super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
-            vec![]
+            vec![] as Vec<usize>
         );
 
         // Test Case 2: No overlap, target range after sorted_key_ranges
@@ -2317,7 +2318,7 @@ mod test {
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
             super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
-            vec![]
+            vec![] as Vec<usize>
         );
 
         // Test Case 3: Exact overlap with one range
@@ -2377,7 +2378,7 @@ mod test {
         let ranges: Vec<(KeyVec, KeyVec)> = vec![];
         assert_eq!(
             super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
-            vec![]
+            vec![] as Vec<usize>
         );
 
         // Test Case 10: Overlap at boundary points with an empty space between
@@ -2393,7 +2394,7 @@ mod test {
         let ranges = vec![r("000010", "000020")];
         assert_eq!(
             super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
-            vec![]
+            vec![] as Vec<usize>
         );
 
         // Test Case 12: Single range in sorted_key_ranges, with overlap
@@ -2586,7 +2587,7 @@ mod test {
         // If level 0 becomes empty and level 1 is not empty, level 0 will still exist as an empty vec.
         // If the highest level (e.g. level 2) becomes empty, it should be popped.
         assert_eq!(result6.len(), 2); // Expected levels after removing trailing empty ones
-        assert_eq!(result6[0], vec![]); // Level 0 is now empty
+        assert_eq!(result6[0], vec![] as Vec<u64>); // Level 0 is now empty
         assert_eq!(result6[1], vec![20]); // Level 1 still has 20
 
         // Test case 7: Deletion with incorrect ID (should panic in real application, but for test, simulate with expected valid case)

@@ -17,6 +17,7 @@ use crate::db::store::Memstore;
 use crate::db::store::Store;
 use crate::db::table::TableReader;
 
+use serde::{Serialize, Deserialize};
 use super::key::KeySlice;
 use super::level;
 use super::level::LevelStoregeConfig;
@@ -24,7 +25,7 @@ use super::level::TableChange;
 use super::store::StoreId;
 use super::table::TableConfig;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize,Debug)]
 pub struct LsmStorageConfig {
     pub memtable_size_limit: usize,
     pub level_config: LevelStoregeConfig,
