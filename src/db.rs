@@ -35,7 +35,7 @@ use level::TableChangeLog;
 use logfile::LogFile;
 use lsm_storage::{LsmStorage, LsmStorageConfig};
 use once_cell::sync::Lazy;
-use store::{fetch_add_store_id, Memstore, Store, StoreId};
+use store::{fetch_store_id_range_for_test, Memstore, Store, StoreId};
 use tracing::info;
 
 const START_WRITE_REQUEST_QUEUE_LEN: usize = 100;
@@ -193,11 +193,12 @@ impl<T: Store> Drop for LsmDB<T> {
 }
 
 impl LsmDB<Memstore> {
+    // for test 
     pub fn new_with_memstore(config: Config) -> Self {
         // Create the initial LsmStorage, wrapped in Arc<RwLock<...>>
         let initial_lsm_storage = Arc::new(RwLock::new(LsmStorage::new(config.lsm_storage_config)));
 
-        let mut store_id = fetch_add_store_id();
+        let mut store_id = fetch_store_id_range_for_test();
         // Create LogFile and TableChangeLog with unique Memstore instances
         let logfile_store_id = store_id;
         store_id += 1;

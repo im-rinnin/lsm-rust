@@ -14,10 +14,12 @@ use once_cell::sync::Lazy;
 use tracing::info;
 
 pub type StoreId = u64;
-pub const PRIVATE_STORE_ID_MAX: u64 = 100000;
-static STORE_ID_OFFSET: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(PRIVATE_STORE_ID_MAX));
-pub fn fetch_add_store_id() -> u64 {
-    STORE_ID_OFFSET.fetch_add(PRIVATE_STORE_ID_MAX, Ordering::SeqCst)
+// id range is enough for test
+pub const STORE_ID_RANGE: u64 = 100000;
+static STORE_ID_OFFSET: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(STORE_ID_RANGE));
+// requeset store id range in [current id, current id + STORE_ID_RANGE) for test
+pub fn fetch_store_id_range_for_test() -> u64 {
+    STORE_ID_OFFSET.fetch_add(STORE_ID_RANGE, Ordering::SeqCst)
 }
 static MEM_POOL: Lazy<Arc<Mutex<HashMap<StoreId, Arc<Mutex<Vec<u8>>>>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
@@ -54,7 +56,7 @@ impl Store for Memstore {
     }
 
     fn open(id: StoreId) -> Self {
-        let store = if id < PRIVATE_STORE_ID_MAX {
+        let store = if id < STORE_ID_RANGE {
             Arc::new(Mutex::new(vec![]))
         } else {
             let mut pool = MEM_POOL.lock().unwrap();
@@ -195,7 +197,7 @@ impl Store for Filestore {
 
 #[cfg(test)]
 mod test {
-    use crate::db::store::{fetch_add_store_id, PRIVATE_STORE_ID_MAX};
+    use crate::db::store::{fetch_store_id_range_for_test, STORE_ID_RANGE};
 
     use super::Filestore;
     use std::{
@@ -416,7 +418,7 @@ mod test {
 
     #[test]
     fn test_shared_and_private_memstore() {
-        let id = fetch_add_store_id();
+        let id = fetch_store_id_range_for_test();
         let mut memstore = Memstore::open(id);
         memstore.append("test".as_bytes());
         assert_eq!(memstore.len(), 4);
