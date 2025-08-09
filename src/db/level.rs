@@ -18,7 +18,6 @@ use crate::db::{
 };
 use tracing::debug;
 
-use serde::{Serialize, Deserialize};
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
     key::{KeySlice, KeyVec},
@@ -26,6 +25,7 @@ use super::{
     store::{Filestore, Store, StoreId},
     table::{self, *},
 };
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
 const MAX_INPUT_TABLE_IN_COMPACT: usize = 1;
@@ -43,6 +43,54 @@ pub struct TableChange {
     change_type: ChangeType,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableChanges {
+    // compact table from level_low to high_level
+    // low_level is the level where the compaction starts
+    low_level: usize,
+    delete_tables: Vec<StoreId>,
+    // (index, id) in high level
+    // sorted by index
+    add_tables: Vec<(usize, StoreId)>,
+}
+impl TableChanges {
+    fn new(level_start: usize) -> Self {
+        TableChanges {
+            low_level: level_start,
+            delete_tables: Vec::new(),
+            add_tables: Vec::new(),
+        }
+    }
+    fn encode<W: Write>(&self, writer: &mut W) {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        // Write low_level as u64
+        writer
+            .write_u64::<LittleEndian>(self.low_level as u64)
+            .unwrap();
+
+        // Write delete table count and each id
+        writer
+            .write_u64::<LittleEndian>(self.delete_tables.len() as u64)
+            .unwrap();
+        for id in &self.delete_tables {
+            writer.write_u64::<LittleEndian>(*id).unwrap();
+        }
+
+        // Write add table count and each (index, id) pair
+        writer
+            .write_u64::<LittleEndian>(self.add_tables.len() as u64)
+            .unwrap();
+        for (index, id) in &self.add_tables {
+            writer.write_u64::<LittleEndian>(*index as u64).unwrap();
+            writer.write_u64::<LittleEndian>(*id).unwrap();
+        }
+    }
+
+    fn decode<R: Read>(mut data: R) -> Self {
+        todo!()
+    }
+}
 impl TableChange {
     fn encode<W: Write>(&self, writer: &mut W) {
         writer.write_u64::<LittleEndian>(self.level as u64).unwrap();
@@ -304,7 +352,7 @@ impl<T: Store> Clone for LevelStorege<T> {
         }
     }
 }
-#[derive(Clone, Copy, Serialize, Deserialize,Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct LevelStoregeConfig {
     pub level_zero_num_limit: usize,
     pub level_ratio: usize,
