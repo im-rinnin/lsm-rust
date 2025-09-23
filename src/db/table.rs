@@ -408,15 +408,14 @@ impl<T: Store> TableBuilder<T> {
         // Calculate the offset where block metadata will start
         let block_meta_start_offset = self.store.len();
 
-        // Encode and append all block metadata to the store
+        // Encode and append all block metadata to the store tightly (no padding)
         let block_meta_count = self.block_metas.len() as u64;
-        let mut temp_buffer = new_buffer(1024); // Use a temporary buffer for encoding each meta
+        // Use a growable buffer to avoid prefilled zeros and gaps
+        let mut temp_buffer = Cursor::new(Vec::new());
         for meta in &self.block_metas {
             meta.encode(&mut temp_buffer);
         }
-
-        temp_buffer.seek(std::io::SeekFrom::End(16));
-
+        // Write trailer immediately after metas: [meta_start_offset][meta_count]
         temp_buffer
             .write_u64::<LittleEndian>(block_meta_start_offset as u64)
             .unwrap();
