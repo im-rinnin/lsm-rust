@@ -60,33 +60,34 @@ pub struct TableBuilder<T: Store> {
 }
 
 impl BlockMeta {
-    pub fn encode(&self, w: &mut Buffer) {
+    pub fn encode(&self, w: &mut Buffer) -> std::io::Result<()> {
         let first_key_len = self.first_key.len() as u64;
-        w.write_u64::<LittleEndian>(first_key_len).unwrap();
-        w.write_all(self.first_key.as_ref()).unwrap();
+        w.write_u64::<LittleEndian>(first_key_len)?;
+        w.write_all(self.first_key.as_ref())?;
 
         // Encode last_key
         let last_key_len = self.last_key.len() as u64;
-        w.write_u64::<LittleEndian>(last_key_len).unwrap();
-        w.write_all(self.last_key.as_ref()).unwrap();
+        w.write_u64::<LittleEndian>(last_key_len)?;
+        w.write_all(self.last_key.as_ref())?;
+        Ok(())
     }
-    pub fn decode(r: &mut Buffer) -> Self {
+    pub fn decode(r: &mut Buffer) -> std::io::Result<Self> {
         // Decode first_key
-        let first_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
+        let first_key_len = r.read_u64::<LittleEndian>()? as usize;
         let mut first_key_data = vec![0u8; first_key_len];
-        r.read_exact(&mut first_key_data).unwrap();
+        r.read_exact(&mut first_key_data)?;
         let first_key = KeyBytes::from_vec(first_key_data);
 
         // Decode last_key
-        let last_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
+        let last_key_len = r.read_u64::<LittleEndian>()? as usize;
         let mut last_key_data = vec![0u8; last_key_len];
-        r.read_exact(&mut last_key_data).unwrap();
+        r.read_exact(&mut last_key_data)?;
         let last_key = KeyBytes::from_vec(last_key_data);
 
-        BlockMeta {
+        Ok(BlockMeta {
             first_key,
             last_key,
-        }
+        })
     }
 }
 
@@ -98,6 +99,10 @@ impl<T: Store> TableReader<T> {
         Self::new_with_store_for_test(store)
     }
     pub fn new_with_store_for_test(store: T) -> Self {
+        Self::try_new_with_store_for_test(store)
+            .expect("failed to construct TableReader from store")
+    }
+    pub fn try_new_with_store_for_test(store: T) -> anyhow::Result<Self> {
         let store_len = store.len();
         let mut buffer_for_meta_pointers = [0u8; 16]; // Buffer for offset and count (2 * u64)
 
@@ -105,8 +110,8 @@ impl<T: Store> TableReader<T> {
         store.read_at(&mut buffer_for_meta_pointers, store_len - 16);
         let mut cursor = Cursor::new(buffer_for_meta_pointers);
 
-        let block_meta_start_offset = cursor.read_u64::<LittleEndian>().unwrap() as usize;
-        let block_meta_count = cursor.read_u64::<LittleEndian>().unwrap() as usize;
+        let block_meta_start_offset = cursor.read_u64::<LittleEndian>()? as usize;
+        let block_meta_count = cursor.read_u64::<LittleEndian>()? as usize;
 
         // Read all block metas
         let block_metas_data_len = store_len - block_meta_start_offset - 16;
@@ -117,10 +122,10 @@ impl<T: Store> TableReader<T> {
         let mut block_metas = Vec::with_capacity(block_meta_count);
 
         for _ in 0..block_meta_count {
-            block_metas.push(BlockMeta::decode(&mut block_metas_cursor));
+            block_metas.push(BlockMeta::decode(&mut block_metas_cursor)?);
         }
 
-        TableReader { store, block_metas }
+        Ok(TableReader { store, block_metas })
     }
     pub fn store_id(&self) -> StoreId {
         self.store.id()
@@ -408,30 +413,35 @@ impl<T: Store> TableBuilder<T> {
         // Calculate the offset where block metadata will start
         let block_meta_start_offset = self.store.len();
 
+        // Delegate to fallible variant and unwrap at wrapper boundary
+        self.try_flush_at(block_meta_start_offset)
+            .expect("failed to flush table")
+    }
+
+    pub fn try_flush_at(
+        mut self,
+        block_meta_start_offset: usize,
+    ) -> anyhow::Result<TableReader<T>> {
         // Encode and append all block metadata to the store tightly (no padding)
         let block_meta_count = self.block_metas.len() as u64;
         // Use a growable buffer to avoid prefilled zeros and gaps
         let mut temp_buffer = Cursor::new(Vec::new());
         for meta in &self.block_metas {
-            meta.encode(&mut temp_buffer);
+            meta.encode(&mut temp_buffer)?;
         }
         // Write trailer immediately after metas: [meta_start_offset][meta_count]
-        temp_buffer
-            .write_u64::<LittleEndian>(block_meta_start_offset as u64)
-            .unwrap();
-        temp_buffer
-            .write_u64::<LittleEndian>(block_meta_count)
-            .unwrap();
+        temp_buffer.write_u64::<LittleEndian>(block_meta_start_offset as u64)?;
+        temp_buffer.write_u64::<LittleEndian>(block_meta_count)?;
         self.store.append(temp_buffer.get_ref());
 
         // Flush the store to ensure all data is written to disk
         self.store.flush();
 
         // Create and return a TableReader
-        TableReader {
+        Ok(TableReader {
             store: self.store,
             block_metas: self.block_metas,
-        }
+        })
     }
     pub fn fill_with_op<'a, IT: Iterator<Item = &'a KVOperation>>(&mut self, it: IT) {
         for op_ref in it {
@@ -805,12 +815,12 @@ pub mod test {
         };
 
         let mut buffer = new_buffer(1024); // Sufficiently large buffer
-        original_meta.encode(&mut buffer);
+        original_meta.encode(&mut buffer).unwrap();
 
         // Reset buffer position to the beginning for decoding
         buffer.seek(std::io::SeekFrom::Start(0)).unwrap();
 
-        let decoded_meta = BlockMeta::decode(&mut buffer);
+        let decoded_meta = BlockMeta::decode(&mut buffer).unwrap();
 
         assert_eq!(original_meta, decoded_meta);
     }
