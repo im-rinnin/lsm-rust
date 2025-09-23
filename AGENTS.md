@@ -6,6 +6,7 @@
 - Design notes: `design.md`, `ut-design.md`. Coverage helper: `code_coverage.sh`.
 - Unit tests live alongside modules via `#[cfg(test)]`. No `tests/` integration folder yet.
 
+
 ## Build, Test, and Development Commands
 - Build: `cargo build` (debug), `cargo build --release` (optimized).
 - Check: `cargo check` (fast type/borrow checking).
@@ -37,3 +38,29 @@
 ## Security & Configuration Tips
 - Do not commit real datasets or secrets.
 - Avoid `unsafe` unless essential and reviewed; document any usage.
+
+## Roadmap & TODOs
+- Source of truth is `todo.md`. When tasks change, update `todo.md` first and mirror a concise summary here to keep both in sync.
+- In progress: Open DB from existing files
+  - Load table change file; reconstruct levels
+  - Load SSTables and build level storage
+- High priority
+  - Read mini LSM and refactor
+  - Test running DB from files
+- Normal
+  - Writer loop: fetch requests continuously (avoid sleeps)
+  - Disk perf tests: reads and sequential writes
+  - File-based storage backend improvements
+  - Support range query APIs
+  - Verify starting DB from files
+  - Persist compact-level changes in table-change log
+- Low
+  - Performance benchmarking suite
+  - Recovery mechanism hardening
+- Done (highlights)
+  - Freeze memtable in write worker; backpressure on many imms
+  - Post-compact check and immediate rerun if needed
+  - Unit tests across memtable/levels/log/table
+  - Delete-tombstone handling in deepest level
+  - Zero-copy KV read; block format aligned with mini LSM
+  - Config plumbed through components; logging via tracing
