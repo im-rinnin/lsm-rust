@@ -47,6 +47,13 @@ pub struct Filestore {
     filename: String,
 }
 
+impl Drop for Filestore {
+    fn drop(&mut self) {
+        // Best-effort flush to ensure durability before the file handle closes.
+        let _ = self.f.sync_all();
+    }
+}
+
 // Inherent helpers for Memstore used in tests
 impl Memstore {
     pub fn open_for_test(id: StoreId) -> Self {
@@ -413,6 +420,35 @@ mod test {
         filestore.read_at(&mut read_buf2, 5);
         assert_eq!(&read_buf2[0..5], b"56789");
         assert_eq!(&read_buf2[5..15], &[0u8; 10]);
+    }
+
+    #[test]
+    fn test_filestore_drop_flush_persists() {
+        use std::fs::OpenOptions;
+        use std::io::Read;
+
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_path_buf();
+
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)
+                .unwrap();
+
+            // Write without calling flush; rely on Drop to sync
+            let mut filestore = Filestore::open_with_file(file, 42);
+            filestore.append(b"hello drop");
+            // filestore dropped here
+        }
+
+        // Reopen and verify content is present
+        let mut f = OpenOptions::new().read(true).open(&path).unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.as_slice(), b"hello drop");
     }
 
     #[test]
