@@ -7,7 +7,6 @@ pub struct Key<T: AsRef<[u8]>> {
 pub type KeySlice<'a> = Key<&'a [u8]>;
 pub type ValueSlice<'a> = Key<&'a [u8]>;
 pub type KeyBytes = Key<Bytes>;
-pub type KeyVec = Key<Vec<u8>>;
 pub type ValueByte = Key<Bytes>;
 
 impl KeyBytes {
@@ -47,24 +46,7 @@ impl From<&'_ [u8]> for KeyBytes {
     }
 }
 
-impl KeyVec {
-    pub fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        Self { data }
-    }
-
-    pub fn append(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
-    }
-}
-impl<'a> From<&'a [u8]> for KeyVec {
-    fn from(s: &'a [u8]) -> Self {
-        KeyVec { data: s.to_vec() }
-    }
-}
+// KeyVec removed in favor of KeyBytes
 
 impl<'a> From<&'a [u8]> for KeySlice<'a> {
     fn from(value: &'a [u8]) -> Self {
@@ -73,12 +55,4 @@ impl<'a> From<&'a [u8]> for KeySlice<'a> {
 }
 
 #[cfg(test)]
-mod test {
-    use super::KeySlice;
-    use super::KeyVec;
-
-    fn test() {
-        let k = String::from("sdf");
-        let d = k.as_str();
-    }
-}
+mod test {}

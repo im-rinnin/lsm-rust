@@ -1,4 +1,4 @@
-// use super::{key::KeyVec, table::TableReader};
+// use super::{key::KeyBytes, table::TableReader};
 // use std::sync::Arc;
 //
 // use super::{common::*, store::Store};
@@ -13,7 +13,7 @@
 //     pub fn query(&self, q: KeyQuery) -> Result<Option<Value>> {
 //         unimplemented!()
 //     }
-//     pub fn range_query(&self, start: KeyVec, end: KeyVec) -> Result<Option<Vec<Value>>> {
+//     pub fn range_query(&self, start: KeyBytes, end: KeyBytes) -> Result<Option<Vec<Value>>> {
 //         unimplemented!()
 //     }
 // }

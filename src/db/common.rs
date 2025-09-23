@@ -238,7 +238,7 @@ pub mod test {
             (10, 99),
         ];
         let output_ids: Vec<(u64, u64)> = kv_iter
-            // Convert KeyVec to String before parsing
+            // Convert KeyBytes to String before parsing
             .map(|i| {
                 (
                     i.id,
