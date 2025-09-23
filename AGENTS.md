@@ -23,6 +23,7 @@
 - Memory/Buffers: `Arc<T>` for sharing, `Bytes` for zero-copy buffers, `Vec<u8>` when owned.
 - Logging: `tracing`; enable via `db::db_log::enable_log_with_level(tracing::Level::INFO)`.
 - Serialization: `serde` with `#[derive(Serialize, Deserialize)]`.
+ - Keys/Values: use `KeyBytes`/`ValueByte`; `KeyVec`/`ValueVec` are removed.
 
 ## Testing Guidelines
 - Write small, deterministic tests; use `assert!`/`assert_eq!` and fixed seeds.
@@ -33,34 +34,29 @@
 ## Commit & Pull Request Guidelines
 - Prefer Conventional Commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`.
 - PRs: clear description, rationale, and scope; link issues; include behavior/perf notes when relevant; add/adjust tests.
-- Ensure green `cargo test`, `cargo fmt --check`, and `cargo clippy` before pushing.
+- Ensure green: `cargo test`, `cargo fmt --check`, and `cargo clippy -- -D warnings` before pushing.
 
 ## Security & Configuration Tips
 - Do not commit real datasets or secrets.
 - Avoid `unsafe` unless essential and reviewed; document any usage.
 
 ## Roadmap & TODOs
-- Source of truth is `todo.md`. When tasks change, update `todo.md` first and mirror a concise summary here to keep both in sync.
-- In progress: Open DB from existing files
-  - Load table change file; reconstruct levels
-  - Load SSTables and build level storage
+- Source of truth is `todo.md`. Update `todo.md` first, then mirror a concise summary here.
+- In progress
+  - Open DB from existing files: load table-change log; load SSTables and build levels
 - High priority
-  - Read mini LSM and refactor
-  - Test running DB from files
+  - Read mini LSM and refactor; validate running DB from files
 - Normal
-  - Writer loop: fetch requests continuously (avoid sleeps)
-  - Disk perf tests: reads and sequential writes
-  - File-based storage backend improvements
-  - Support range query APIs
-  - Verify starting DB from files
-  - Persist compact-level changes in table-change log
+  - Write worker: loop and fetch requests (no sleeps)
+  - Disk perf: reads and sequential writes
+  - File-backed store improvements; range query API support
+  - Persist compaction changes in table-change log
 - Low
-  - Performance benchmarking suite
-  - Recovery mechanism hardening
+  - Benchmarking suite; recovery hardening
 - Done (highlights)
-  - Freeze memtable in write worker; backpressure on many imms
-  - Post-compact check and immediate rerun if needed
-  - Unit tests across memtable/levels/log/table
-  - Delete-tombstone handling in deepest level
-  - Zero-copy KV read; block format aligned with mini LSM
-  - Config plumbed through components; logging via tracing
+  - Shutdown dumps memtables/imm to L0
+  - Freeze memtable; backpressure when many imm tables
+  - Post-compact check with immediate rerun if needed
+  - Key/Value refactor to `KeyBytes`/`ValueByte`; removed `KeyVec`/`ValueVec`
+  - Unit tests across memtable/levels/log/table; zero-copy KV read
+  - Block format aligned with mini LSM; configs plumbed; tracing logs
