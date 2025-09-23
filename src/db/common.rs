@@ -15,6 +15,7 @@ use std::mem::size_of;
 
 use super::key::KeyBytes;
 use super::key::ValueByte;
+use std::iter::Peekable;
 
 #[derive(Clone)] // Add Clone derive
 pub struct KeyQuery {
@@ -42,9 +43,9 @@ pub enum OpType {
     Write(ValueByte),
     Delete,
 }
+// Aggregates multiple sorted iterators of KVOperation using per-iterator Peekable
 pub struct KViterAgg<'a> {
-    iters: Vec<Box<dyn Iterator<Item = KVOperation> + 'a>>,
-    iters_next: Vec<Option<KVOperation>>,
+    iters: Vec<Peekable<Box<dyn Iterator<Item = KVOperation> + 'a>>>,
 }
 impl KVOperation {
     pub fn new(id: OpId, key: KeyBytes, op: OpType) -> Self {
@@ -112,14 +113,8 @@ impl KVOperation {
 impl<'a> KViterAgg<'a> {
     // change this to Box<dyn Iterator<Item = KVOperation>>
     pub fn new(iters: Vec<Box<dyn Iterator<Item = KVOperation> + 'a>>) -> Self {
-        let mut res = KViterAgg {
-            iters,
-            iters_next: Vec::new(),
-        };
-        for it in res.iters.iter_mut() {
-            res.iters_next.push(it.next());
-        }
-        res
+        let iters = iters.into_iter().map(|it| it.peekable()).collect();
+        KViterAgg { iters }
     }
 }
 
@@ -133,40 +128,23 @@ impl<'a> Iterator for KViterAgg<'a> {
     /// with the exact same key from different iterators to ensure that
     /// only the most recent operation for a given key is yielded.
     fn next(&mut self) -> Option<Self::Item> {
-        let mut has_next = false;
-        for (i, n) in self.iters_next.iter_mut().enumerate() {
-            if n.is_some() {
-                has_next = true;
-            } else {
-                *n = self.iters.get_mut(i).unwrap().next();
-                if n.is_some() {
-                    has_next = true;
-                }
-            }
-        }
+        // Snapshot current heads to avoid aliasing mutable borrows during selection
+        let heads: Vec<Option<KVOperation>> =
+            self.iters.iter_mut().map(|it| it.peek().cloned()).collect();
 
-        if !has_next {
-            return None;
-        }
-
-        let mut smallest_key_index: Option<usize> = None;
-
-        for (index, current_kv_option) in self.iters_next.iter().enumerate() {
-            if let Some(current_kv) = current_kv_option {
-                match smallest_key_index {
-                    None => {
-                        smallest_key_index = Some(index);
-                    }
+        // Find the iterator with the smallest key; break ties by larger id
+        let mut smallest_idx: Option<usize> = None;
+        for (idx, head) in heads.iter().enumerate() {
+            if let Some(cur) = head.as_ref() {
+                match smallest_idx {
+                    None => smallest_idx = Some(idx),
                     Some(s_idx) => {
-                        let smallest_kv = self.iters_next[s_idx].as_ref().unwrap();
-                        let cmp_res = current_kv.key.cmp(&smallest_kv.key);
-                        match cmp_res {
-                            Ordering::Less => {
-                                smallest_key_index = Some(index);
-                            }
+                        let smallest = heads[s_idx].as_ref().expect("head exists");
+                        match cur.key.cmp(&smallest.key) {
+                            Ordering::Less => smallest_idx = Some(idx),
                             Ordering::Equal => {
-                                if current_kv.id > smallest_kv.id {
-                                    smallest_key_index = Some(index);
+                                if cur.id > smallest.id {
+                                    smallest_idx = Some(idx);
                                 }
                             }
                             Ordering::Greater => {}
@@ -176,21 +154,28 @@ impl<'a> Iterator for KViterAgg<'a> {
             }
         }
 
-        if let Some(s_idx) = smallest_key_index {
-            let result_kv = self.iters_next[s_idx].take(); // Take the value out
-            for (index, current_kv_option) in self.iters_next.iter_mut().enumerate() {
-                if index != s_idx {
-                    if let Some(current_kv) = current_kv_option {
-                        if current_kv.key == result_kv.as_ref().unwrap().key {
-                            *current_kv_option = None; // Invalidate other KVs with the same key
-                        }
+        let s_idx = smallest_idx?;
+        // Consume and return the chosen item
+        let chosen = self.iters[s_idx].next();
+
+        if let Some(ref chosen_kv) = chosen {
+            // Invalidate (consume) any other heads with the same key
+            for (idx, it) in self.iters.iter_mut().enumerate() {
+                if idx == s_idx {
+                    continue;
+                }
+                while let Some(other) = it.peek() {
+                    if other.key == chosen_kv.key {
+                        // discard it
+                        let _ = it.next();
+                    } else {
+                        break;
                     }
                 }
             }
-            result_kv
-        } else {
-            None
         }
+
+        chosen
     }
 }
 
