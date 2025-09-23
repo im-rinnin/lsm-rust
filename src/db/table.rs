@@ -34,6 +34,30 @@ struct BlockMeta {
     first_key: KeyBytes,
     last_key: KeyBytes,
 }
+pub struct TableReader<T: Store> {
+    store: T,
+    block_metas: Vec<BlockMeta>,
+}
+pub struct TableIter<'a, T: Store> {
+    table: &'a TableReader<T>,
+    current_block_num: usize,
+    current_block_iter: Option<BlockIter>,
+    // Reusable buffer for reading block data
+    block_read_buffer: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+pub struct TableConfig {
+    block_num_limit: usize,
+}
+
+pub struct TableBuilder<T: Store> {
+    store: T,
+    block_metas: Vec<BlockMeta>,
+    config: TableConfig,
+    current_block_first_key: Option<KeyBytes>,
+    block_builder: BlockBuilder,
+}
 
 impl BlockMeta {
     pub fn encode(&self, w: &mut Buffer) {
@@ -66,14 +90,10 @@ impl BlockMeta {
     }
 }
 
-pub struct TableReader<T: Store> {
-    store: T,
-    block_metas: Vec<BlockMeta>,
-}
 // for level 0,must consider multiple key with diff value/or delete
 impl<T: Store> TableReader<T> {
     pub fn new(store_id: StoreId) -> Self {
-        debug!(id = store_id, "table read new witht id ");
+        debug!(id = store_id, "table read new with id");
         let store = open_store::<T>(store_id);
         Self::new_with_store_for_test(store)
     }
@@ -195,13 +215,7 @@ impl<T: Store> TableReader<T> {
         best_op
     }
 }
-pub struct TableIter<'a, T: Store> {
-    table: &'a TableReader<T>,
-    current_block_num: usize,
-    current_block_iter: Option<BlockIter>,
-    // Reusable buffer for reading block data
-    block_read_buffer: Option<Vec<u8>>,
-}
+
 impl<'a, T: Store> TableIter<'a, T> {
     pub fn new(table: &'a TableReader<T>) -> Self {
         TableIter {
@@ -251,10 +265,6 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
 
 use crate::db::block::BlockBuilder;
 use serde::{Deserialize, Serialize};
-#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
-pub struct TableConfig {
-    block_num_limit: usize,
-}
 impl TableConfig {
     pub fn new(table_size: usize) -> Self {
         TableConfig {
@@ -277,13 +287,7 @@ impl Default for TableConfig {
         }
     }
 }
-pub struct TableBuilder<T: Store> {
-    store: T,
-    block_metas: Vec<BlockMeta>,
-    config: TableConfig,
-    current_block_first_key: Option<KeyBytes>,
-    block_builder: BlockBuilder,
-}
+
 impl<T: Store> TableBuilder<T> {
     pub fn new_with_store_for_test(store: T) -> Self {
         debug!(id = store.id(), "table_builder new with store");
@@ -373,7 +377,7 @@ impl<T: Store> TableBuilder<T> {
             .take()
             .expect("First key must be set when flushing a non-empty block");
 
-        self.block_builder.finish().expect("block finishi error");
+        self.block_builder.finish().expect("block finish error");
         let block_buffer = self.block_builder.get_ref();
 
         // Append the block data to the store
@@ -393,10 +397,11 @@ impl<T: Store> TableBuilder<T> {
     pub fn flush(mut self) -> TableReader<T> {
         // Flush any remaining data in the current buffer
         if !self.block_builder.is_empty() {
-            let last_key = self
-                .block_builder
-                .last_key()
-                .expect("Block should have a last key if it's not empty");
+            // Ensure last key exists if block is not empty
+            assert!(
+                self.block_builder.last_key().is_some(),
+                "Block should have a last key if it's not empty"
+            );
             self.flush_current_block();
         }
 
