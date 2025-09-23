@@ -199,7 +199,7 @@ impl TableChangeLog<Filestore> {
 impl<T: Store> TableChangeLog<T> {
     pub fn from(id: StoreId) -> Self {
         TableChangeLog {
-            storage: T::open_with(id, "table_changes", "data"),
+            storage: T::open(id, "table_changes", "data"),
         }
     }
 
@@ -2296,7 +2296,7 @@ mod test {
     #[test]
     fn test_table_change_log_corrupted_checksum() {
         let store_id = 100;
-        let mut memstore = Memstore::open(store_id);
+        let mut memstore = Memstore::open_for_test(store_id);
 
         // Manually create a valid TableChange and its encoded bytes
         let change = TableChange {

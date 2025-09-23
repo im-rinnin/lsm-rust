@@ -33,9 +33,7 @@ pub trait Store {
     fn seek(&mut self, position: usize);
     fn len(&self) -> usize;
     fn close(self);
-    // only for test
-    fn open(id: StoreId) -> Self;
-    fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self;
+    fn open(id: StoreId, prefix: &str, postfix: &str) -> Self;
     fn id(&self) -> StoreId;
 }
 
@@ -49,13 +47,9 @@ pub struct Filestore {
     filename: String,
 }
 
-impl Store for Memstore {
-    fn close(self) {}
-    fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self {
-        Self::open(id)
-    }
-
-    fn open(id: StoreId) -> Self {
+// Inherent helpers for Memstore used in tests
+impl Memstore {
+    pub fn open_for_test(id: StoreId) -> Self {
         let store = if id < STORE_ID_RANGE {
             Arc::new(Mutex::new(vec![]))
         } else {
@@ -65,6 +59,14 @@ impl Store for Memstore {
                 .clone()
         };
         Memstore { store, id }
+    }
+}
+
+impl Store for Memstore {
+    fn close(self) {}
+    // ignore prefix and postfix because memstore is for test only
+    fn open(id: StoreId, _prefix: &str, _postfix: &str) -> Self {
+        Memstore::open_for_test(id)
     }
     fn id(&self) -> StoreId {
         self.id
@@ -130,7 +132,7 @@ impl Store for Filestore {
     fn id(&self) -> StoreId {
         self.id
     }
-    fn open_with(id: StoreId, prefix: &str, postfix: &str) -> Self {
+    fn open(id: StoreId, prefix: &str, postfix: &str) -> Self {
         assert!(!postfix.is_empty());
         use std::fs::OpenOptions;
         let filename = if prefix.is_empty() {
@@ -146,9 +148,6 @@ impl Store for Filestore {
             .open(&path) // Open using PathBuf
             .expect(&format!("Failed to open file: {}", path.display()));
         Filestore { f, id, filename } // Store path
-    }
-    fn open(id: StoreId) -> Self {
-        Self::open_with(id, "", "")
     }
     fn len(&self) -> usize {
         let meta = self.f.metadata().unwrap();
@@ -213,7 +212,7 @@ mod test {
     #[test]
     fn test_read_at_memstore() {
         let id = 2u64; // Using a unique ID for this test
-        let mut m = Memstore::open(id);
+        let mut m = Memstore::open_for_test(id);
         let data = b"0123456789abcdef";
         m.append(data);
         let original_len = m.len();
@@ -235,7 +234,7 @@ mod test {
     #[test]
     fn test_write_at_memstore() {
         let id = 3u64; // Using a unique ID for this test
-        let mut m = Memstore::open(id);
+        let mut m = Memstore::open_for_test(id);
         let initial_data = b"initial";
         m.append(initial_data);
         let initial_len = m.len();
@@ -254,7 +253,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_write_at_memstore_panic() {
-        let mut m = Memstore::open(4u64); // Using a unique ID for this test
+        let mut m = Memstore::open_for_test(4u64); // Using a unique ID for this test
         m.append(b"some data");
         m.seek(1); // Seek backwards, should panic due to assert
     }
@@ -419,25 +418,25 @@ mod test {
     #[test]
     fn test_shared_and_private_memstore() {
         let id = fetch_store_id_range_for_test();
-        let mut memstore = Memstore::open(id);
+        let mut memstore = Memstore::open_for_test(id);
         memstore.append("test".as_bytes());
         assert_eq!(memstore.len(), 4);
         drop(memstore);
-        let mut memstore = Memstore::open(id);
+        let mut memstore = Memstore::open_for_test(id);
         assert_eq!(memstore.len(), 4);
 
-        let mut memstore = Memstore::open(0);
+        let mut memstore = Memstore::open_for_test(0);
         memstore.append("test".as_bytes());
         assert_eq!(memstore.len(), 4);
         drop(memstore);
         let id = 0;
-        let mut memstore = Memstore::open(id);
+        let mut memstore = Memstore::open_for_test(id);
         assert_eq!(memstore.len(), 0);
     }
     #[test]
     fn test_memstore_pad_in_write() {
         let id = 9u64; // Using a unique ID for this test
-        let mut m = Memstore::open(id);
+        let mut m = Memstore::open_for_test(id);
 
         // Write initial data
         m.append(b"initial");

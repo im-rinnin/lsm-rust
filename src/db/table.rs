@@ -27,7 +27,7 @@ const BLOCK_COUNT_LIMIT: usize = SSTABLE_DATA_SIZE_LIMIT / DATA_BLOCK_SIZE;
 pub type ThreadSafeTableReader<T> = Arc<TableReader<T>>;
 
 fn open_store<T: Store>(id: StoreId) -> T {
-    T::open_with(id, "table", "data")
+    T::open(id, "table", "data")
 }
 #[derive(PartialEq, Debug)]
 struct BlockMeta {
@@ -519,7 +519,7 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(num_kvs);
 
         let store_id = 100u64; // Assign a unique u64 ID for this test
-        let store = Memstore::open(store_id);
+        let store = Memstore::open_for_test(store_id);
         let mut table_builder = TableBuilder::new_with_store_for_test(store);
 
         table_builder.fill_with_op(kvs.iter());

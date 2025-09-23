@@ -1775,7 +1775,7 @@ mod test {
         let serialized_config = serde_json::to_vec_pretty(&original_config)
             .expect("Failed to serialize config for test");
 
-        let mut memstore_valid = Memstore::open(1); // Unique store ID
+        let mut memstore_valid = Memstore::open_for_test(1); // Unique store ID
         memstore_valid.append(&serialized_config);
 
         let loaded_config = Config::load_from_store(&memstore_valid)
@@ -1812,7 +1812,7 @@ mod test {
         // Add more assertions for nested structs if needed, or rely on derived PartialEq if it were implemented for all.
 
         // Case 2: Empty store
-        let memstore_empty = Memstore::open(2); // Unique store ID
+        let memstore_empty = Memstore::open_for_test(2); // Unique store ID
         let load_result_empty = Config::load_from_store(&memstore_empty);
         assert!(load_result_empty.is_err());
         assert_eq!(
@@ -1821,7 +1821,7 @@ mod test {
         );
 
         // Case 3: Corrupted data in store (not valid JSON)
-        let mut memstore_corrupted = Memstore::open(3); // Unique store ID
+        let mut memstore_corrupted = Memstore::open_for_test(3); // Unique store ID
         memstore_corrupted.append(b"this is not valid json");
         let load_result_corrupted = Config::load_from_store(&memstore_corrupted);
         assert!(load_result_corrupted.is_err());
