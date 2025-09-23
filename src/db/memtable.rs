@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::common::SearchResult;
 use super::key::KeyBytes;
-use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
+use crate::db::common::{KVOperation, KeyQuery, OpId, OpType};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
@@ -47,7 +47,7 @@ impl Memtable {
         None
     }
 
-    pub fn insert(&self, op: KVOpertion) -> Result {
+    pub fn insert(&self, op: KVOperation) -> Result {
         let op_size = op.encode_size();
         self.table.insert((op.key, op.id), op.op);
         self.current_size_bytes
@@ -79,7 +79,7 @@ impl Memtable {
 }
 
 impl<'a> Iterator for MemtableIterator<'a> {
-    type Item = KVOpertion;
+    type Item = KVOperation;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Get the current candidate entry. If `peeked_entry` is `None`, try to fetch from `inner_iter`.
@@ -126,8 +126,8 @@ impl<'a> Iterator for MemtableIterator<'a> {
         }
 
         // Convert the `best_entry` (which is the latest for its key group)
-        // into the `KVOpertion` to be returned.
-        Some(KVOpertion {
+        // into the `KVOperation` to be returned.
+        Some(KVOperation {
             id: best_entry.key().1,
             key: best_entry.key().0.clone(), // Clone the KeyBytes for ownership
             op: best_entry.value().clone(),  // Clone the OpType for ownership
@@ -139,7 +139,7 @@ impl<'a> Iterator for MemtableIterator<'a> {
 mod test {
     use tracing::info;
 
-    use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
+    use crate::db::common::{KVOperation, KeyQuery, OpId, OpType};
     use crate::db::db_log;
     use crate::db::key::KeyBytes;
 
@@ -157,7 +157,7 @@ mod test {
     fn test_empty_count() {
         let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         assert_eq!(m.len(), 0);
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             1,
             1.to_string().as_bytes().into(),
             OpType::Write(1.to_string().as_bytes().into()),
@@ -175,7 +175,7 @@ mod test {
         // Insert multiple operations for the same key with increasing op_ids
         // 1. Write "value1" with op_id 0
         let op_id_0 = get_next_id(&mut id);
-        m.insert(KVOpertion::new(
+        m.insert(KVOperation::new(
             op_id_0,
             key.clone(),
             OpType::Write("value1".as_bytes().into()),
@@ -184,7 +184,7 @@ mod test {
 
         // 2. Write "value2" with op_id 1
         let op_id_1 = get_next_id(&mut id);
-        m.insert(KVOpertion::new(
+        m.insert(KVOperation::new(
             op_id_1,
             key.clone(),
             OpType::Write("value2".as_bytes().into()),
@@ -193,12 +193,12 @@ mod test {
 
         // 3. Delete with op_id 2
         let op_id_2 = get_next_id(&mut id);
-        m.insert(KVOpertion::new(op_id_2, key.clone(), OpType::Delete))
+        m.insert(KVOperation::new(op_id_2, key.clone(), OpType::Delete))
             .unwrap();
 
         // 4. Write "value3" with op_id 3
         let op_id_3 = get_next_id(&mut id);
-        m.insert(KVOpertion::new(
+        m.insert(KVOperation::new(
             op_id_3,
             key.clone(),
             OpType::Write("value3".as_bytes().into()),
@@ -282,7 +282,7 @@ mod test {
         // put 1..20
         for i in 0..20 {
             let op_id = get_next_id(&mut id);
-            let op = KVOpertion::new(
+            let op = KVOperation::new(
                 op_id,
                 i.to_string().as_bytes().into(),
                 OpType::Write(i.to_string().as_bytes().into()),
@@ -291,7 +291,7 @@ mod test {
         }
         // delete 10
         let op_id_delete_10 = get_next_id(&mut id);
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             op_id_delete_10,
             10.to_string().as_bytes().into(),
             OpType::Delete,
@@ -299,7 +299,7 @@ mod test {
         m.insert(op).unwrap();
         // overwirte  12 to 100
         let op_id_overwrite_12 = get_next_id(&mut id);
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             op_id_overwrite_12,
             12.to_string().as_bytes().into(),
             OpType::Write(100.to_string().as_bytes().into()),
@@ -398,7 +398,7 @@ mod test {
         let mut add_op = |m: &Memtable, key: &str, value: &str, op_id_gen: &mut OpId| {
             let op_id = get_next_id(op_id_gen);
             let op_type = OpType::Write(value.as_bytes().into());
-            let op = KVOpertion::new(op_id, key.as_bytes().into(), op_type.clone());
+            let op = KVOperation::new(op_id, key.as_bytes().into(), op_type.clone());
             m.insert(op).unwrap();
             inserted_ops.push((key.to_string(), op_id, op_type));
         };
@@ -417,7 +417,7 @@ mod test {
         add_op(&m, "a", "val_a_5", &mut id);
         // Key "d", op_id 6, Delete
         let op_id_delete_d = get_next_id(&mut id);
-        let op = KVOpertion::new(op_id_delete_d, "d".as_bytes().into(), OpType::Delete);
+        let op = KVOperation::new(op_id_delete_d, "d".as_bytes().into(), OpType::Delete);
         m.insert(op).unwrap();
         // Key "d", op_id 7, Write (after delete)
         add_op(&m, "d", "val_d_7", &mut id);
@@ -435,10 +435,10 @@ mod test {
         // So, `actual_iter_data` should contain only the final state for each unique key.
         // We need to process `inserted_ops` to get the 'expected' deduplicated and sorted list.
 
-        let mut expected_deduplicated_data: Vec<KVOpertion> = Vec::new();
+        let mut expected_deduplicated_data: Vec<KVOperation> = Vec::new();
         for (key_str, op_id, op_type) in inserted_ops {
             let key = KeyBytes::from(key_str.as_bytes());
-            let op = KVOpertion::new(op_id, key.clone(), op_type);
+            let op = KVOperation::new(op_id, key.clone(), op_type);
 
             // Find if this key already exists in the result, and replace if new op_id is higher
             let mut found = false;
@@ -510,7 +510,7 @@ mod test {
 
         for (key_val, op_type) in ops_to_insert {
             let op_id = get_next_id(&mut id);
-            let op = KVOpertion::new(op_id, key_val.to_string().as_bytes().into(), op_type);
+            let op = KVOperation::new(op_id, key_val.to_string().as_bytes().into(), op_type);
             expected_iter_data.push((key_val.to_string(), op_id, op.op.clone()));
             m.insert(op).unwrap();
         }
@@ -556,7 +556,7 @@ mod test {
             let op_id = get_next_id(&mut id);
             let key_str = format!("key_{}", op_id);
             let value_str = format!("value_{}", op_id);
-            let op = KVOpertion::new(
+            let op = KVOperation::new(
                 op_id,
                 key_str.as_bytes().into(),
                 OpType::Write(value_str.as_bytes().into()),
@@ -582,7 +582,7 @@ mod test {
         let op_id = get_next_id(&mut id);
         let key_str = format!("key_final_{}", op_id);
         let value_str = format!("value_final_{}", op_id);
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             op_id,
             key_str.as_bytes().into(),
             OpType::Write(value_str.as_bytes().into()),

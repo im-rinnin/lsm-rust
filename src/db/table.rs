@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::db::{
-    common::{new_buffer, Buffer, KVOpertion, OpId, OpType},
-    key::{KeySlice, KeyBytes},
+    common::{new_buffer, Buffer, KVOperation, OpId, OpType},
+    key::{KeyBytes, KeySlice},
     store::{Store, StoreId},
 };
 use byteorder::LittleEndian;
@@ -213,7 +213,7 @@ impl<'a, T: Store> TableIter<'a, T> {
     }
 }
 impl<'a, T: Store> Iterator for TableIter<'a, T> {
-    type Item = KVOpertion;
+    type Item = KVOperation;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -249,9 +249,9 @@ impl<'a, T: Store> Iterator for TableIter<'a, T> {
     }
 }
 
-use serde::{Serialize, Deserialize};
 use crate::db::block::BlockBuilder;
-#[derive(Clone, Copy, Serialize, Deserialize,Debug)]
+use serde::{Deserialize, Serialize};
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct TableConfig {
     block_num_limit: usize,
 }
@@ -325,7 +325,7 @@ impl<T: Store> TableBuilder<T> {
     /// and starts a new block.
     /// Returns `false` if the operation cannot be added because the table
     /// has reached its `block_num_limit`.
-    pub fn add(&mut self, op: KVOpertion) -> bool {
+    pub fn add(&mut self, op: KVOperation) -> bool {
         // If the current block is empty, this operation's key is the first key of the block.
         if self.block_builder.is_empty() {
             self.current_block_first_key = Some(op.key.as_ref().into());
@@ -429,7 +429,7 @@ impl<T: Store> TableBuilder<T> {
             block_metas: self.block_metas,
         }
     }
-    pub fn fill_with_op<'a, IT: Iterator<Item = &'a KVOpertion>>(&mut self, it: IT) {
+    pub fn fill_with_op<'a, IT: Iterator<Item = &'a KVOperation>>(&mut self, it: IT) {
         for op_ref in it {
             if !self.add(op_ref.clone()) {
                 // If add returns false, it means the table is full (block_num_limit reached)
@@ -446,15 +446,15 @@ pub mod test {
     use super::TableBuilder;
     use crate::db::block::test::create_kv_data_with_range_id_offset;
     use crate::db::common::OpId;
-    use crate::db::key::KeySlice;
     use crate::db::key::KeyBytes;
+    use crate::db::key::KeySlice;
     use crate::db::table::open_store;
     use std::mem;
     use std::ops::Range;
 
     use super::super::block::test::pad_zero;
     use crate::db::{
-        common::{KVOpertion, OpType},
+        common::{KVOperation, OpType},
         store::{Memstore, Store},
     };
 
@@ -479,19 +479,19 @@ pub mod test {
         create_test_table(0..size)
     }
 
-    fn create_test_kvs_for_add_test() -> Vec<KVOpertion> {
+    fn create_test_kvs_for_add_test() -> Vec<KVOperation> {
         vec![
-            KVOpertion::new(
+            KVOperation::new(
                 0,
                 "keyA".as_bytes().into(),
                 OpType::Write("valueA".as_bytes().into()),
             ),
-            KVOpertion::new(
+            KVOperation::new(
                 1,
                 "keyB".as_bytes().into(),
                 OpType::Write("valueB".as_bytes().into()),
             ),
-            KVOpertion::new(
+            KVOperation::new(
                 2,
                 "keyC".as_bytes().into(),
                 OpType::Write("valueC".as_bytes().into()),
@@ -659,14 +659,14 @@ pub mod test {
 
         // Version 1: id 5 (original from create_kv_data_in_range_zero_to)
         // Version 2: id 15, value "duplicate_15"
-        kvs.push(KVOpertion::new(
+        kvs.push(KVOperation::new(
             15,
             key_to_duplicate.as_bytes().into(),
             OpType::Write("duplicate_15".as_bytes().into()),
         ));
 
         // Version 3: id 11, value "duplicate_11"
-        kvs.push(KVOpertion::new(
+        kvs.push(KVOperation::new(
             11,
             key_to_duplicate.as_bytes().into(),
             OpType::Write("duplicate_11".as_bytes().into()),
@@ -792,7 +792,7 @@ pub mod test {
     fn test_block_meta_encode_decode() {
         use super::BlockMeta;
         use crate::db::common::new_buffer;
-    use crate::db::key::KeyBytes;
+        use crate::db::key::KeyBytes;
         use std::io::Seek;
 
         let original_meta = BlockMeta {

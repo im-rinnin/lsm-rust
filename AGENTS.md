@@ -24,7 +24,7 @@
 - Logging: `tracing`; enable via `db::db_log::enable_log_with_level(tracing::Level::INFO)`.
 - Serialization: `serde` with `#[derive(Serialize, Deserialize)]`.
 - Keys/Values: use `KeyBytes`/`ValueByte`; `KeyVec`/`ValueVec` are removed.
- - Iterators: aggregate multiple ordered KV streams with `KViterAgg`, which accepts `Vec<Box<dyn Iterator<Item = KVOpertion>>>`.
+ - Iterators: aggregate multiple ordered KV streams with `KViterAgg`, which accepts `Vec<Box<dyn Iterator<Item = KVOperation>>>`.
 
 ## Testing Guidelines
 - write unit test first (TDD)

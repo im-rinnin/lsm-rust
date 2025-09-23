@@ -32,7 +32,7 @@ pub fn new_buffer(size: usize) -> Buffer {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct KVOpertion {
+pub struct KVOperation {
     pub id: OpId,
     pub key: KeyBytes,
     pub op: OpType,
@@ -43,12 +43,12 @@ pub enum OpType {
     Delete,
 }
 pub struct KViterAgg<'a> {
-    iters: Vec<Box<dyn Iterator<Item = KVOpertion> + 'a>>,
-    iters_next: Vec<Option<KVOpertion>>,
+    iters: Vec<Box<dyn Iterator<Item = KVOperation> + 'a>>,
+    iters_next: Vec<Option<KVOperation>>,
 }
-impl KVOpertion {
+impl KVOperation {
     pub fn new(id: OpId, key: KeyBytes, op: OpType) -> Self {
-        KVOpertion { id, key, op }
+        KVOperation { id, key, op }
     }
 
     pub fn encode_size(&self) -> usize {
@@ -88,7 +88,7 @@ impl KVOpertion {
             _ => panic!("Unknown OpType byte: {}", op_type_byte),
         };
         let end_offset = cursor.position() as usize;
-        (KVOpertion { id, key, op }, end_offset)
+        (KVOperation { id, key, op }, end_offset)
     }
     pub fn encode<W: Write>(&self, mut w: &mut W) {
         w.write_u64::<LittleEndian>(self.id).unwrap();
@@ -110,8 +110,8 @@ impl KVOpertion {
 }
 
 impl<'a> KViterAgg<'a> {
-    // change this to Box<dyn Iterator<Item = KVOpertion>>
-    pub fn new(iters: Vec<Box<dyn Iterator<Item = KVOpertion> + 'a>>) -> Self {
+    // change this to Box<dyn Iterator<Item = KVOperation>>
+    pub fn new(iters: Vec<Box<dyn Iterator<Item = KVOperation> + 'a>>) -> Self {
         let mut res = KViterAgg {
             iters,
             iters_next: Vec::new(),
@@ -124,7 +124,7 @@ impl<'a> KViterAgg<'a> {
 }
 
 impl<'a> Iterator for KViterAgg<'a> {
-    type Item = KVOpertion;
+    type Item = KVOperation;
     /// Advances the iterator and returns the next key-value operation.
     /// This method implements a merge-sort-like logic:
     /// It identifies the smallest key among all iterators. If keys are equal,
@@ -195,7 +195,7 @@ impl<'a> Iterator for KViterAgg<'a> {
 }
 
 pub mod test {
-    use crate::db::common::{new_buffer, KVOpertion, KViterAgg};
+    use crate::db::common::{new_buffer, KVOperation, KViterAgg};
 
     use super::OpType;
 
@@ -208,17 +208,17 @@ pub mod test {
         let b = vec![(2, 2), (5, 3), (6, 6), (28, 8), (9, 9)];
         let c = vec![(11, 3), (18, 8)];
 
-        let f = |a: &(u64, u64)| -> KVOpertion {
+        let f = |a: &(u64, u64)| -> KVOperation {
             let id = a.0;
             let key = a.1.to_string();
-            KVOpertion::new(
+            KVOperation::new(
                 id,
                 key.as_bytes().into(),
                 OpType::Write(key.to_string().as_bytes().into()),
             )
         };
 
-        let a_ops: Vec<KVOpertion> = a.iter().map(|x| f(x)).collect();
+        let a_ops: Vec<KVOperation> = a.iter().map(|x| f(x)).collect();
         let b_ops: Vec<_> = b.iter().map(|x| f(x)).collect();
         let c_ops: Vec<_> = c.iter().map(|x| f(x)).collect();
 
@@ -254,11 +254,11 @@ pub mod test {
 
     #[test]
     fn test_kv_operation_size() {
-        let op = KVOpertion::new(1, "123".as_bytes().into(), OpType::Delete);
+        let op = KVOperation::new(1, "123".as_bytes().into(), OpType::Delete);
 
         assert_eq!(20, op.encode_size());
 
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             1,
             "123".as_bytes().into(),
             OpType::Write("234".as_bytes().into()),
@@ -267,16 +267,16 @@ pub mod test {
     }
     #[test]
     fn test_kv_operation_encode() {
-        let op = KVOpertion::new(1, "123".to_string().as_bytes().into(), OpType::Delete);
+        let op = KVOperation::new(1, "123".to_string().as_bytes().into(), OpType::Delete);
         let mut v = new_buffer(1024);
         op.encode(&mut v);
         assert_eq!(v.position() as usize, op.encode_size());
         v.set_position(0);
-        let (op_res, offset) = KVOpertion::decode(v.into_inner().into());
+        let (op_res, offset) = KVOperation::decode(v.into_inner().into());
         assert_eq!(offset, op_res.encode_size());
         assert_eq!(op_res, op);
 
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             1,
             "123".to_string().as_bytes().into(),
             OpType::Write("234".as_bytes().into()),
@@ -284,7 +284,7 @@ pub mod test {
         let mut v = new_buffer(1024);
         op.encode(&mut v);
         assert_eq!(v.position() as usize, op.encode_size());
-        let (op_res, offset) = KVOpertion::decode(v.into_inner().into());
+        let (op_res, offset) = KVOperation::decode(v.into_inner().into());
         assert_eq!(offset, op_res.encode_size());
         assert_eq!(op_res, op);
     }

@@ -14,7 +14,7 @@ use std::{
 mod db_log;
 
 use anyhow::Result;
-use common::{KVOpertion, OpId, OpType};
+use common::{KVOperation, OpId, OpType};
 use key::{KeyBytes, KeySlice, ValueByte, ValueSlice};
 use serde::{Deserialize, Serialize}; // Required for serialization/deserialization
 
@@ -193,7 +193,7 @@ impl<T: Store> Drop for LsmDB<T> {
 }
 
 impl LsmDB<Memstore> {
-    // for test 
+    // for test
     pub fn new_with_memstore(config: Config) -> Self {
         // Create the initial LsmStorage, wrapped in Arc<RwLock<...>>
         let initial_lsm_storage = Arc::new(RwLock::new(LsmStorage::new(config.lsm_storage_config)));
@@ -563,7 +563,7 @@ impl<T: Store> LsmDB<T> {
         let mut ops_to_write = Vec::new();
         let mut current_id = next_op_id.load(Ordering::SeqCst);
         for kv in kvs {
-            ops_to_write.push(KVOpertion {
+            ops_to_write.push(KVOperation {
                 id: current_id,
                 key: kv.0,
                 op: kv.1,
@@ -626,7 +626,7 @@ impl DBWriter {
 
         self.queue
             .send(request)
-            .expect("Failed to send KVOpertion to queue");
+            .expect("Failed to send KVOperation to queue");
 
         r
     }
@@ -639,7 +639,7 @@ impl<T: Store> DBReader<T> {
     pub fn set_id(&mut self, id: u64) {
         self.id = id;
     }
-    pub fn query(&self, key: KeyBytes) -> Option<KVOpertion> {
+    pub fn query(&self, key: KeyBytes) -> Option<KVOperation> {
         // Create a KeyQuery using the reader's snapshot op_id.
         let query = common::KeyQuery {
             key: key.as_ref().into(), // Use KeyBytes directly
@@ -667,7 +667,7 @@ mod test {
     use tracing_subscriber::filter::Targets;
 
     use crate::db::block::test::pad_zero;
-    use crate::db::common::KVOpertion; // Added for test_mutiple_thread_random_operaiton
+    use crate::db::common::KVOperation; // Added for test_mutiple_thread_random_operaiton
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
@@ -1531,10 +1531,10 @@ mod test {
         let mut db = LsmDB::<Memstore>::new_with_memstore(config);
         let mut writer = db.get_writer();
 
-        // data_states: HashMap where each value is an Arc<Mutex<Option<KVOpertion>>>
+        // data_states: HashMap where each value is an Arc<Mutex<Option<KVOperation>>>
         // The outer Mutex protects the HashMap itself (adding/removing keys).
-        // The inner Mutex protects the KVOpertion for a specific key.
-        let data_states: Arc<RwLock<HashMap<KeyBytes, Arc<Mutex<Option<KVOpertion>>>>>> =
+        // The inner Mutex protects the KVOperation for a specific key.
+        let data_states: Arc<RwLock<HashMap<KeyBytes, Arc<Mutex<Option<KVOperation>>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         // 1. Initial data population (keys 0..1000)
@@ -1561,7 +1561,8 @@ mod test {
             for (key_bytes, op_type) in initial_kvs_to_write {
                 let op_id = initial_op_id_base;
                 initial_op_id_base += 1;
-                let new_kv_op = KVOpertion::new(op_id, KeyBytes::from(key_bytes.as_ref()), op_type);
+                let new_kv_op =
+                    KVOperation::new(op_id, KeyBytes::from(key_bytes.as_ref()), op_type);
                 data_states_guard.insert(key_bytes, Arc::new(Mutex::new(Some(new_kv_op))));
             }
         }
@@ -1680,7 +1681,7 @@ mod test {
                                 "Thread {} operation {} failed to receive OpId for key {:?}",
                                 thread_idx, ops_done_in_thread, key_bytes
                             ));
-                            let new_kv_op = KVOpertion::new(
+                            let new_kv_op = KVOperation::new(
                                 committed_op_id,
                                 KeyBytes::from(key_bytes.as_ref()),
                                 op_type,

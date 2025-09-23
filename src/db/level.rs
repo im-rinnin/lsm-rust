@@ -16,8 +16,8 @@ use crate::db::common::KViterAgg;
 use tracing::debug;
 
 use super::{
-    common::{KVOpertion, OpId, OpType, SearchResult},
-    key::{KeySlice, KeyBytes},
+    common::{KVOperation, OpId, OpType, SearchResult},
+    key::{KeyBytes, KeySlice},
     lsm_storage::LsmStorage,
     store::{Filestore, Store, StoreId},
     table::{self, *},
@@ -407,7 +407,7 @@ impl<T: Store> LevelStorege<T> {
 
     // add new table from iterator `it` to level 0.
     // `next_sstable_id` is used to generate a unique ID for the new table and is incremented.
-    pub fn push_new_table<P: Iterator<Item = KVOpertion>>(
+    pub fn push_new_table<P: Iterator<Item = KVOperation>>(
         &mut self,
         mut it: P, // Take iterator by value or mutable ref depending on usage
         next_sstable_id: &mut StoreId,
@@ -594,7 +594,9 @@ impl<T: Store> LevelStorege<T> {
         (min_key, max_key)
     }
 
-    fn get_target_level_key_ranges(sstables: &Vec<Arc<TableReader<T>>>) -> Vec<(KeyBytes, KeyBytes)> {
+    fn get_target_level_key_ranges(
+        sstables: &Vec<Arc<TableReader<T>>>,
+    ) -> Vec<(KeyBytes, KeyBytes)> {
         let mut target_level_key_value_range = vec![];
         for table in sstables {
             target_level_key_value_range.push(table.key_range());
@@ -716,9 +718,11 @@ impl<T: Store> LevelStorege<T> {
 
         // Create boxed iterators borrowing from the table readers.
         // Each TableIter borrows from the corresponding TableReader inside Arc.
-        let boxed_iters: Vec<Box<dyn Iterator<Item = KVOpertion> + '_>> = all_tables_for_merge
+        let boxed_iters: Vec<Box<dyn Iterator<Item = KVOperation> + '_>> = all_tables_for_merge
             .iter()
-            .map(|table_reader_arc| Box::new(table_reader_arc.to_iter()) as Box<dyn Iterator<Item = KVOpertion>>)
+            .map(|table_reader_arc| {
+                Box::new(table_reader_arc.to_iter()) as Box<dyn Iterator<Item = KVOperation>>
+            })
             .collect();
 
         let kv_iter_agg = KViterAgg::new(boxed_iters);
@@ -728,7 +732,7 @@ impl<T: Store> LevelStorege<T> {
         let is_target_deepest_level = target_level > 0 && target_level == self.levels.len() - 1;
 
         // If it's the deepest level, chain `skip_while` to filter out deletes.
-        let mut final_iter: Box<dyn Iterator<Item = KVOpertion>> = if is_target_deepest_level {
+        let mut final_iter: Box<dyn Iterator<Item = KVOperation>> = if is_target_deepest_level {
             Box::new(kv_iter_agg.filter(|op| {
                 if op.op == OpType::Delete {
                     debug!(key = %op.key.to_string(), op_id = op.id, "Skipping delete operation at deepest level during compaction");
@@ -998,10 +1002,10 @@ mod test {
 
     use crc32fast::Hasher;
 
-    use crate::db::common::{KVOpertion, OpId, OpType};
+    use crate::db::common::{KVOperation, OpId, OpType};
     use crate::db::db_log;
     // OpType moved from helper
-    use crate::db::key::{KeySlice, KeyBytes};
+    use crate::db::key::{KeyBytes, KeySlice};
     use crate::db::level::{ChangeType, Level, LevelStorege, TableChange, U32_SIZE};
     use crate::db::store::{Filestore, Store, StoreId};
     // KeyBytes moved from helper
@@ -1095,7 +1099,7 @@ mod test {
     ) -> TableReader<Memstore> {
         let mut v = Vec::new();
         for i in range.clone() {
-            let tmp = KVOpertion::new(
+            let tmp = KVOperation::new(
                 i as u64 + id_offset,
                 crate::db::block::test::pad_zero(i as u64).as_bytes().into(),
                 OpType::Write(value_transform(i).to_string().as_bytes().into()),
@@ -1265,7 +1269,7 @@ mod test {
         // Change id type to u64
         let mut v = Vec::new();
         for i in range.clone() {
-            let tmp = KVOpertion::new(
+            let tmp = KVOperation::new(
                 i as u64,
                 crate::db::block::test::pad_zero(i as u64).as_bytes().into(),
                 OpType::Write(i.to_string().as_bytes().into()),
@@ -2466,8 +2470,8 @@ mod test {
         );
     }
 
-    // Helper function for tests: creates a TableReader from a vector of KVOpertions with a specific ID.
-    fn create_test_table_from_kvs_with_id(kvs: Vec<KVOpertion>, id: u64) -> TableReader<Memstore> {
+    // Helper function for tests: creates a TableReader from a vector of KVOperations with a specific ID.
+    fn create_test_table_from_kvs_with_id(kvs: Vec<KVOperation>, id: u64) -> TableReader<Memstore> {
         let mut table_builder = TableBuilder::new_with_id(id);
         table_builder.fill_with_op(kvs.iter());
         table_builder.flush()
@@ -2652,29 +2656,29 @@ mod test {
         // Create 3 tables, some with delete operations, some with overwrites
         // Table 1: Writes (0, "0"), (1, "1"), Delete (2)
         let table_1_data = vec![
-            KVOpertion::new(
+            KVOperation::new(
                 10,
                 "0".as_bytes().into(),
                 OpType::Write("0".as_bytes().into()),
             ),
-            KVOpertion::new(
+            KVOperation::new(
                 11,
                 "1".as_bytes().into(),
                 OpType::Write("1".as_bytes().into()),
             ),
-            KVOpertion::new(12, "2".as_bytes().into(), OpType::Delete),
+            KVOperation::new(12, "2".as_bytes().into(), OpType::Delete),
         ];
         let table_1 = Arc::new(create_test_table_from_kvs_with_id(table_1_data, 101));
 
         // Table 2: Delete (0), Write (1, "1_new"), Write (3, "3")
         let table_2_data = vec![
-            KVOpertion::new(13, "0".as_bytes().into(), OpType::Delete), // Deletes "0" from table 1
-            KVOpertion::new(
+            KVOperation::new(13, "0".as_bytes().into(), OpType::Delete), // Deletes "0" from table 1
+            KVOperation::new(
                 14,
                 "1".as_bytes().into(),
                 OpType::Write("1_new".as_bytes().into()),
             ), // Overwrites "1" from table 1
-            KVOpertion::new(
+            KVOperation::new(
                 15,
                 "3".as_bytes().into(),
                 OpType::Write("3".as_bytes().into()),
@@ -2684,8 +2688,8 @@ mod test {
 
         // Table 3: Delete (3), Write (4, "4")
         let table_3_data = vec![
-            KVOpertion::new(16, "3".as_bytes().into(), OpType::Delete), // Deletes "3" from table 2
-            KVOpertion::new(
+            KVOperation::new(16, "3".as_bytes().into(), OpType::Delete), // Deletes "3" from table 2
+            KVOperation::new(
                 17,
                 "4".as_bytes().into(),
                 OpType::Write("4".as_bytes().into()),
@@ -2719,7 +2723,7 @@ mod test {
         // If this test was for `compact_storage`, then `take_out_table_to_compact` would generate the deletes.
         // Here, we focus on the *output* of compaction.
 
-        // The key check: check level 1, all delete KVOpertion will be discarded
+        // The key check: check level 1, all delete KVOperation will be discarded
         let compacted_level = &level_storage.levels[1]; // Level 1 is the target level
 
         // Expected keys: "1" (from "1_new"), "4" (from "4")
@@ -3038,12 +3042,12 @@ mod test {
 
         // Case 1: Push data that fits into one table
         let data1 = vec![
-            KVOpertion::new(
+            KVOperation::new(
                 1,
                 "key001".as_bytes().into(),
                 OpType::Write("val001".as_bytes().into()),
             ),
-            KVOpertion::new(
+            KVOperation::new(
                 2,
                 "key002".as_bytes().into(),
                 OpType::Write("val002".as_bytes().into()),
@@ -3072,12 +3076,12 @@ mod test {
 
         // Case 2: Push more data, creating another table in level 0
         let data2 = vec![
-            KVOpertion::new(
+            KVOperation::new(
                 3,
                 "key003".as_bytes().into(),
                 OpType::Write("val003".as_bytes().into()),
             ),
-            KVOpertion::new(
+            KVOperation::new(
                 4,
                 "key004".as_bytes().into(),
                 OpType::Write("val004".as_bytes().into()),
@@ -3120,13 +3124,13 @@ mod test {
         // Create enough data to likely span multiple tables.
         // The exact number depends on block size and encoding.
         // Let's create 1000 KVs. If block size is ~4KB, this should create multiple tables.
-        // Use the existing helper function to create the KVOpertions.
-        // Note: create_test_table_with_id_offset returns a TableReader, we need the Vec<KVOpertion>.
+        // Use the existing helper function to create the KVOperations.
+        // Note: create_test_table_with_id_offset returns a TableReader, we need the Vec<KVOperation>.
         // We need a function like `create_kv_data_with_range_id_offset` from block::test.
         // Let's assume we have access to a similar function or adapt it.
         // For now, we'll use the existing map as the helper isn't directly usable here.
         // Re-using the map logic but ensuring it matches the helper's output format if possible.
-        let large_data: Vec<KVOpertion> =
+        let large_data: Vec<KVOperation> =
             crate::db::block::test::create_kv_data_with_range_id_offset(1000..200000, 0);
 
         let initial_table_count = level_storage_multi

@@ -1,10 +1,10 @@
 use std::fs::File; // Add import for File
 
 use super::{key::KeyBytes, store::*};
-use crate::db::common::KVOpertion;
+use crate::db::common::KVOperation;
 const LOG_FILE_NAME: &str = "logfile";
 // log data struct
-// [[KVOpertion 1],[KVOpertion 2]....]
+// [[KVOperation 1],[KVOperation 2]....]
 pub struct LogFile<T: Store> {
     s: T,
 }
@@ -18,7 +18,7 @@ impl<T: Store> LogFile<T> {
     pub fn open_with(t: T) -> Self {
         LogFile { s: t }
     }
-    pub fn append(&mut self, ops: &Vec<KVOpertion>) {
+    pub fn append(&mut self, ops: &Vec<KVOperation>) {
         for op in ops {
             let mut buffer = Vec::new();
             op.encode(&mut buffer);
@@ -48,7 +48,7 @@ impl<T: Store> LogFileIter<T> {
 }
 
 impl<T: Store> Iterator for LogFileIter<T> {
-    type Item = KVOpertion;
+    type Item = KVOperation;
     fn next(&mut self) -> Option<Self::Item> {
         // Check if there are enough bytes for the length (u64)
         if self.current_offset + 8 > self.store.len() {
@@ -60,7 +60,7 @@ impl<T: Store> Iterator for LogFileIter<T> {
         let kv_op_len = Cursor::new(len_buf).read_u64::<LittleEndian>().unwrap() as usize;
         self.current_offset += 8;
 
-        // Check if there are enough bytes for the KVOpertion itself
+        // Check if there are enough bytes for the KVOperation itself
         if self.current_offset + kv_op_len > self.store.len() {
             // This indicates a corrupted log file or incomplete write
             return None;
@@ -70,8 +70,8 @@ impl<T: Store> Iterator for LogFileIter<T> {
         self.store.read_at(&mut kv_op_buf, self.current_offset);
         self.current_offset += kv_op_len;
 
-        // KVOpertion::decode expects Bytes, so convert Vec<u8> to Bytes
-        let (kv_op, _offset) = KVOpertion::decode(bytes::Bytes::from(kv_op_buf));
+        // KVOperation::decode expects Bytes, so convert Vec<u8> to Bytes
+        let (kv_op, _offset) = KVOperation::decode(bytes::Bytes::from(kv_op_buf));
         Some(kv_op)
     }
 }
@@ -79,8 +79,8 @@ impl<T: Store> Iterator for LogFileIter<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::db::common::{KVOpertion, OpId, OpType};
-    use crate::db::key::{KeyBytes};
+    use crate::db::common::{KVOperation, OpId, OpType};
+    use crate::db::key::KeyBytes;
     use std::env;
     use std::fs::OpenOptions; // Add this import
     use tempfile::tempdir;
@@ -105,17 +105,17 @@ mod test {
         let mut log_file = LogFile::open_with(filestore_write);
 
         let ops = vec![
-            KVOpertion::new(
+            KVOperation::new(
                 1,
                 KeyBytes::from_vec(b"key1".to_vec()),
                 OpType::Write(KeyBytes::from_vec(b"value1".to_vec())),
             ),
-            KVOpertion::new(
+            KVOperation::new(
                 2,
                 KeyBytes::from_vec(b"key2".to_vec()),
                 OpType::Write(KeyBytes::from_vec(b"value2".to_vec())),
             ),
-            KVOpertion::new(3, KeyBytes::from_vec(b"key3".to_vec()), OpType::Delete),
+            KVOperation::new(3, KeyBytes::from_vec(b"key3".to_vec()), OpType::Delete),
         ];
 
         log_file.append(&ops);

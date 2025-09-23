@@ -17,15 +17,15 @@ use crate::db::store::Memstore;
 use crate::db::store::Store;
 use crate::db::table::TableReader;
 
-use serde::{Serialize, Deserialize};
 use super::key::KeySlice;
 use super::level;
 use super::level::LevelStoregeConfig;
 use super::level::TableChange;
 use super::store::StoreId;
 use super::table::TableConfig;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Serialize, Deserialize,Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct LsmStorageConfig {
     pub memtable_size_limit: usize,
     pub level_config: LevelStoregeConfig,
@@ -170,9 +170,9 @@ impl<T: Store> LsmStorage<T> {
         let oldest_imm = self.imm.remove(0); // Remove from the front
 
         // create kv iterator from the memtable
-        // Assuming Memtable has an `iter()` method that returns an iterator yielding KVOpertion
+        // Assuming Memtable has an `iter()` method that returns an iterator yielding KVOperation
         // The iterator needs to own or reference the data appropriately.
-        // Let's assume `oldest_imm.iter()` returns `impl Iterator<Item = KVOpertion>`.
+        // Let's assume `oldest_imm.iter()` returns `impl Iterator<Item = KVOperation>`.
         let kv_iterator = oldest_imm.to_iter();
 
         // call level.push_new_table to dump memtable
@@ -186,18 +186,18 @@ impl<T: Store> LsmStorage<T> {
         self.m.get_size()
     }
 
-    pub fn put(&self, query: KVOpertion) {
+    pub fn put(&self, query: KVOperation) {
         // Insert the operation into the active memtable.
         // The memtable's insert method handles the key-op_id pair insertion.
         self.m.insert(query).expect("Memtable insert failed"); // Call insert on Memtable
     }
 
-    pub fn get(&self, query: &KeyQuery) -> Option<KVOpertion> {
+    pub fn get(&self, query: &KeyQuery) -> Option<KVOperation> {
         // 1. Check active memtable
         if let Some((op_type, op_id)) = self.m.get(query) {
             match op_type {
                 OpType::Write(value) => {
-                    return Some(KVOpertion {
+                    return Some(KVOperation {
                         id: op_id,
                         key: query.key.clone(), // Reuse the key from the query
                         op: OpType::Write(value),
@@ -212,7 +212,7 @@ impl<T: Store> LsmStorage<T> {
             if let Some((op_type, op_id)) = imm_table.get(query) {
                 match op_type {
                     OpType::Write(value) => {
-                        return Some(KVOpertion {
+                        return Some(KVOperation {
                             id: op_id,
                             key: query.key.clone(),
                             op: OpType::Write(value),
@@ -228,10 +228,10 @@ impl<T: Store> LsmStorage<T> {
         let key_slice: KeySlice = query.key.as_ref().into();
         if let Some((op_type, op_id)) = self.current.find(&key_slice, query.op_id) {
             // LevelStorege::find returns SearchResult (Option<(OpType, OpId)>)
-            // We need to reconstruct KVOpertion if it's a Write
+            // We need to reconstruct KVOperation if it's a Write
             match op_type {
                 OpType::Write(value) => {
-                    return Some(KVOpertion {
+                    return Some(KVOperation {
                         id: op_id,
                         key: query.key.clone(), // Reuse the key from the query
                         op: OpType::Write(value),
@@ -245,7 +245,7 @@ impl<T: Store> LsmStorage<T> {
         None
     }
     // return key and value in [start end)
-    pub fn get_range(&self, start: KeyQuery, end: KeyQuery) -> Option<KVOpertion> {
+    pub fn get_range(&self, start: KeyQuery, end: KeyQuery) -> Option<KVOperation> {
         unimplemented!()
     }
 }
@@ -255,8 +255,8 @@ mod test {
     use std::sync::Arc;
 
     use super::{LsmStorage, LsmStorageConfig};
-    use crate::db::common::{KVOpertion, KeyQuery, OpType};
-    use crate::db::key::{KeyBytes, KeySlice, KeyBytes as _KeyVecUnusedRename};
+    use crate::db::common::{KVOperation, KeyQuery, OpType};
+    use crate::db::key::{KeyBytes, KeyBytes as _KeyVecUnusedRename, KeySlice};
     use crate::db::level::LevelStoregeConfig;
     use crate::db::store::Memstore;
 
@@ -272,7 +272,7 @@ mod test {
         let op_id = 1;
 
         // Use KeyBytes for OpType::Write
-        let op = KVOpertion::new(
+        let op = KVOperation::new(
             op_id,
             key.clone(),
             OpType::Write(KeyBytes::from(value.as_ref())),
@@ -378,7 +378,7 @@ mod test {
         let key1: KeyBytes = "imm_key1".as_bytes().into();
         let value1: KeyBytes = "imm_value1".as_bytes().into();
         let op1_id = 10;
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op1_id,
             key1.clone(),
             OpType::Write(KeyBytes::from(value1.as_ref())),
@@ -391,7 +391,7 @@ mod test {
         let key2: KeyBytes = "imm_key2".as_bytes().into();
         let value2: KeyBytes = "imm_value2".as_bytes().into();
         let op2_id = 20;
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op2_id,
             key2.clone(),
             OpType::Write(KeyBytes::from(value2.as_ref())),
@@ -428,14 +428,14 @@ mod test {
         let op_id_original = 30;
         let op_id_new = 31;
 
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op_id_original,
             key_overwrite.clone(),
             OpType::Write(KeyBytes::from(value_original.as_ref())),
         ));
         lsm.freeze_memtable(); // Move original to immutable
 
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op_id_new,
             key_overwrite.clone(),
             OpType::Write(KeyBytes::from(value_new.as_ref())),
@@ -469,14 +469,14 @@ mod test {
         let op_id_initial_delete = 40;
         let op_id_actual_delete = 41;
 
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op_id_initial_delete,
             key_delete.clone(),
             OpType::Write(KeyBytes::from(value_delete.as_ref())),
         ));
         lsm.freeze_memtable(); // Move original to immutable
 
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op_id_actual_delete,
             key_delete.clone(),
             OpType::Delete,
@@ -514,7 +514,7 @@ mod test {
         let value1: KeyBytes = "value_active_1".as_bytes().into();
         let op1_id = 1;
 
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op1_id,
             key1.clone(),
             OpType::Write(KeyBytes::from(value1.as_ref())),
@@ -545,14 +545,14 @@ mod test {
         let key_deleted: KeyBytes = "key_deleted".as_bytes().into();
         let value_original: KeyBytes = "original_value".as_bytes().into();
         let op_id_original = 3;
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op_id_original,
             key_deleted.clone(),
             OpType::Write(KeyBytes::from(value_original.as_ref())),
         ));
 
         let op_id_delete = 4;
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op_id_delete,
             key_deleted.clone(),
             OpType::Delete,
@@ -589,7 +589,7 @@ mod test {
         let key1: KeyBytes = "dump_key1".as_bytes().into();
         let value1: KeyBytes = "dump_value1".as_bytes().into();
         let op1_id = 50;
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op1_id,
             key1.clone(),
             OpType::Write(KeyBytes::from(value1.as_ref())),
@@ -598,7 +598,7 @@ mod test {
         let key2: KeyBytes = "dump_key2".as_bytes().into();
         let value2: KeyBytes = "dump_value2".as_bytes().into();
         let op2_id = 51;
-        lsm.put(KVOpertion::new(
+        lsm.put(KVOperation::new(
             op2_id,
             key2.clone(),
             OpType::Write(KeyBytes::from(value2.as_ref())),

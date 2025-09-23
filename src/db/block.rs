@@ -22,12 +22,11 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use std::io::{Cursor, Read, Write};
 
-use crate::db::common::{new_buffer, Buffer, KVOpertion, KViterAgg};
+use crate::db::common::{new_buffer, Buffer, KVOperation, KViterAgg};
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
 use crate::db::key::KeyBytes;
 use std::cell::RefCell;
-
 
 pub struct BlockReader {
     data: Bytes,
@@ -49,7 +48,7 @@ impl BlockReader {
         let bytes = data_bytes.slice(..count_bytes_start);
 
         // Decode the first KV operation to get the first key
-        let (first_kv, _) = KVOpertion::decode(bytes);
+        let (first_kv, _) = KVOperation::decode(bytes);
         let first_key = first_kv.key;
 
         BlockReader {
@@ -72,7 +71,7 @@ impl BlockReader {
         // Iterate through the KV operations in the block
         for _ in 0..self.count {
             // Decode the next KV operation from the cursor
-            let (kv_op, _) = KVOpertion::decode(data_slice.slice(cursor.position() as usize..));
+            let (kv_op, _) = KVOperation::decode(data_slice.slice(cursor.position() as usize..));
 
             // Move the cursor past the decoded KV operation
             cursor.set_position(cursor.position() + kv_op.encode_size() as u64);
@@ -137,7 +136,7 @@ impl BlockBuilder {
             let data = Bytes::from(slice_from_last_key);
 
             // Decode the KV operation from this slice to get the key
-            let (kv_op, _) = KVOpertion::decode(data);
+            let (kv_op, _) = KVOperation::decode(data);
             Some(kv_op.key) // Already KeyBytes
         } else {
             None
@@ -153,7 +152,7 @@ impl BlockBuilder {
         self.buffer.set_position(0);
     }
 
-    pub fn add(&mut self, op: KVOpertion) -> bool {
+    pub fn add(&mut self, op: KVOperation) -> bool {
         let op_size = op.encode_size();
         // Check if adding the current operation would exceed the block size limit,
         // considering space for the final count (u64).
@@ -183,7 +182,7 @@ impl BlockBuilder {
         Ok(self.buffer.get_ref().as_ref())
     }
 
-    pub fn fill<T: Iterator<Item = KVOpertion>>(&mut self, it: &mut Peekable<T>) -> Result<&[u8]> {
+    pub fn fill<T: Iterator<Item = KVOperation>>(&mut self, it: &mut Peekable<T>) -> Result<&[u8]> {
         // Iterate through the peekable iterator and fill the block until it's full or the iterator is exhausted.
         // get first key by peek() if pit is empty return error with message "at least one kv"
         let first_kv = it
@@ -215,12 +214,12 @@ pub struct BlockIter {
     offset: usize,
 }
 impl Iterator for BlockIter {
-    type Item = KVOpertion;
+    type Item = KVOperation;
     fn next(&mut self) -> Option<Self::Item> {
         if self.count == self.num {
             return None;
         }
-        let (res, offset) = KVOpertion::decode(self.data.slice(self.offset..));
+        let (res, offset) = KVOperation::decode(self.data.slice(self.offset..));
         self.count += 1;
         self.offset += offset;
         Some(res)
@@ -250,9 +249,9 @@ pub mod test {
     use crate::db::common::new_buffer;
     use crate::db::common::KViterAgg;
     use crate::db::common::OpId;
-    use crate::db::common::{KVOpertion, OpType};
-    use crate::db::key::KeySlice;
+    use crate::db::common::{KVOperation, OpType};
     use crate::db::key::KeyBytes;
+    use crate::db::key::KeySlice;
     use byteorder::LittleEndian;
     use byteorder::WriteBytesExt;
     use std::io::Cursor;
@@ -272,14 +271,14 @@ pub mod test {
         // Use format! to pad with leading zeros
         format!("{:0>6}", s)
     }
-    pub fn create_kv_data_with_range(r: Range<usize>) -> Vec<KVOpertion> {
+    pub fn create_kv_data_with_range(r: Range<usize>) -> Vec<KVOperation> {
         create_kv_data_with_range_id_offset(r, 0)
     }
-    pub fn create_kv_data_with_range_id_offset(r: Range<usize>, id: OpId) -> Vec<KVOpertion> {
+    pub fn create_kv_data_with_range_id_offset(r: Range<usize>, id: OpId) -> Vec<KVOperation> {
         let mut v = Vec::new();
 
         for i in r {
-            let tmp = KVOpertion::new(
+            let tmp = KVOperation::new(
                 i as u64 + id,
                 pad_zero(i as u64).as_bytes().into(),
                 OpType::Write(i.to_string().as_bytes().into()),
@@ -292,14 +291,14 @@ pub mod test {
 
         v
     }
-    fn build_block_from_kvs_iter(kvs: Vec<KVOpertion>) -> BlockReader {
+    fn build_block_from_kvs_iter(kvs: Vec<KVOperation>) -> BlockReader {
         let kv_iter = kvs.into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder.fill(&mut kv_iter_agg).expect("fill error");
         BlockReader::new(block_builder.into_inner())
     }
-    pub fn create_kv_data_in_range_zero_to(size: usize) -> Vec<KVOpertion> {
+    pub fn create_kv_data_in_range_zero_to(size: usize) -> Vec<KVOperation> {
         create_kv_data_with_range(0..size)
     }
 
@@ -309,7 +308,7 @@ pub mod test {
 
         // Add a new KV with key "50" and a higher ID
         let key50_str = pad_zero(50);
-        kvs.push(KVOpertion::new(
+        kvs.push(KVOperation::new(
             10000, // Higher ID
             key50_str.as_bytes().into(),
             OpType::Write("51".as_bytes().into()), // New value
@@ -379,7 +378,7 @@ pub mod test {
 
         kvs.insert(
             insert_pos,
-            KVOpertion::new(
+            KVOperation::new(
                 15, // Insert the one with the higher ID first if needed, though search handles it
                 5.to_string().as_bytes().into(),
                 OpType::Write("duplicate_15".as_bytes().into()),
@@ -387,7 +386,7 @@ pub mod test {
         );
         kvs.insert(
             insert_pos,
-            KVOpertion::new(
+            KVOperation::new(
                 11,
                 5.to_string().as_bytes().into(),
                 OpType::Write("duplicate_5".as_bytes().into()),
@@ -562,7 +561,7 @@ pub mod test {
     #[test]
     fn test_block_builder_empty_iterator() {
         // Create an empty iterator
-        let kvs: Vec<KVOpertion> = Vec::new();
+        let kvs: Vec<KVOperation> = Vec::new();
         let kv_iter = kvs.into_iter();
         let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
 
@@ -631,7 +630,7 @@ pub mod test {
         );
 
         // Add first KV
-        let kv1 = KVOpertion::new(
+        let kv1 = KVOperation::new(
             1,
             "key1".as_bytes().into(),
             OpType::Write("value1".as_bytes().into()),
@@ -644,7 +643,7 @@ pub mod test {
         );
 
         // Add second KV
-        let kv2 = KVOpertion::new(
+        let kv2 = KVOperation::new(
             2,
             "key2".as_bytes().into(),
             OpType::Write("value2".as_bytes().into()),
@@ -657,7 +656,7 @@ pub mod test {
         );
 
         // Add third KV
-        let kv3 = KVOpertion::new(
+        let kv3 = KVOperation::new(
             3,
             "key3".as_bytes().into(),
             OpType::Write("value3".as_bytes().into()),
@@ -675,7 +674,7 @@ pub mod test {
         for i in 0.. {
             let key_str = format!("key_{:0>6}", i);
             let value_str = format!("value_{}", i);
-            let kv_op = KVOpertion::new(
+            let kv_op = KVOperation::new(
                 i as u64,
                 key_str.as_bytes().into(),
                 OpType::Write(value_str.as_bytes().into()),
@@ -698,7 +697,7 @@ pub mod test {
         let mut builder = BlockBuilder::new();
 
         // Add some data to the builder
-        let kv1 = KVOpertion::new(
+        let kv1 = KVOperation::new(
             1,
             "key1".as_bytes().into(),
             OpType::Write("value1".as_bytes().into()),
@@ -737,7 +736,7 @@ pub mod test {
         );
 
         // Try adding data again to ensure it's usable
-        let kv2 = KVOpertion::new(
+        let kv2 = KVOperation::new(
             2,
             "key2".as_bytes().into(),
             OpType::Write("value2".as_bytes().into()),
@@ -761,7 +760,7 @@ pub mod test {
 
         // Create KV operations until `add` returns false
         for i in 0.. {
-            let kv_op = KVOpertion::new(
+            let kv_op = KVOperation::new(
                 i as u64,
                 pad_zero(i as u64).as_bytes().into(),
                 OpType::Write(format!("value_{}", i).as_bytes().into()),
@@ -778,7 +777,7 @@ pub mod test {
         assert!(added_count > 0, "Should have added at least one item");
 
         // Try to add one more item, it should fail
-        let last_kv_op = KVOpertion::new(
+        let last_kv_op = KVOperation::new(
             added_count as u64,
             pad_zero(added_count as u64).as_bytes().into(),
             OpType::Write(format!("value_{}", added_count).as_bytes().into()),
