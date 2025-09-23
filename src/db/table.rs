@@ -385,8 +385,8 @@ impl<T: Store> TableBuilder<T> {
 
         // Add block metadata
         self.block_metas.push(BlockMeta {
-            first_key: KeyBytes::from_vec(first_key.into_inner().to_vec()),
-            last_key: KeyBytes::from_vec(last_key.into_inner().to_vec()),
+            first_key,
+            last_key,
         });
         self.block_builder.reset();
 
