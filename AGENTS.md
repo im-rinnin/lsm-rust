@@ -23,9 +23,12 @@
 - Memory/Buffers: `Arc<T>` for sharing, `Bytes` for zero-copy buffers, `Vec<u8>` when owned.
 - Logging: `tracing`; enable via `db::db_log::enable_log_with_level(tracing::Level::INFO)`.
 - Serialization: `serde` with `#[derive(Serialize, Deserialize)]`.
- - Keys/Values: use `KeyBytes`/`ValueByte`; `KeyVec`/`ValueVec` are removed.
+- Keys/Values: use `KeyBytes`/`ValueByte`; `KeyVec`/`ValueVec` are removed.
+ - Iterators: aggregate multiple ordered KV streams with `KViterAgg`, which accepts `Vec<Box<dyn Iterator<Item = KVOpertion>>>`.
 
 ## Testing Guidelines
+- write unit test first (TDD)
+- run `cargo check && cargo test ` after code change  
 - Write small, deterministic tests; use `assert!`/`assert_eq!` and fixed seeds.
 - Name tests descriptively (e.g., `fn compaction_merges_latest()`).
 - Run a single test: `cargo test module::tests::name -- --nocapture`.

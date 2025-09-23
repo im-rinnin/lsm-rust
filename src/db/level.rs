@@ -714,23 +714,14 @@ impl<T: Store> LevelStorege<T> {
         // Sort tables for merge by first key to ensure correct merge order
         all_tables_for_merge.sort_by(|a, b| a.key_range().0.cmp(&b.key_range().0));
 
-        // Create a vector to own the concrete iterator instances.
-        // The TableIter will borrow the TableReader inside the Arc.
-        // all_tables_for_merge (which owns the Arcs) must live longer than concrete_iterators.
-        let mut concrete_iterators: Vec<TableIter<T>> = Vec::new();
-        for table_reader_arc in &all_tables_for_merge {
-            // Iterate over references (&)
-            concrete_iterators.push(table_reader_arc.to_iter()); // Borrow happens here
-        }
-
-        // Create a vector of mutable trait object references from the concrete iterators.
-        // concrete_iterators owns the TableIter instances.
-        let iterators_for_agg: Vec<&mut dyn Iterator<Item = KVOpertion>> = concrete_iterators
-            .iter_mut()
-            .map(|it| it as &mut dyn Iterator<Item = KVOpertion>)
+        // Create boxed iterators borrowing from the table readers.
+        // Each TableIter borrows from the corresponding TableReader inside Arc.
+        let boxed_iters: Vec<Box<dyn Iterator<Item = KVOpertion> + '_>> = all_tables_for_merge
+            .iter()
+            .map(|table_reader_arc| Box::new(table_reader_arc.to_iter()) as Box<dyn Iterator<Item = KVOpertion>>)
             .collect();
 
-        let kv_iter_agg = KViterAgg::new(iterators_for_agg);
+        let kv_iter_agg = KViterAgg::new(boxed_iters);
         let mut compacted_tables = Vec::new();
 
         // Check if the target level is the deepest level (and not level 0)

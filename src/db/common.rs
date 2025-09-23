@@ -23,6 +23,9 @@ pub struct KeyQuery {
 }
 pub type SearchResult = Option<(OpType, OpId)>;
 
+// every Key in db has a unique id
+pub type OpId = u64;
+pub const MAX_OP_ID: OpId = u64::MAX; // Represents the maximum possible OpId
 pub type Buffer = Cursor<Vec<u8>>;
 pub fn new_buffer(size: usize) -> Buffer {
     Cursor::new(vec![0; size])
@@ -33,6 +36,15 @@ pub struct KVOpertion {
     pub id: OpId,
     pub key: KeyBytes,
     pub op: OpType,
+}
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)] // Added Clone
+pub enum OpType {
+    Write(ValueByte),
+    Delete,
+}
+pub struct KViterAgg<'a> {
+    iters: Vec<Box<dyn Iterator<Item = KVOpertion> + 'a>>,
+    iters_next: Vec<Option<KVOpertion>>,
 }
 impl KVOpertion {
     pub fn new(id: OpId, key: KeyBytes, op: OpType) -> Self {
@@ -96,22 +108,10 @@ impl KVOpertion {
         }
     }
 }
-// every Key in db has a unique id
-pub type OpId = u64;
-pub const MAX_OP_ID: OpId = u64::MAX; // Represents the maximum possible OpId
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)] // Added Clone
-pub enum OpType {
-    Write(ValueByte),
-    Delete,
-}
-
-pub struct KViterAgg<'a> {
-    iters: Vec<&'a mut dyn Iterator<Item = KVOpertion>>,
-    iters_next: Vec<Option<KVOpertion>>,
-}
 
 impl<'a> KViterAgg<'a> {
-    pub fn new(iters: Vec<&'a mut dyn Iterator<Item = KVOpertion>>) -> Self {
+    // change this to Box<dyn Iterator<Item = KVOpertion>>
+    pub fn new(iters: Vec<Box<dyn Iterator<Item = KVOpertion> + 'a>>) -> Self {
         let mut res = KViterAgg {
             iters,
             iters_next: Vec::new(),
@@ -219,13 +219,14 @@ pub mod test {
         };
 
         let a_ops: Vec<KVOpertion> = a.iter().map(|x| f(x)).collect();
-        let mut a_iter_ref = a_ops.into_iter();
         let b_ops: Vec<_> = b.iter().map(|x| f(x)).collect();
-        let mut b_iter_ref = b_ops.into_iter();
         let c_ops: Vec<_> = c.iter().map(|x| f(x)).collect();
-        let mut c_iter_ref = c_ops.into_iter();
 
-        let kv_iter = KViterAgg::new(vec![&mut a_iter_ref, &mut b_iter_ref, &mut c_iter_ref]);
+        let kv_iter = KViterAgg::new(vec![
+            Box::new(a_ops.into_iter()),
+            Box::new(b_ops.into_iter()),
+            Box::new(c_ops.into_iter()),
+        ]);
         let expect = vec![
             (1, 1),
             (2, 2),

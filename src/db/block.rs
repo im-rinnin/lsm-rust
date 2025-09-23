@@ -293,8 +293,8 @@ pub mod test {
         v
     }
     fn build_block_from_kvs_iter(kvs: Vec<KVOpertion>) -> BlockReader {
-        let mut kv_iter = kvs.into_iter();
-        let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
+        let kv_iter = kvs.into_iter();
+        let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder.fill(&mut kv_iter_agg).expect("fill error");
         BlockReader::new(block_builder.into_inner())
@@ -484,8 +484,8 @@ pub mod test {
     #[test]
     fn test_block_iter() {
         let iter = create_kv_data_in_range_zero_to(100);
-        let mut kv_iter = iter.into_iter();
-        let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
+        let kv_iter = iter.into_iter();
+        let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder.fill(&mut kv_iter_agg).unwrap();
         let br = BlockReader::new(block_builder.into_inner());
@@ -539,8 +539,8 @@ pub mod test {
         let kvs = create_kv_data_in_range_zero_to(5); // Use 5 KVs
 
         // Build a block from these KVs
-        let mut kv_iter = kvs.clone().into_iter();
-        let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
+        let kv_iter = kvs.clone().into_iter();
+        let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
         let mut block_builder = BlockBuilder::new();
         block_builder
             .fill(&mut kv_iter_agg)
@@ -563,8 +563,8 @@ pub mod test {
     fn test_block_builder_empty_iterator() {
         // Create an empty iterator
         let kvs: Vec<KVOpertion> = Vec::new();
-        let mut kv_iter = kvs.into_iter();
-        let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
+        let kv_iter = kvs.into_iter();
+        let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
 
         // Build a block with the empty iterator - should result in an error
         let mut block_builder = BlockBuilder::new();
@@ -583,8 +583,8 @@ pub mod test {
     fn test_block_builder_with_oversized_data() {
         // Create a large dataset that exceeds DATA_BLOCK_SIZE
         let kvs = create_kv_data_in_range_zero_to(200); // Create more data than can fit in one block
-        let mut kv_iter = kvs.clone().into_iter();
-        let mut kv_iter_agg = KViterAgg::new(vec![&mut kv_iter]).peekable();
+        let kv_iter = kvs.clone().into_iter();
+        let mut kv_iter_agg = KViterAgg::new(vec![Box::new(kv_iter)]).peekable();
 
         // Build a block with the oversized data
         let mut block_builder = BlockBuilder::new();
