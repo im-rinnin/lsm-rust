@@ -12,15 +12,12 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::Hasher;
 use tracing::info;
 
-use crate::db::{
-    common::KViterAgg,
-    key::{self, KeyBytes},
-};
+use crate::db::common::KViterAgg;
 use tracing::debug;
 
 use super::{
     common::{KVOpertion, OpId, OpType, SearchResult},
-    key::{KeySlice, KeyVec},
+    key::{KeySlice, KeyBytes},
     lsm_storage::LsmStorage,
     store::{Filestore, Store, StoreId},
     table::{self, *},
@@ -582,7 +579,7 @@ impl<T: Store> LevelStorege<T> {
     ///
     /// # Panics
     /// Panics if the tables slice is empty
-    fn get_key_range(&self, tables: &[ThreadSafeTableReader<T>]) -> (KeyVec, KeyVec) {
+    fn get_key_range(&self, tables: &[ThreadSafeTableReader<T>]) -> (KeyBytes, KeyBytes) {
         assert!(!tables.is_empty());
         let (mut min_key, mut max_key) = tables[0].key_range();
         for table in tables.iter().skip(1) {
@@ -597,7 +594,7 @@ impl<T: Store> LevelStorege<T> {
         (min_key, max_key)
     }
 
-    fn get_target_level_key_ranges(sstables: &Vec<Arc<TableReader<T>>>) -> Vec<(KeyVec, KeyVec)> {
+    fn get_target_level_key_ranges(sstables: &Vec<Arc<TableReader<T>>>) -> Vec<(KeyBytes, KeyBytes)> {
         let mut target_level_key_value_range = vec![];
         for table in sstables {
             target_level_key_value_range.push(table.key_range());
@@ -853,8 +850,8 @@ impl<T: Store> LevelStorege<T> {
     // sorted_key_ranges order by first_key
     // e.g. k:[2,10] key_ranges:[[1,3],[5,7],[12,20]] return (0,1)
     fn key_range_overlap(
-        k: (KeyVec, KeyVec),
-        sorted_key_ranges: &Vec<(KeyVec, KeyVec)>,
+        k: (KeyBytes, KeyBytes),
+        sorted_key_ranges: &Vec<(KeyBytes, KeyBytes)>,
     ) -> Vec<usize> {
         let (k_min, k_max) = k;
         let mut overlapping_indices = Vec::new();
@@ -1013,10 +1010,10 @@ mod test {
     use crate::db::common::{KVOpertion, OpId, OpType};
     use crate::db::db_log;
     // OpType moved from helper
-    use crate::db::key::{KeySlice, KeyVec};
+    use crate::db::key::{KeySlice, KeyBytes};
     use crate::db::level::{ChangeType, Level, LevelStorege, TableChange, U32_SIZE};
     use crate::db::store::{Filestore, Store, StoreId};
-    // KeyVec moved from helper
+    // KeyBytes moved from helper
     use crate::db::table::test::{create_test_table, create_test_table_with_id_offset};
     use crate::db::table::TableBuilder; // Moved from helper
 
@@ -1346,20 +1343,20 @@ mod test {
         let level_storage_single =
             super::LevelStorege::new(vec![], LevelStoregeConfig::config_for_test()); // Levels vector doesn't matter for this test
         let (min_key, max_key) = level_storage_single.get_key_range(&[table_1.clone()]);
-        assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
-        assert_eq!(max_key, KeyVec::from("000009".as_bytes()));
+        assert_eq!(min_key, KeyBytes::from("000000".as_bytes()));
+        assert_eq!(max_key, KeyBytes::from("000009".as_bytes()));
 
         // Scenario 2: Multiple tables, ordered
         let tables_ordered = vec![table_1.clone(), table_2.clone()];
         let (min_key, max_key) = level_storage_single.get_key_range(&tables_ordered);
-        assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
-        assert_eq!(max_key, KeyVec::from("000029".as_bytes()));
+        assert_eq!(min_key, KeyBytes::from("000000".as_bytes()));
+        assert_eq!(max_key, KeyBytes::from("000029".as_bytes()));
 
         // Scenario 3: Multiple tables, overlapping and out of order
         let tables_mixed = vec![table_2.clone(), table_1.clone(), table_3.clone()];
         let (min_key, max_key) = level_storage_single.get_key_range(&tables_mixed);
-        assert_eq!(min_key, KeyVec::from("000000".as_bytes())); // From table_1
-        assert_eq!(max_key, KeyVec::from("000029".as_bytes())); // From table_2
+        assert_eq!(min_key, KeyBytes::from("000000".as_bytes())); // From table_1
+        assert_eq!(max_key, KeyBytes::from("000029".as_bytes())); // From table_2
     }
 
     #[test]
@@ -2348,7 +2345,7 @@ mod test {
 
     #[test]
     fn test_key_range_overlap() {
-        let to_kv_vec = |s: &str| KeyVec::from(s.as_bytes());
+        let to_kv_vec = |s: &str| KeyBytes::from(s.as_bytes());
 
         // Helper for creating range tuples
         let r = |start: &str, end: &str| (to_kv_vec(start), to_kv_vec(end));
@@ -2423,7 +2420,7 @@ mod test {
 
         // Test Case 9: Empty sorted_key_ranges
         let k = r("000010", "000020");
-        let ranges: Vec<(KeyVec, KeyVec)> = vec![];
+        let ranges: Vec<(KeyBytes, KeyBytes)> = vec![];
         assert_eq!(
             super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
             vec![] as Vec<usize>

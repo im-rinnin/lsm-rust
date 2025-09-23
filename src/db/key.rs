@@ -8,7 +8,6 @@ pub type KeySlice<'a> = Key<&'a [u8]>;
 pub type ValueSlice<'a> = Key<&'a [u8]>;
 pub type KeyBytes = Key<Bytes>;
 pub type KeyVec = Key<Vec<u8>>;
-pub type ValueVec = Key<Vec<u8>>;
 pub type ValueByte = Key<Bytes>;
 
 impl KeyBytes {

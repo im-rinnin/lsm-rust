@@ -256,7 +256,7 @@ mod test {
 
     use super::{LsmStorage, LsmStorageConfig};
     use crate::db::common::{KVOpertion, KeyQuery, OpType};
-    use crate::db::key::{KeyBytes, KeySlice, KeyVec};
+    use crate::db::key::{KeyBytes, KeySlice, KeyBytes as _KeyVecUnusedRename};
     use crate::db::level::LevelStoregeConfig;
     use crate::db::store::Memstore;
 
@@ -267,8 +267,8 @@ mod test {
         let config = LsmStorageConfig::config_for_test();
         let lsm = LsmStorage::<Memstore>::new(config);
 
-        let key: KeyVec = "test_key".as_bytes().into();
-        let value: KeyVec = "test_value".as_bytes().into();
+        let key: KeyBytes = "test_key".as_bytes().into();
+        let value: KeyBytes = "test_value".as_bytes().into();
         let op_id = 1;
 
         // Use KeyBytes for OpType::Write
@@ -321,7 +321,7 @@ mod test {
         let lsm = LsmStorage::<Memstore>::from(config, level_storage);
 
         // Test 1: Get a key that exists in Level 0
-        let key1: KeyVec = "000050".as_bytes().into();
+        let key1: KeyBytes = "000050".as_bytes().into();
         let query1 = KeyQuery {
             op_id: 1050, // OpId within the range of table_lvl0
             key: KeyBytes::from(key1.as_ref()),
@@ -334,7 +334,7 @@ mod test {
         );
 
         // Test 2: Get a key that exists in Level 1
-        let key2: KeyVec = "000150".as_bytes().into();
+        let key2: KeyBytes = "000150".as_bytes().into();
         let query2 = KeyQuery {
             op_id: 2150, // OpId within the range of table_lvl1
             key: KeyBytes::from(key2.as_ref()),
@@ -347,7 +347,7 @@ mod test {
         );
 
         // Test 3: Get a key that does not exist
-        let key3: KeyVec = "000250".as_bytes().into();
+        let key3: KeyBytes = "000250".as_bytes().into();
         let query3 = KeyQuery {
             op_id: 3000,
             key: KeyBytes::from(key3.as_ref()),
@@ -356,7 +356,7 @@ mod test {
         assert!(result3.is_none());
 
         // Test 4: Key exists in Level 0, but query op_id is too old
-        let key4: KeyVec = "000010".as_bytes().into();
+        let key4: KeyBytes = "000010".as_bytes().into();
         let query4 = KeyQuery {
             op_id: 500, // OpId older than any in table_lvl0
             key: KeyBytes::from(key4.as_ref()),
@@ -375,8 +375,8 @@ mod test {
         let mut lsm = LsmStorage::<Memstore>::new(config);
 
         // Insert data into active memtable
-        let key1: KeyVec = "imm_key1".as_bytes().into();
-        let value1: KeyVec = "imm_value1".as_bytes().into();
+        let key1: KeyBytes = "imm_key1".as_bytes().into();
+        let value1: KeyBytes = "imm_value1".as_bytes().into();
         let op1_id = 10;
         lsm.put(KVOpertion::new(
             op1_id,
@@ -388,8 +388,8 @@ mod test {
         lsm.freeze_memtable();
 
         // Insert new data into the new active memtable
-        let key2: KeyVec = "imm_key2".as_bytes().into();
-        let value2: KeyVec = "imm_value2".as_bytes().into();
+        let key2: KeyBytes = "imm_key2".as_bytes().into();
+        let value2: KeyBytes = "imm_value2".as_bytes().into();
         let op2_id = 20;
         lsm.put(KVOpertion::new(
             op2_id,
@@ -422,9 +422,9 @@ mod test {
         );
 
         // Test 3: Overwrite a key in active memtable that exists in immutable
-        let key_overwrite: KeyVec = "imm_key_overwrite".as_bytes().into();
-        let value_original: KeyVec = "original_value".as_bytes().into();
-        let value_new: KeyVec = "new_value".as_bytes().into();
+        let key_overwrite: KeyBytes = "imm_key_overwrite".as_bytes().into();
+        let value_original: KeyBytes = "original_value".as_bytes().into();
+        let value_new: KeyBytes = "new_value".as_bytes().into();
         let op_id_original = 30;
         let op_id_new = 31;
 
@@ -464,8 +464,8 @@ mod test {
         );
 
         // Test 4: Delete a key in active memtable that exists in immutable
-        let key_delete: KeyVec = "imm_key_delete".as_bytes().into();
-        let value_delete: KeyVec = "value_to_delete".as_bytes().into();
+        let key_delete: KeyBytes = "imm_key_delete".as_bytes().into();
+        let value_delete: KeyBytes = "value_to_delete".as_bytes().into();
         let op_id_initial_delete = 40;
         let op_id_actual_delete = 41;
 
@@ -510,8 +510,8 @@ mod test {
         let config = LsmStorageConfig::config_for_test();
         let lsm = LsmStorage::<Memstore>::new(config);
 
-        let key1: KeyVec = "key_active_1".as_bytes().into();
-        let value1: KeyVec = "value_active_1".as_bytes().into();
+        let key1: KeyBytes = "key_active_1".as_bytes().into();
+        let value1: KeyBytes = "value_active_1".as_bytes().into();
         let op1_id = 1;
 
         lsm.put(KVOpertion::new(
@@ -533,7 +533,7 @@ mod test {
         );
 
         // Test: Get non-existent key
-        let key_non_existent: KeyVec = "non_existent".as_bytes().into();
+        let key_non_existent: KeyBytes = "non_existent".as_bytes().into();
         let query_non_existent = KeyQuery {
             op_id: 2,
             key: KeyBytes::from(key_non_existent.as_ref()),
@@ -542,8 +542,8 @@ mod test {
         assert!(result_non_existent.is_none());
 
         // Test: Get a key that was deleted in the active memtable
-        let key_deleted: KeyVec = "key_deleted".as_bytes().into();
-        let value_original: KeyVec = "original_value".as_bytes().into();
+        let key_deleted: KeyBytes = "key_deleted".as_bytes().into();
+        let value_original: KeyBytes = "original_value".as_bytes().into();
         let op_id_original = 3;
         lsm.put(KVOpertion::new(
             op_id_original,
@@ -586,8 +586,8 @@ mod test {
         let mut next_sstable_id: u64 = 100;
 
         // 1. Insert data into active memtable
-        let key1: KeyVec = "dump_key1".as_bytes().into();
-        let value1: KeyVec = "dump_value1".as_bytes().into();
+        let key1: KeyBytes = "dump_key1".as_bytes().into();
+        let value1: KeyBytes = "dump_value1".as_bytes().into();
         let op1_id = 50;
         lsm.put(KVOpertion::new(
             op1_id,
@@ -595,8 +595,8 @@ mod test {
             OpType::Write(KeyBytes::from(value1.as_ref())),
         ));
 
-        let key2: KeyVec = "dump_key2".as_bytes().into();
-        let value2: KeyVec = "dump_value2".as_bytes().into();
+        let key2: KeyBytes = "dump_key2".as_bytes().into();
+        let value2: KeyBytes = "dump_value2".as_bytes().into();
         let op2_id = 51;
         lsm.put(KVOpertion::new(
             op2_id,

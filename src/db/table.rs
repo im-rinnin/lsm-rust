@@ -9,7 +9,7 @@ use std::{
 
 use crate::db::{
     common::{new_buffer, Buffer, KVOpertion, OpId, OpType},
-    key::{KeySlice, KeyVec},
+    key::{KeySlice, KeyBytes},
     store::{Store, StoreId},
 };
 use byteorder::LittleEndian;
@@ -20,7 +20,6 @@ use tracing::{debug, info};
 use super::{
     block::{BlockIter, BlockReader, DATA_BLOCK_SIZE},
     common::SearchResult,
-    key::KeyBytes,
 };
 const SSTABLE_DATA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -32,8 +31,8 @@ fn open_store<T: Store>(id: StoreId) -> T {
 }
 #[derive(PartialEq, Debug)]
 struct BlockMeta {
-    first_key: KeyVec,
-    last_key: KeyVec,
+    first_key: KeyBytes,
+    last_key: KeyBytes,
 }
 
 impl BlockMeta {
@@ -52,13 +51,13 @@ impl BlockMeta {
         let first_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
         let mut first_key_data = vec![0u8; first_key_len];
         r.read_exact(&mut first_key_data).unwrap();
-        let first_key = KeyVec::from_vec(first_key_data);
+        let first_key = KeyBytes::from_vec(first_key_data);
 
         // Decode last_key
         let last_key_len = r.read_u64::<LittleEndian>().unwrap() as usize;
         let mut last_key_data = vec![0u8; last_key_len];
         r.read_exact(&mut last_key_data).unwrap();
-        let last_key = KeyVec::from_vec(last_key_data);
+        let last_key = KeyBytes::from_vec(last_key_data);
 
         BlockMeta {
             first_key,
@@ -107,7 +106,7 @@ impl<T: Store> TableReader<T> {
         self.store.id()
     }
     // min and max key in table
-    pub fn key_range(&self) -> (KeyVec, KeyVec) {
+    pub fn key_range(&self) -> (KeyBytes, KeyBytes) {
         if self.block_metas.is_empty() {
             panic!("table can't be empty")
         }
@@ -115,7 +114,7 @@ impl<T: Store> TableReader<T> {
         let last_key = self.block_metas.last().unwrap().last_key.clone();
         (first_key, last_key)
     }
-    pub fn to_iter(&self) -> TableIter<T> {
+    pub fn to_iter(&self) -> TableIter<'_, T> {
         TableIter::new(self)
     }
     pub fn take(self) -> T {
@@ -382,8 +381,8 @@ impl<T: Store> TableBuilder<T> {
 
         // Add block metadata
         self.block_metas.push(BlockMeta {
-            first_key: KeyVec::from_vec(first_key.into_inner().to_vec()),
-            last_key: KeyVec::from_vec(last_key.into_inner().to_vec()),
+            first_key: KeyBytes::from_vec(first_key.into_inner().to_vec()),
+            last_key: KeyBytes::from_vec(last_key.into_inner().to_vec()),
         });
         self.block_builder.reset();
 
@@ -448,7 +447,7 @@ pub mod test {
     use crate::db::block::test::create_kv_data_with_range_id_offset;
     use crate::db::common::OpId;
     use crate::db::key::KeySlice;
-    use crate::db::key::KeyVec;
+    use crate::db::key::KeyBytes;
     use crate::db::table::open_store;
     use std::mem;
     use std::ops::Range;
@@ -544,10 +543,10 @@ pub mod test {
         let num_kvs = 100;
         let table = create_test_table(0..num_kvs);
         let (min_key, max_key) = table.key_range();
-        assert_eq!(min_key, KeyVec::from("000000".as_bytes()));
+        assert_eq!(min_key, KeyBytes::from("000000".as_bytes()));
         assert_eq!(
             max_key,
-            KeyVec::from(pad_zero((num_kvs - 1) as u64).as_bytes())
+            KeyBytes::from(pad_zero((num_kvs - 1) as u64).as_bytes())
         );
     }
 
@@ -793,12 +792,12 @@ pub mod test {
     fn test_block_meta_encode_decode() {
         use super::BlockMeta;
         use crate::db::common::new_buffer;
-        use crate::db::key::KeyVec;
+    use crate::db::key::KeyBytes;
         use std::io::Seek;
 
         let original_meta = BlockMeta {
-            first_key: KeyVec::from_vec(b"key_a".to_vec()),
-            last_key: KeyVec::from_vec(b"key_z".to_vec()),
+            first_key: KeyBytes::from_vec(b"key_a".to_vec()),
+            last_key: KeyBytes::from_vec(b"key_z".to_vec()),
         };
 
         let mut buffer = new_buffer(1024); // Sufficiently large buffer

@@ -15,7 +15,6 @@ use std::mem::size_of;
 
 use super::key::KeyBytes;
 use super::key::ValueByte;
-use super::key::{KeyVec, ValueVec}; // Added for kv_opertion_len // Added for kv_opertion_len
 
 #[derive(Clone)] // Add Clone derive
 pub struct KeyQuery {
@@ -36,12 +35,8 @@ pub struct KVOpertion {
     pub op: OpType,
 }
 impl KVOpertion {
-    pub fn new(id: OpId, key: KeyVec, op: OpType) -> Self {
-        KVOpertion {
-            id: id,
-            key: KeyBytes::from_vec(key.into_inner()),
-            op: op,
-        }
+    pub fn new(id: OpId, key: KeyBytes, op: OpType) -> Self {
+        KVOpertion { id, key, op }
     }
 
     pub fn encode_size(&self) -> usize {

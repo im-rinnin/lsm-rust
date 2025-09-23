@@ -80,7 +80,7 @@ impl<T: Store> Iterator for LogFileIter<T> {
 mod test {
     use super::*;
     use crate::db::common::{KVOpertion, OpId, OpType};
-    use crate::db::key::{KeyBytes, KeyVec};
+    use crate::db::key::{KeyBytes};
     use std::env;
     use std::fs::OpenOptions; // Add this import
     use tempfile::tempdir;
@@ -107,15 +107,15 @@ mod test {
         let ops = vec![
             KVOpertion::new(
                 1,
-                KeyVec::from_vec(b"key1".to_vec()),
+                KeyBytes::from_vec(b"key1".to_vec()),
                 OpType::Write(KeyBytes::from_vec(b"value1".to_vec())),
             ),
             KVOpertion::new(
                 2,
-                KeyVec::from_vec(b"key2".to_vec()),
+                KeyBytes::from_vec(b"key2".to_vec()),
                 OpType::Write(KeyBytes::from_vec(b"value2".to_vec())),
             ),
-            KVOpertion::new(3, KeyVec::from_vec(b"key3".to_vec()), OpType::Delete),
+            KVOpertion::new(3, KeyBytes::from_vec(b"key3".to_vec()), OpType::Delete),
         ];
 
         log_file.append(&ops);

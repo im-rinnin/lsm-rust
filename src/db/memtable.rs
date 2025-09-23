@@ -2,7 +2,7 @@ use std::fmt::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::common::SearchResult;
-use super::key::{KeyBytes, KeyVec};
+use super::key::KeyBytes;
 use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
@@ -141,7 +141,7 @@ mod test {
 
     use crate::db::common::{KVOpertion, KeyQuery, OpId, OpType};
     use crate::db::db_log;
-    use crate::db::key::{KeyBytes, KeyVec};
+    use crate::db::key::KeyBytes;
 
     fn get_next_id(id: &mut OpId) -> OpId {
         let old = *id;
@@ -170,7 +170,7 @@ mod test {
     fn test_get_with_duplicate_key() {
         let mut m = Memtable::new(TEST_MEMTABLE_CAPACITY);
         let mut id = 0;
-        let key: KeyVec = "test_key".as_bytes().into();
+        let key: KeyBytes = "test_key".as_bytes().into();
 
         // Insert multiple operations for the same key with increasing op_ids
         // 1. Write "value1" with op_id 0
@@ -438,7 +438,7 @@ mod test {
         let mut expected_deduplicated_data: Vec<KVOpertion> = Vec::new();
         for (key_str, op_id, op_type) in inserted_ops {
             let key = KeyBytes::from(key_str.as_bytes());
-            let op = KVOpertion::new(op_id, KeyVec::from(key.clone().as_ref()), op_type);
+            let op = KVOpertion::new(op_id, key.clone(), op_type);
 
             // Find if this key already exists in the result, and replace if new op_id is higher
             let mut found = false;

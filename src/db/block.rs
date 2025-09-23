@@ -14,7 +14,6 @@ use crate::db::common::KeyQuery;
 use crate::db::common::OpId;
 use crate::db::common::OpType;
 use crate::db::key::KeySlice;
-use crate::db::key::ValueVec;
 use anyhow::Error;
 use anyhow::Result;
 use byteorder::WriteBytesExt;
@@ -26,10 +25,9 @@ use std::io::{Cursor, Read, Write};
 use crate::db::common::{new_buffer, Buffer, KVOpertion, KViterAgg};
 
 pub const DATA_BLOCK_SIZE: usize = 4 * 1024;
-use crate::db::key::KeyVec;
+use crate::db::key::KeyBytes;
 use std::cell::RefCell;
 
-use super::key::KeyBytes;
 
 pub struct BlockReader {
     data: Bytes,
@@ -131,7 +129,7 @@ impl BlockBuilder {
         }
     }
 
-    pub fn last_key(&self) -> Option<KeyVec> {
+    pub fn last_key(&self) -> Option<KeyBytes> {
         if let Some(pos) = self.last_key_positon {
             // Create a slice from the buffer starting at the last_key_positon
             let buffer_ref = self.buffer.get_ref();
@@ -140,7 +138,7 @@ impl BlockBuilder {
 
             // Decode the KV operation from this slice to get the key
             let (kv_op, _) = KVOpertion::decode(data);
-            Some(KeyVec::from(kv_op.key.as_ref())) // Convert KeySlice to KeyVec
+            Some(kv_op.key) // Already KeyBytes
         } else {
             None
         }
@@ -254,7 +252,7 @@ pub mod test {
     use crate::db::common::OpId;
     use crate::db::common::{KVOpertion, OpType};
     use crate::db::key::KeySlice;
-    use crate::db::key::KeyVec;
+    use crate::db::key::KeyBytes;
     use byteorder::LittleEndian;
     use byteorder::WriteBytesExt;
     use std::io::Cursor;
@@ -673,7 +671,7 @@ pub mod test {
 
         // Test with a block that becomes full
         let mut full_builder = BlockBuilder::new();
-        let mut last_added_key: Option<KeyVec> = None;
+        let mut last_added_key: Option<KeyBytes> = None;
         for i in 0.. {
             let key_str = format!("key_{:0>6}", i);
             let value_str = format!("value_{}", i);
@@ -686,7 +684,7 @@ pub mod test {
             if !full_builder.add(kv_op.clone()) {
                 break; // Block is full
             }
-            last_added_key = Some(KeyVec::from(kv_op.key.as_ref()));
+            last_added_key = Some(KeyBytes::from(kv_op.key.as_ref()));
         }
         assert_eq!(
             full_builder.last_key().unwrap().as_ref(),

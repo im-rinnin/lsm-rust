@@ -15,7 +15,7 @@ mod db_log;
 
 use anyhow::Result;
 use common::{KVOpertion, OpId, OpType};
-use key::{KeyBytes, KeySlice, KeyVec, ValueByte, ValueSlice, ValueVec};
+use key::{KeyBytes, KeySlice, ValueByte, ValueSlice};
 use serde::{Deserialize, Serialize}; // Required for serialization/deserialization
 
 mod store;
@@ -639,10 +639,10 @@ impl<T: Store> DBReader<T> {
     pub fn set_id(&mut self, id: u64) {
         self.id = id;
     }
-    pub fn query(&self, key: KeyVec) -> Option<KVOpertion> {
+    pub fn query(&self, key: KeyBytes) -> Option<KVOpertion> {
         // Create a KeyQuery using the reader's snapshot op_id.
         let query = common::KeyQuery {
-            key: key.as_ref().into(), // Convert KeyVec to KeyBytes
+            key: key.as_ref().into(), // Use KeyBytes directly
             op_id: self.id,           // Use the snapshot OpId from the reader
         };
         // self.current is an Arc<LsmStorage<T>> holding the cloned state
@@ -668,7 +668,6 @@ mod test {
 
     use crate::db::block::test::pad_zero;
     use crate::db::common::KVOpertion; // Added for test_mutiple_thread_random_operaiton
-    use crate::db::key::{KeyVec, ValueVec};
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
@@ -748,7 +747,7 @@ mod test {
                     // Check by read after each write batch
                     let reader_after_batch = db_clone.get_reader();
                     for (key, expected_val) in batch_expected_data.iter() {
-                        let result = reader_after_batch.query(KeyVec::from(key.clone().as_ref()));
+                        let result = reader_after_batch.query(KeyBytes::from(key.clone().as_ref()));
                         match result {
                             Some(kv_op) => {
                                 if let OpType::Write(actual_value) = kv_op.op {
@@ -801,7 +800,7 @@ mod test {
         let mut count = 00;
         for (key, expected_val) in expected_map.iter() {
             count += 1;
-            let result = final_reader.query(KeyVec::from(key.clone().as_ref()));
+            let result = final_reader.query(KeyBytes::from(key.clone().as_ref()));
             match result {
                 Some(kv_op) => {
                     if let OpType::Write(actual_value) = kv_op.op {
@@ -886,7 +885,7 @@ mod test {
 
         // Verify it's found after write
         let reader_after_write = db.get_reader();
-        let query_key_vec = KeyVec::from(key_str.as_bytes());
+        let query_key_vec = KeyBytes::from(key_str.as_bytes());
         let result_after_write = reader_after_write.query(query_key_vec.clone());
         assert!(
             result_after_write.is_some(),
@@ -968,7 +967,7 @@ mod test {
         // Verify first batch keys (should be found)
         for i in 0..num_kvs_first_batch {
             let key_str = pad_zero(i as u64);
-            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let query_key_vec = KeyBytes::from(key_str.as_bytes());
             let result = reader.query(query_key_vec.clone());
 
             let query_key_bytes = KeyBytes::from(key_str.as_bytes());
@@ -1001,7 +1000,7 @@ mod test {
         // Verify second batch keys (should NOT be found)
         for i in num_kvs_first_batch..(num_kvs_first_batch + num_kvs_second_batch) {
             let key_str = pad_zero(i as u64);
-            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let query_key_vec = KeyBytes::from(key_str.as_bytes());
             let result = reader.query(query_key_vec.clone());
 
             assert!(
@@ -1062,7 +1061,7 @@ mod test {
         for i in (0..num_kvs).step_by(5) {
             // Check a subset of keys
             let key_str = pad_zero(i as u64);
-            let query_key_vec = KeyVec::from(key_str.as_bytes());
+            let query_key_vec = KeyBytes::from(key_str.as_bytes());
             let result = reader.query(query_key_vec.clone());
 
             let query_key_bytes = KeyBytes::from(key_str.as_bytes());
@@ -1379,7 +1378,7 @@ mod test {
 
         // Check keys that should still exist
         for (key, expected_val) in expected_data_after_write.iter() {
-            let result = reader.query(KeyVec::from(key.as_ref()));
+            let result = reader.query(KeyBytes::from(key.as_ref()));
             match result {
                 Some(kv_op) => {
                     if let OpType::Write(actual_value) = kv_op.op {
@@ -1406,7 +1405,7 @@ mod test {
 
         // Check keys that should have been deleted
         for key in keys_to_delete.iter() {
-            let result = reader.query(KeyVec::from(key.as_ref()));
+            let result = reader.query(KeyBytes::from(key.as_ref()));
             assert!(result.is_none(), "Deleted key {:?} found unexpectedly", key);
         }
         info!("Verified {} deleted keys are absent.", num_to_delete);
@@ -1475,8 +1474,8 @@ mod test {
         let start_time = Instant::now(); // Record start time for read loop
         for i in 0..num_kvs {
             let key_str = pad_zero(i as u64);
-            let query_key_vec = KeyVec::from(key_str.as_bytes());
-            let result = reader.query(query_key_vec.clone()); // query expects KeyVec
+            let query_key_vec = KeyBytes::from(key_str.as_bytes());
+            let result = reader.query(query_key_vec.clone()); // query expects KeyBytes
 
             // HashMap uses KeyBytes, so convert for lookup
             let query_key_bytes = KeyBytes::from(key_str.as_bytes());
@@ -1562,7 +1561,7 @@ mod test {
             for (key_bytes, op_type) in initial_kvs_to_write {
                 let op_id = initial_op_id_base;
                 initial_op_id_base += 1;
-                let new_kv_op = KVOpertion::new(op_id, KeyVec::from(key_bytes.as_ref()), op_type);
+                let new_kv_op = KVOpertion::new(op_id, KeyBytes::from(key_bytes.as_ref()), op_type);
                 data_states_guard.insert(key_bytes, Arc::new(Mutex::new(Some(new_kv_op))));
             }
         }
@@ -1602,7 +1601,7 @@ mod test {
                                 let data_state_entry_guard = key_entry_mutex.lock().unwrap();
                                 let current_reader = db_clone.get_reader(); // Snapshot reader for this query
                                 let db_result =
-                                    current_reader.query(KeyVec::from(key_bytes.as_ref()));
+                                    current_reader.query(KeyBytes::from(key_bytes.as_ref()));
                                 if let Some(expected_kv) = &*data_state_entry_guard {
                                     if expected_kv.id <= current_reader.id {
                                         match (&expected_kv.op, db_result) {
@@ -1645,7 +1644,7 @@ mod test {
                             } else {
                                 let current_reader = db_clone.get_reader(); // Snapshot reader for this query
                                 let db_result =
-                                    current_reader.query(KeyVec::from(key_bytes.as_ref()));
+                                    current_reader.query(KeyBytes::from(key_bytes.as_ref()));
                                 // Key not present in `data_states` HashMap
                                 assert!(db_result.is_none(),
                                     "GET: Key {:?} not expected (not in data_states map) but found in DB: {:?}", key_bytes, db_result);
@@ -1683,7 +1682,7 @@ mod test {
                             ));
                             let new_kv_op = KVOpertion::new(
                                 committed_op_id,
-                                KeyVec::from(key_bytes.as_ref()),
+                                KeyBytes::from(key_bytes.as_ref()),
                                 op_type,
                             );
                             *data_state_entry_guard = Some(new_kv_op);
@@ -1727,7 +1726,7 @@ mod test {
 
         for (key_bytes, key_entry_mutex) in data_states_final_guard.iter() {
             let data_state_entry_guard = key_entry_mutex.lock().unwrap();
-            let db_result = final_reader.query(KeyVec::from(key_bytes.as_ref()));
+            let db_result = final_reader.query(KeyBytes::from(key_bytes.as_ref()));
 
             match (&*data_state_entry_guard, db_result) {
                 (Some(expected_kv), Some(actual_kv)) => {
