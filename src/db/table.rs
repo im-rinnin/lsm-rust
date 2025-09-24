@@ -352,27 +352,30 @@ impl<T: Store> TableBuilder<T> {
     /// Returns `false` if the operation cannot be added because the table
     /// has reached its `block_num_limit`.
     pub fn add(&mut self, op: KVOperation) -> bool {
-        // If the current block is empty, this operation's key is the first key of the block.
-        if self.block_builder.is_empty() {
-            self.current_block_first_key = Some(op.key.as_ref().into());
-        }
-
-        // Try to add the operation to the current block builder.
-        if !self.block_builder.add(op.clone()) {
-            // If adding fails, the current block is full. Flush it.
-            self.flush_current_block();
-
-            // Check if we've reached the overall block limit for the table.
-            if self.block_metas.len() >= self.config.block_num_limit {
-                info!(block_limit = self.config.block_num_limit, "block_num_limit");
-                return false; // Cannot add more blocks to this table.
+        // Try to add the operation to the current block builder first.
+        if self.block_builder.add(op.clone()) {
+            if self.current_block_first_key.is_none() {
+                self.current_block_first_key = Some(op.key.clone());
             }
-
-            // Create a new block builder and add the operation to it.
-            self.block_builder = BlockBuilder::new();
-            self.current_block_first_key = Some(op.key.clone());
-            self.block_builder.add(op); // This add should succeed as it's a new empty block.
+            return true;
         }
+
+        // If adding fails, the current block is full (or the op is too large for remaining space). Flush it.
+        self.flush_current_block();
+
+        // Check if we've reached the overall block limit for the table.
+        if self.block_metas.len() >= self.config.block_num_limit {
+            info!(block_limit = self.config.block_num_limit, "block_num_limit");
+            return false; // Cannot add more blocks to this table.
+        }
+
+        // Create a new block builder and try adding the operation to it.
+        self.block_builder = BlockBuilder::new();
+        if !self.block_builder.add(op.clone()) {
+            // The op itself does not fit in an empty block.
+            return false;
+        }
+        self.current_block_first_key = Some(op.key);
         true
     }
 
@@ -808,6 +811,39 @@ pub mod test {
             .find(&search_key, 0)
             .expect("should find earliest version across blocks");
         assert_eq!(earliest.1, 0u64);
+    }
+
+    #[test]
+    fn test_table_builder_add_oversized_op_does_not_panic_and_returns_false() {
+        use crate::db::common::OpType;
+        use crate::db::store::Memstore;
+        use crate::db::block::DATA_BLOCK_SIZE;
+
+        // Construct a KVOperation whose encoded size cannot fit in an empty block.
+        // op_size = 8(id) + 8(key_len) + key_len + 1(tag) + 8(val_len) + val_len
+        // For DATA_BLOCK_SIZE=4096, BlockBuilder reserves 8 bytes for count,
+        // so require op_size > 4088.
+        let key = b"k"; // key_len = 1
+        let min_value_len_overflow = (DATA_BLOCK_SIZE - 8) - (8 + 8 + key.len() + 1 + 8) + 1; // 4088 - (25 + key_len) + 1
+        assert!(min_value_len_overflow > 0);
+        let value = vec![b'x'; min_value_len_overflow];
+
+        let op = KVOperation::new(
+            1,
+            KeyBytes::from(key.as_ref()),
+            OpType::Write(value.as_slice().into()),
+        );
+
+        let store_id = 106u64;
+        let mut tb = TableBuilder::<Memstore>::new_with_id(store_id);
+
+        // Adding an oversized op should return false and not panic.
+        let added = tb.add(op);
+        assert!(!added, "oversized op should not be added to an empty block");
+
+        // Flushing an empty builder should also not panic and produce an empty table.
+        let table_reader = tb.flush();
+        assert_eq!(table_reader.block_metas.len(), 0);
     }
     #[test]
     fn test_table_reader_find() {
