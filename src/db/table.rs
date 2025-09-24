@@ -15,6 +15,7 @@ use crate::db::{
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
+use bytes::BytesMut;
 use tracing::{debug, info};
 
 use super::{
@@ -195,7 +196,6 @@ impl<T: Store> TableReader<T> {
             left_idx -= 1;
         }
 
-        let mut block_buffer_data = Option::Some(vec![0; DATA_BLOCK_SIZE]);
         // Iterate through blocks from the adjusted starting point.
         for i in left_idx..self.block_metas.len() {
             let block_meta = &self.block_metas[i];
@@ -214,9 +214,11 @@ impl<T: Store> TableReader<T> {
 
             // If we reach here, the block's key range [first_key, last_key] potentially contains the search key.
             let offset = i * DATA_BLOCK_SIZE;
-            let mut data = block_buffer_data.take().unwrap();
-            self.store.read_at(&mut data, offset);
-            let block_reader = BlockReader::new(data);
+            // Read block into a BytesMut buffer and convert to Bytes without copying
+            let mut data = BytesMut::with_capacity(DATA_BLOCK_SIZE);
+            data.resize(DATA_BLOCK_SIZE, 0);
+            self.store.read_at(&mut data[..], offset);
+            let block_reader = BlockReader::from_bytes(data.freeze());
 
             if let Some((current_op_type, op_id_found)) = block_reader.search(key, id) {
                 // current_op_type is already OpType, no need for conversion
@@ -231,7 +233,6 @@ impl<T: Store> TableReader<T> {
                     }
                 }
             }
-            block_buffer_data = Some(block_reader.into_inner());
         }
         best_op
     }

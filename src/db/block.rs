@@ -36,15 +36,19 @@ pub struct BlockReader {
 
 impl BlockReader {
     pub fn new(data: Vec<u8>) -> Self {
-        let data_len = data.len();
+        // Zero-copy convert Vec<u8> to Bytes and delegate
+        let data_bytes = Bytes::from(data);
+        Self::from_bytes(data_bytes)
+    }
+
+    pub fn from_bytes(data_bytes: Bytes) -> Self {
+        let data_len = data_bytes.len();
         // Read count from the last 8 bytes (u64)
         let count_bytes_start = data_len - std::mem::size_of::<u64>();
-        let mut cursor = Cursor::new(&data[count_bytes_start..]);
+        let mut cursor = Cursor::new(&data_bytes[count_bytes_start..]);
         let count = cursor.read_u64::<LittleEndian>().unwrap() as usize;
 
         // The actual block data is everything before the count
-        let data_bytes = Bytes::from(data);
-
         let bytes = data_bytes.slice(..count_bytes_start);
 
         // Decode the first KV operation to get the first key
