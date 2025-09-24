@@ -1,4 +1,4 @@
-use std::fmt::Result;
+use anyhow::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::common::SearchResult;
@@ -35,11 +35,14 @@ impl Memtable {
     pub fn get_capacity_bytes(&self) -> usize {
         self.capacity_bytes.load(Ordering::Relaxed)
     }
-    pub fn get<'a>(&'a self, q: &KeyQuery) -> SearchResult {
+    pub fn get(&self, q: &KeyQuery) -> SearchResult {
         let range_start_bound = (q.key.clone(), 0);
-        let range_end_bound = (q.key.clone(), q.op_id + 1);
-
-        for entry in self.table.range(range_start_bound..range_end_bound).rev() {
+        // Use an inclusive upper bound to avoid overflow when q.op_id == u64::MAX
+        for entry in self
+            .table
+            .range(range_start_bound..=(q.key.clone(), q.op_id))
+            .rev()
+        {
             let (_entry_key, entry_op_id) = entry.key();
             let entry_op_type = entry.value();
             return Some((entry_op_type.clone(), *entry_op_id));
@@ -47,7 +50,7 @@ impl Memtable {
         None
     }
 
-    pub fn insert(&self, op: KVOperation) -> Result {
+    pub fn insert(&self, op: KVOperation) -> Result<()> {
         let op_size = op.encode_size();
         self.table.insert((op.key, op.id), op.op);
         self.current_size_bytes
@@ -66,10 +69,6 @@ impl Memtable {
             inner_iter: iter,
             peeked_entry: first_entry,
         }
-    }
-
-    pub fn estimated_size_bytes(&self) -> usize {
-        self.current_size_bytes.load(Ordering::Relaxed)
     }
 
     pub fn is_full(&self) -> bool {
@@ -566,7 +565,7 @@ mod test {
             // Check if adding the current operation would exceed the capacity
             // This check is now more about predicting the state after the atomic operation
             // For a single-threaded test, this logic is fine.
-            if m.estimated_size_bytes() + op_size > small_capacity && !m.is_full() {
+            if m.get_size() + op_size > small_capacity && !m.is_full() {
                 m.insert(op).unwrap();
                 assert!(m.is_full());
                 break;
@@ -575,7 +574,7 @@ mod test {
             assert!(!m.is_full());
         }
 
-        assert!(m.estimated_size_bytes() >= small_capacity);
+        assert!(m.get_size() >= small_capacity);
         assert!(m.is_full());
 
         // Try to insert one more operation, it should still be full or exceed capacity
