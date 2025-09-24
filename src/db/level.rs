@@ -24,6 +24,10 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 
+const U64_SIZE: usize = std::mem::size_of::<u64>();
+const U32_SIZE: usize = std::mem::size_of::<u32>();
+// level (u64) + index (u64) + id (u64) + change_type (u8)
+const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 3 + std::mem::size_of::<u8>();
 const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
 const MAX_INPUT_TABLE_IN_COMPACT: usize = 1;
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -50,6 +54,30 @@ pub struct TableChanges {
     // sorted by index
     add_tables: Vec<(usize, StoreId)>,
 }
+
+// level change 0: [table_change_count(u64)][table_change_entry_0][table_change_entry_1][check_sum of all table change]
+pub struct TableChangeLog<T: Store> {
+    storage: T,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+pub struct LevelStoregeConfig {
+    pub level_zero_num_limit: usize,
+    pub level_ratio: usize,
+    pub table_config: TableConfig,
+}
+
+pub struct Level<T: Store> {
+    // sstable sorted  by (key,op id)
+    sstables: Vec<ThreadSafeTableReader<T>>,
+    is_level_zero: bool,
+}
+
+pub struct LevelStorege<T: Store> {
+    levels: Vec<Level<T>>,
+    config: LevelStoregeConfig,
+}
+
 impl TableChanges {
     fn new(level_start: usize) -> Self {
         TableChanges {
@@ -180,15 +208,6 @@ impl TableChange {
     }
 }
 
-// level change 0: [table_change_count(u64)][table_change_entry_0][table_change_entry_1][check_sum of all table change]
-pub struct TableChangeLog<T: Store> {
-    storage: T,
-}
-const U64_SIZE: usize = std::mem::size_of::<u64>();
-const U32_SIZE: usize = std::mem::size_of::<u32>();
-// level (u64) + index (u64) + id (u64) + change_type (u8)
-const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 3 + std::mem::size_of::<u8>();
-
 impl TableChangeLog<Filestore> {
     pub fn from_file(f: File, id: StoreId) -> Self {
         TableChangeLog {
@@ -278,12 +297,6 @@ impl<T: Store> TableChangeLog<T> {
     }
 }
 
-pub struct Level<T: Store> {
-    // sstable sorted  by (key,op id)
-    sstables: Vec<ThreadSafeTableReader<T>>,
-    is_level_zero: bool,
-}
-
 impl<T: Store> Clone for Level<T> {
     fn clone(&self) -> Self {
         Level {
@@ -336,11 +349,6 @@ impl<T: Store> Level<T> {
     }
 }
 
-pub struct LevelStorege<T: Store> {
-    levels: Vec<Level<T>>,
-    config: LevelStoregeConfig,
-}
-
 impl<T: Store> Clone for LevelStorege<T> {
     fn clone(&self) -> Self {
         LevelStorege {
@@ -348,12 +356,6 @@ impl<T: Store> Clone for LevelStorege<T> {
             config: self.config.clone(),
         }
     }
-}
-#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
-pub struct LevelStoregeConfig {
-    pub level_zero_num_limit: usize,
-    pub level_ratio: usize,
-    pub table_config: TableConfig,
 }
 
 impl Default for LevelStoregeConfig {
