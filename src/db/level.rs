@@ -175,25 +175,16 @@ impl TableChange {
                     {
                         current_level_tables.remove(change.index);
                     } else {
-                        // This indicates a critical error: log corruption or a bug in change generation.
-                        // The state cannot be reliably reconstructed based on this log entry.
-                        // Panicking is appropriate here as it signals a serious inconsistency
-                        // that cannot be safely ignored or automatically recovered from without
-                        // further logic (e.g., manual intervention, more sophisticated conflict resolution).
-                        panic!(
-                            "Critical Error: TableChange::Delete failed due to index out of bounds or ID mismatch.\n\
-                             Change: {:?}\n\
-                             Current level {} state: {:?}\n\
-                             Index out of bounds: {}\n\
-                             ID mismatch (expected {}, found {}): {}",
-                            change,
-                            change.level,
-                            current_level_tables,
-                            change.index >= current_level_tables.len(),
-                            change.id,
-                            if change.index < current_level_tables.len() { current_level_tables[change.index].to_string() } else { "N/A".to_string() },
-                            change.index < current_level_tables.len() && current_level_tables[change.index] != change.id
+                        // Log error instead of panicking to avoid crashing library users.
+                        tracing::error!(
+                            level = change.level,
+                            index = change.index,
+                            id = change.id,
+                            current_len = current_level_tables.len(),
+                            current_tables = ?current_level_tables,
+                            "TableChange::Delete mismatch or out of bounds; skipping this change"
                         );
+                        // Skip applying this invalid deletion.
                     }
                 }
             }
@@ -250,7 +241,11 @@ impl<T: Store> TableChangeLog<T> {
         while current_read_offset < storage_len {
             // Read count (u64)
             if current_read_offset + U64_SIZE > storage_len {
-                eprintln!("TableChangeLog: Corrupted log file - incomplete count header at offset {}. Remaining bytes: {}", current_read_offset, storage_len - current_read_offset);
+                tracing::error!(
+                    offset = current_read_offset,
+                    remaining = storage_len - current_read_offset,
+                    "TableChangeLog: Corrupted log file - incomplete count header"
+                );
                 break;
             }
             let mut count_buf = [0u8; U64_SIZE];
@@ -262,7 +257,12 @@ impl<T: Store> TableChangeLog<T> {
             let batch_expected_total_len = batch_changes_data_len + U32_SIZE; // Data + Checksum
 
             if current_read_offset + batch_expected_total_len > storage_len {
-                eprintln!("TableChangeLog: Corrupted log file - incomplete batch data or checksum at offset {}. Expected total batch bytes: {}, Remaining bytes: {}", current_read_offset, batch_expected_total_len, storage_len - current_read_offset);
+                tracing::error!(
+                    offset = current_read_offset,
+                    expected_total = batch_expected_total_len,
+                    remaining = storage_len - current_read_offset,
+                    "TableChangeLog: Corrupted log file - incomplete batch data or checksum"
+                );
                 break;
             }
 
@@ -287,7 +287,12 @@ impl<T: Store> TableChangeLog<T> {
 
             let calculated_checksum = hasher.finalize();
             if calculated_checksum != expected_checksum {
-                eprintln!("TableChangeLog: Checksum mismatch detected for a batch at offset {}. Calculated: {}, Expected: {}. Log might be corrupted.", current_read_offset - U32_SIZE, calculated_checksum, expected_checksum);
+                tracing::error!(
+                    offset = current_read_offset - U32_SIZE,
+                    calculated = calculated_checksum,
+                    expected = expected_checksum,
+                    "TableChangeLog: Checksum mismatch detected for a batch; log might be corrupted"
+                );
                 return Err(anyhow::anyhow!("decode table change checksum"));
             }
         }
@@ -451,9 +456,9 @@ impl<T: Store> LevelStorage<T> {
                 // Add the operation that didn't fit into the previous builder to the new one.
                 // This should always succeed on a fresh builder unless the single op is too large.
                 if !table_builder.add(op.clone()) {
-                    // Handle the edge case where a single operation is too large for a block/table.
-                    // This might indicate a configuration issue or an unexpectedly large KV pair.
-                    panic!("Error: Single KVOperation is too large to fit in a new table block during push_new_table. Operation ID: {}", op.id);
+                    // Edge case: a single operation is too large for a new table.
+                    tracing::error!(op_id = op.id, "KVOperation too large to fit in a fresh table during push_new_table; skipping op");
+                    continue;
                 }
             }
         }
@@ -769,7 +774,7 @@ impl<T: Store> LevelStorage<T> {
                         TableBuilder::new_with_id_config(*store_id_start, self.config.table_config);
                     *store_id_start += 1;
                     if !table_builder.add(op.clone()) {
-                        panic!("Error: Single KVOperation is too large to fit in a new table block during compaction. Operation ID: {}", op.id);
+                        tracing::error!(op_id = op.id, "KVOperation too large to fit in a fresh table during compaction; skipping op");
                     }
                 }
 
