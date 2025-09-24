@@ -9,7 +9,7 @@ use tracing_subscriber::filter::Targets;
 
 use crate::db::common::*;
 use crate::db::db_log;
-use crate::db::level::LevelStorege;
+use crate::db::level::LevelStorage;
 use crate::db::logfile::LogFile;
 use crate::db::memtable::Memtable;
 use crate::db::store::Filestore;
@@ -19,7 +19,7 @@ use crate::db::table::TableReader;
 
 use super::key::KeySlice;
 use super::level;
-use super::level::LevelStoregeConfig;
+use super::level::LevelStorageConfig;
 use super::level::TableChange;
 use super::store::StoreId;
 use super::table::TableConfig;
@@ -28,12 +28,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct LsmStorageConfig {
     pub memtable_size_limit: usize,
-    pub level_config: LevelStoregeConfig,
+    pub level_config: LevelStorageConfig,
 }
 impl Default for LsmStorageConfig {
     fn default() -> Self {
         LsmStorageConfig {
-            level_config: LevelStoregeConfig::default(),
+            level_config: LevelStorageConfig::default(),
             memtable_size_limit: 2 * 1024 * 1024, //4MB
         }
     }
@@ -41,7 +41,7 @@ impl Default for LsmStorageConfig {
 impl LsmStorageConfig {
     pub fn config_for_test() -> Self {
         LsmStorageConfig {
-            level_config: LevelStoregeConfig::config_for_test(),
+            level_config: LevelStorageConfig::config_for_test(),
             memtable_size_limit: 1024,
         }
     }
@@ -50,7 +50,7 @@ pub struct LsmStorage<T: Store> {
     m: Arc<Memtable>,
     //  immutable memtable
     imm: Vec<Arc<Memtable>>,
-    current: LevelStorege<T>,
+    current: LevelStorage<T>,
 }
 impl<T: Store> Clone for LsmStorage<T> {
     fn clone(&self) -> Self {
@@ -62,7 +62,7 @@ impl<T: Store> Clone for LsmStorage<T> {
     }
 }
 impl<T: Store> LsmStorage<T> {
-    pub fn from(config: LsmStorageConfig, level: LevelStorege<T>) -> Self {
+    pub fn from(config: LsmStorageConfig, level: LevelStorage<T>) -> Self {
         LsmStorage {
             m: Arc::new(Memtable::new(config.memtable_size_limit)),
             imm: Vec::new(),
@@ -73,7 +73,7 @@ impl<T: Store> LsmStorage<T> {
         LsmStorage {
             m: Arc::new(Memtable::new(config.memtable_size_limit)),
             imm: Vec::new(),
-            current: LevelStorege::new(vec![], config.level_config),
+            current: LevelStorage::new(vec![], config.level_config),
         }
     }
 
@@ -85,7 +85,7 @@ impl<T: Store> LsmStorage<T> {
         self.current.need_compact()
     }
     pub fn level_zero_reach_limit(&self) -> bool {
-        self.current.level_zero_need_reach_limit()
+        self.current.level_zero_exceeds_limit()
     }
 
     pub fn log_lsm_debug_info(&self) {
@@ -227,7 +227,7 @@ impl<T: Store> LsmStorage<T> {
         // Convert Key<Bytes> to KeySlice (&Key<&[u8]>) before calling find
         let key_slice: KeySlice = query.key.as_ref().into();
         if let Some((op_type, op_id)) = self.current.find(&key_slice, query.op_id) {
-            // LevelStorege::find returns SearchResult (Option<(OpType, OpId)>)
+            // LevelStorage::find returns SearchResult (Option<(OpType, OpId)>)
             // We need to reconstruct KVOperation if it's a Write
             match op_type {
                 OpType::Write(value) => {
@@ -257,7 +257,7 @@ mod test {
     use super::{LsmStorage, LsmStorageConfig};
     use crate::db::common::{KVOperation, KeyQuery, OpType};
     use crate::db::key::{KeyBytes, KeyBytes as _KeyVecUnusedRename, KeySlice};
-    use crate::db::level::LevelStoregeConfig;
+    use crate::db::level::LevelStorageConfig;
     use crate::db::store::Memstore;
 
     /// Tests the basic put and get functionality of the LsmStorage.
@@ -298,7 +298,7 @@ mod test {
         }
     }
 
-    /// Tests retrieving data that exists only in the LevelStorege (SSTables).
+    /// Tests retrieving data that exists only in the LevelStorage (SSTables).
     /// It constructs an LsmStorage with pre-populated levels and verifies
     /// that `get` can find keys in different levels and handles non-existent keys correctly.
     #[test]
@@ -313,9 +313,9 @@ mod test {
         let table_lvl1 = crate::db::table::test::create_test_table_with_id_offset(100..200, 2000); // keys "000100" to "000199", OpIds 2100-2199
         let level1 = crate::db::level::Level::new(vec![Arc::new(table_lvl1)], false);
 
-        // Create LevelStorege with these levels
+        // Create LevelStorage with these levels
         let level_storage =
-            crate::db::level::LevelStorege::new(vec![level0, level1], config.level_config);
+            crate::db::level::LevelStorage::new(vec![level0, level1], config.level_config);
 
         // Create LsmStorage from the configured levels
         let lsm = LsmStorage::<Memstore>::from(config, level_storage);

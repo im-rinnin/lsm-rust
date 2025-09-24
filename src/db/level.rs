@@ -1,10 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    default,
     fs::File,
     io::{Read, Write},
     sync::Arc,
-    usize,
 };
 
 use anyhow::Result;
@@ -61,7 +59,7 @@ pub struct TableChangeLog<T: Store> {
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
-pub struct LevelStoregeConfig {
+pub struct LevelStorageConfig {
     pub level_zero_num_limit: usize,
     pub level_ratio: usize,
     pub table_config: TableConfig,
@@ -73,9 +71,9 @@ pub struct Level<T: Store> {
     is_level_zero: bool,
 }
 
-pub struct LevelStorege<T: Store> {
+pub struct LevelStorage<T: Store> {
     levels: Vec<Level<T>>,
-    config: LevelStoregeConfig,
+    config: LevelStorageConfig,
 }
 
 impl TableChanges {
@@ -349,18 +347,18 @@ impl<T: Store> Level<T> {
     }
 }
 
-impl<T: Store> Clone for LevelStorege<T> {
+impl<T: Store> Clone for LevelStorage<T> {
     fn clone(&self) -> Self {
-        LevelStorege {
+        LevelStorage {
             levels: self.levels.clone(),
             config: self.config.clone(),
         }
     }
 }
 
-impl Default for LevelStoregeConfig {
+impl Default for LevelStorageConfig {
     fn default() -> Self {
-        LevelStoregeConfig {
+        LevelStorageConfig {
             level_zero_num_limit: DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE,
             level_ratio: 4,
             table_config: TableConfig::default(),
@@ -368,9 +366,9 @@ impl Default for LevelStoregeConfig {
     }
 }
 
-impl LevelStoregeConfig {
+impl LevelStorageConfig {
     pub fn config_for_test() -> Self {
-        LevelStoregeConfig {
+        LevelStorageConfig {
             level_zero_num_limit: 2,
             level_ratio: 2,
             table_config: TableConfig::new_for_test(),
@@ -378,15 +376,15 @@ impl LevelStoregeConfig {
     }
 }
 
-impl<T: Store> LevelStorege<T> {
-    pub fn new(tables: Vec<Level<T>>, config: LevelStoregeConfig) -> Self {
-        LevelStorege {
+impl<T: Store> LevelStorage<T> {
+    pub fn new(tables: Vec<Level<T>>, config: LevelStorageConfig) -> Self {
+        LevelStorage {
             levels: tables,
             config,
         }
     }
     // level zero table size reach limit
-    pub fn level_zero_need_reach_limit(&self) -> bool {
+    pub fn level_zero_exceeds_limit(&self) -> bool {
         if self.levels.is_empty() {
             return false;
         }
@@ -411,7 +409,7 @@ impl<T: Store> LevelStorege<T> {
     // `next_sstable_id` is used to generate a unique ID for the new table and is incremented.
     pub fn push_new_table<P: Iterator<Item = KVOperation>>(
         &mut self,
-        mut it: P, // Take iterator by value or mutable ref depending on usage
+        it: P,
         next_sstable_id: &mut StoreId,
     ) {
         // Ensure level 0 exists
@@ -434,7 +432,7 @@ impl<T: Store> LevelStorege<T> {
         // Keep track of the tables created in this push operation
         let mut created_tables = Vec::new();
 
-        while let Some(op) = it.next() {
+        for op in it {
             // Try adding the operation to the current builder
             if !table_builder.add(op.clone()) {
                 // If add fails, the current builder is full.
@@ -494,9 +492,14 @@ impl<T: Store> LevelStorege<T> {
         for level_depth in 0..self.levels.len() {
             let max_tables = self.max_table_in_level(level_depth);
             let count = self.levels[level_depth].sstables.len();
-            info!(level = level_depth, "count is {}", count);
+            debug!(level = level_depth, count = count, "level table count");
             if count > max_tables {
-                info!("level {} table num {},need compact", level_depth, count);
+                debug!(
+                    level = level_depth,
+                    count = count,
+                    max = max_tables,
+                    "level exceeds limit; needs compaction"
+                );
                 return true;
             }
         }
@@ -564,7 +567,7 @@ impl<T: Store> LevelStorege<T> {
                 "table change during lsm compaction"
             );
         }
-        return table_change;
+        table_change
     }
 
     /// Gets the overall key range (min and max keys) across a collection of tables.
@@ -596,11 +599,9 @@ impl<T: Store> LevelStorege<T> {
         (min_key, max_key)
     }
 
-    fn get_target_level_key_ranges(
-        sstables: &Vec<Arc<TableReader<T>>>,
-    ) -> Vec<(KeyBytes, KeyBytes)> {
+    fn get_target_level_key_ranges(sstables: &[Arc<TableReader<T>>]) -> Vec<(KeyBytes, KeyBytes)> {
         let mut target_level_key_value_range = vec![];
-        for table in sstables {
+        for table in sstables.iter() {
             target_level_key_value_range.push(table.key_range());
         }
         target_level_key_value_range.sort_by(|a, b| a.0.cmp(&b.0));
@@ -848,12 +849,12 @@ impl<T: Store> LevelStorege<T> {
     // e.g. k:[2,10] key_ranges:[[1,3],[5,7],[12,20]] return (0,1)
     fn key_range_overlap(
         k: (KeyBytes, KeyBytes),
-        sorted_key_ranges: &Vec<(KeyBytes, KeyBytes)>,
+        sorted_key_ranges: &[(KeyBytes, KeyBytes)],
     ) -> Vec<usize> {
         let (k_min, k_max) = k;
         let mut overlapping_indices = Vec::new();
 
-        for (idx, (r_min, r_max)) in sorted_key_ranges.into_iter().enumerate() {
+        for (idx, (r_min, r_max)) in sorted_key_ranges.iter().enumerate() {
             // Check for overlap: (k_min <= r_max) AND (k_max >= r_min)
             if k_min.as_ref().le(r_max.as_ref()) && k_max.as_ref().ge(r_min.as_ref()) {
                 overlapping_indices.push(idx);
@@ -997,7 +998,7 @@ impl<T: Store> LevelStorege<T> {
 
 #[cfg(test)]
 mod test {
-    use super::LevelStoregeConfig;
+    use super::LevelStorageConfig;
     use std::ops::Range;
     use std::sync::Arc; // Moved from test functions
     const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4; // Moved here for local test scope
@@ -1008,7 +1009,7 @@ mod test {
     use crate::db::db_log;
     // OpType moved from helper
     use crate::db::key::{KeyBytes, KeySlice};
-    use crate::db::level::{ChangeType, Level, LevelStorege, TableChange, U32_SIZE};
+    use crate::db::level::{ChangeType, Level, LevelStorage, TableChange, U32_SIZE};
     use crate::db::store::{Filestore, Store, StoreId};
     // KeyBytes moved from helper
     use crate::db::table::test::{create_test_table, create_test_table_with_id_offset};
@@ -1054,9 +1055,9 @@ mod test {
         }
     }
 
-    // Helper function to reduce code duplication in tests for LevelStorege struct
+    // Helper function to reduce code duplication in tests for LevelStorage struct
     fn assert_level_storage_find_and_check(
-        level_storage: &super::LevelStorege<Memstore>,
+        level_storage: &super::LevelStorage<Memstore>,
         key: &KeySlice,
         expected_value: Option<&[u8]>,
         opid: OpId,
@@ -1215,9 +1216,9 @@ mod test {
         // but typically sorted by key range for efficiency.
         let level1 = super::Level::new(vec![table_c_lvl1.clone(), table_d_lvl1.clone()], false);
 
-        // Create LevelStorege with levels
+        // Create LevelStorage with levels
         let level_storage =
-            super::LevelStorege::new(vec![level0, level1], LevelStoregeConfig::config_for_test()); // r is level_ratio, not relevant for this test
+            super::LevelStorage::new(vec![level0, level1], LevelStorageConfig::config_for_test()); // r is level_ratio, not relevant for this test
 
         // Test cases for find:
 
@@ -1296,7 +1297,7 @@ mod test {
             true,
         );
         let level_storage_zero =
-            super::LevelStorege::new(vec![level_zero], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![level_zero], LevelStorageConfig::config_for_test());
         let compacted_tables_zero = level_storage_zero.table_to_compact(0);
         assert_eq!(compacted_tables_zero.len(), 3);
         let mut compacted_ids: Vec<u64> = compacted_tables_zero
@@ -1321,7 +1322,7 @@ mod test {
             false,
         );
         let level_storage_n =
-            super::LevelStorege::new(vec![level_n], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![level_n], LevelStorageConfig::config_for_test());
 
         let compacted_tables_n = level_storage_n.table_to_compact(0);
         assert_eq!(compacted_tables_n.len(), 1);
@@ -1338,7 +1339,7 @@ mod test {
 
         // Scenario 1: Single table
         let level_storage_single =
-            super::LevelStorege::new(vec![], LevelStoregeConfig::config_for_test()); // Levels vector doesn't matter for this test
+            super::LevelStorage::new(vec![], LevelStorageConfig::config_for_test()); // Levels vector doesn't matter for this test
         let (min_key, max_key) = level_storage_single.get_key_range(&[table_1.clone()]);
         assert_eq!(min_key, KeyBytes::from("000000".as_bytes()));
         assert_eq!(max_key, KeyBytes::from("000009".as_bytes()));
@@ -1378,10 +1379,10 @@ mod test {
         let table_l1_y = Arc::new(create_test_table_with_id_offset(200..300, 100)); // keys "000200" to "000299", OpIds 300-399
         let level1 = super::Level::new(vec![table_l1_x.clone(), table_l1_y.clone()], false);
 
-        // Create LevelStorege with levels
-        let level_storage = super::LevelStorege::new(
+        // Create LevelStorage with levels
+        let level_storage = super::LevelStorage::new(
             vec![level0.clone(), level1],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Input tables for compaction (from level 0)
@@ -1465,9 +1466,9 @@ mod test {
         // Test case: No overlap in target level
         // Create an empty level 1 to serve as the target for compaction
         let empty_level1 = super::Level::new(vec![], false);
-        let mut level_storage_no_overlap = super::LevelStorege::new(
+        let mut level_storage_no_overlap = super::LevelStorage::new(
             vec![level0.clone(), empty_level1],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
         let input_tables_no_overlap = vec![table_l0_b.clone(), table_l0_a.clone()];
         let mut store_id_start_no_overlap = store_id_start; // Use a new mutable variable for this test case
@@ -1519,7 +1520,7 @@ mod test {
         );
 
         let level_storage =
-            super::LevelStorege::new(vec![level_n], LevelStoregeConfig::config_for_test()); // Level 0 is the only level here
+            super::LevelStorage::new(vec![level_n], LevelStorageConfig::config_for_test()); // Level 0 is the only level here
 
         let level_depth = 0; // We are testing the first (and only) level
 
@@ -1582,7 +1583,7 @@ mod test {
         // Test Case 9: Empty level
         let empty_level: Level<Memstore> = super::Level::new(vec![], false);
         let empty_level_storage =
-            super::LevelStorege::new(vec![empty_level], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![empty_level], LevelStorageConfig::config_for_test());
         let start_key = KeySlice::from("key_start".as_bytes());
         let end_key = KeySlice::from("key_end".as_bytes());
         assert_eq!(
@@ -1600,9 +1601,9 @@ mod test {
 
         // Test Case 11: Single table in level
         let single_table_level = super::Level::new(vec![table_1.clone()], false);
-        let single_table_level_storage = super::LevelStorege::new(
+        let single_table_level_storage = super::LevelStorage::new(
             vec![single_table_level],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
         let start_key = KeySlice::from("000120".as_bytes());
         let end_key = KeySlice::from("000180".as_bytes());
@@ -1644,9 +1645,9 @@ mod test {
             ],
             true, // Level 0
         );
-        let mut config = LevelStoregeConfig::config_for_test();
+        let mut config = LevelStorageConfig::config_for_test();
         config.level_zero_num_limit = 4;
-        let mut level_storage = super::LevelStorege::new(vec![level0], config);
+        let mut level_storage = super::LevelStorage::new(vec![level0], config);
 
         // Level 0 limit is MAX_LEVEL_ZERO_TABLE_SIZE = 4, so with 4 tables, no compaction needed
         let (tables_to_compact, changes) = level_storage.take_out_table_to_compact(0);
@@ -1674,12 +1675,12 @@ mod test {
             vec![table_a.clone(), table_b.clone(), table_c.clone()],
             false, // Not level 0
         );
-        let mut level_storage2 = super::LevelStorege::new(
+        let mut level_storage2 = super::LevelStorage::new(
             vec![
                 super::Level::new(vec![], true), // Empty level 0
                 level1,
             ],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Level 1 limit is level_zero_num_limit * level_ratio^1 = 2 * 10^1 = 20
@@ -1692,7 +1693,7 @@ mod test {
         // Test Case 3: Empty level
         let empty_level: Level<Memstore> = super::Level::new(vec![], false);
         let mut empty_level_storage =
-            super::LevelStorege::new(vec![empty_level], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![empty_level], LevelStorageConfig::config_for_test());
         let (tables_to_compact3, changes3) = empty_level_storage.take_out_table_to_compact(0);
 
         assert_eq!(tables_to_compact3.len(), 0);
@@ -1711,12 +1712,12 @@ mod test {
             .collect();
 
         let level_many = super::Level::new(many_tables, false);
-        let mut level_storage_many = super::LevelStorege::new(
+        let mut level_storage_many = super::LevelStorage::new(
             vec![
                 super::Level::new(vec![], true), // Empty level 0
                 level_many,
             ],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Level 1 limit is 2 * 10^1 = 20.
@@ -1767,7 +1768,7 @@ mod test {
             true,
         );
         let mut level_storage =
-            super::LevelStorege::new(vec![level0], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![level0], LevelStorageConfig::config_for_test());
 
         // Before compaction: Level 0 has 5 tables, no Level 1
         assert_eq!(level_storage.levels.len(), 1);
@@ -1860,12 +1861,12 @@ mod test {
             .expect("many_tables_l1 should not be empty");
 
         let level1_many = super::Level::new(many_tables_l1, false);
-        let mut level_storage_multi = super::LevelStorege::new(
+        let mut level_storage_multi = super::LevelStorage::new(
             vec![
                 super::Level::new(vec![], true), // Empty level 0
                 level1_many,
             ],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Before compaction: Level 1 has 25 tables. Limit is 2 * 10^1 = 20.
@@ -1895,7 +1896,7 @@ mod test {
         let small_table = Arc::new(create_test_table_with_id(0..10, 999u64));
         let level0_small = super::Level::new(vec![small_table], true);
         let mut level_storage_small =
-            super::LevelStorege::new(vec![level0_small], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![level0_small], LevelStorageConfig::config_for_test());
 
         let original_len = level_storage_small.levels.len();
         let original_table_count = level_storage_small.levels[0].sstables.len();
@@ -1922,8 +1923,8 @@ mod test {
         );
 
         // Test Case 4: Empty level storage
-        let mut empty_level_storage: LevelStorege<Memstore> =
-            super::LevelStorege::new(vec![], LevelStoregeConfig::config_for_test());
+        let mut empty_level_storage: LevelStorage<Memstore> =
+            super::LevelStorage::new(vec![], LevelStorageConfig::config_for_test());
 
         // Should not panic and remain empty
         let mut start_id_case4 = 4000;
@@ -1982,16 +1983,16 @@ mod test {
 
     #[test]
     fn test_max_table_in_level() {
-        // Create LevelStorege instances with specific limits
-        let mut config = LevelStoregeConfig::config_for_test();
+        // Create LevelStorage instances with specific limits
+        let mut config = LevelStorageConfig::config_for_test();
         config.level_zero_num_limit = 4;
-        let level_storage_ratio2 = LevelStorege::<Memstore>::new(vec![], config); // level_zero_limit=4, ratio=2
+        let level_storage_ratio2 = LevelStorage::<Memstore>::new(vec![], config); // level_zero_limit=4, ratio=2
         config.level_ratio = 3;
         config.level_zero_num_limit = 4;
-        let level_storage_ratio3 = LevelStorege::<Memstore>::new(vec![], config); // level_zero_limit=4, ratio=3
+        let level_storage_ratio3 = LevelStorage::<Memstore>::new(vec![], config); // level_zero_limit=4, ratio=3
         config.level_zero_num_limit = 2;
         config.level_ratio = 10;
-        let level_storage_limit2_ratio10 = LevelStorege::<Memstore>::new(vec![], config); // level_zero_limit=2, ratio=10
+        let level_storage_limit2_ratio10 = LevelStorage::<Memstore>::new(vec![], config); // level_zero_limit=2, ratio=10
 
         // Test level 0
         assert_eq!(level_storage_ratio2.max_table_in_level(0), 4);
@@ -2040,9 +2041,9 @@ mod test {
 
         // Create empty level 1 as target
         let empty_level1 = super::Level::new(vec![], false);
-        let mut level_storage = super::LevelStorege::new(
+        let mut level_storage = super::LevelStorage::new(
             vec![level0, empty_level1],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Perform compaction from level 0 to level 1
@@ -2204,11 +2205,11 @@ mod test {
     /// Tests the `need_compact` method to ensure it correctly identifies when compaction is needed.
     #[test]
     fn test_need_compact() {
-        // Setup: Use a test config for LevelStorege
-        let config = LevelStoregeConfig::config_for_test(); // level_zero_num_limit = 2, level_ratio = 2
+        // Setup: Use a test config for LevelStorage
+        let config = LevelStorageConfig::config_for_test(); // level_zero_num_limit = 2, level_ratio = 2
 
         // Case 1: Empty storage - no compaction needed
-        let empty_storage = LevelStorege::<Memstore>::new(vec![], config);
+        let empty_storage = LevelStorage::<Memstore>::new(vec![], config);
         assert!(
             !empty_storage.need_compact(),
             "Empty storage should not need compaction"
@@ -2217,7 +2218,7 @@ mod test {
         // Case 2: Level 0 below limit (1 table, limit is 2)
         let table_a = Arc::new(create_test_table_with_id(0..10, 1u64));
         let level0_one_table = Level::new(vec![table_a.clone()], true);
-        let storage_one_table = LevelStorege::new(vec![level0_one_table], config);
+        let storage_one_table = LevelStorage::new(vec![level0_one_table], config);
         assert!(
             !storage_one_table.need_compact(),
             "Level 0 with 1 table should not need compaction"
@@ -2226,7 +2227,7 @@ mod test {
         // Case 3: Level 0 at limit (2 tables, limit is 2)
         let table_b = Arc::new(create_test_table_with_id(10..20, 2u64));
         let level0_at_limit = Level::new(vec![table_a.clone(), table_b.clone()], true);
-        let storage_at_limit = LevelStorege::new(vec![level0_at_limit], config);
+        let storage_at_limit = LevelStorage::new(vec![level0_at_limit], config);
         assert!(
             !storage_at_limit.need_compact(),
             "Level 0 with 2 tables should not need compaction"
@@ -2235,7 +2236,7 @@ mod test {
         // Case 4: Level 0 exceeds limit (3 tables, limit is 2) - should need compaction
         let table_c = Arc::new(create_test_table_with_id(20..30, 3u64));
         let level0_exceeds_limit = Level::new(vec![table_a, table_b, table_c], true);
-        let storage_exceeds_limit = LevelStorege::new(vec![level0_exceeds_limit], config);
+        let storage_exceeds_limit = LevelStorage::new(vec![level0_exceeds_limit], config);
         assert!(
             storage_exceeds_limit.need_compact(),
             "Level 0 with 3 tables should need compaction"
@@ -2255,7 +2256,7 @@ mod test {
         let level1_exceeds_limit =
             Level::new(vec![table_d, table_e, table_f, table_g, table_h], false);
         let storage_multi_level_needs_compact =
-            LevelStorege::new(vec![level0_ok, level1_exceeds_limit], config);
+            LevelStorage::new(vec![level0_ok, level1_exceeds_limit], config);
         assert!(
             storage_multi_level_needs_compact.need_compact(),
             "Multi-level storage with L1 exceeding limit should need compaction"
@@ -2270,7 +2271,7 @@ mod test {
 
         let level0_ok_2 = Level::new(vec![table_i.clone()], true);
         let level1_ok = Level::new(vec![table_i, table_j, table_k], false);
-        let storage_multi_level_ok = LevelStorege::new(vec![level0_ok_2, level1_ok], config);
+        let storage_multi_level_ok = LevelStorage::new(vec![level0_ok_2, level1_ok], config);
         assert!(
             !storage_multi_level_ok.need_compact(),
             "Multi-level storage with all levels within limits should not need compaction"
@@ -2279,7 +2280,7 @@ mod test {
         // Case 7: Level 0 does not exist, but subsequent levels might.
         // `levels` vector might be `[empty_level1, empty_level2]` if they were initialized.
         // The current implementation ensures `levels.len()` means the highest depth.
-        let storage_no_level0 = LevelStorege::<Memstore>::new(
+        let storage_no_level0 = LevelStorage::<Memstore>::new(
             vec![
                 Level::new(vec![], true), // Level 0 exists but is empty
                 Level::new(
@@ -2351,7 +2352,7 @@ mod test {
         let k = r("000000", "000005");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![] as Vec<usize>
         );
 
@@ -2359,7 +2360,7 @@ mod test {
         let k = r("000050", "000060");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![] as Vec<usize>
         );
 
@@ -2367,7 +2368,7 @@ mod test {
         let k = r("000010", "000020");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2375,7 +2376,7 @@ mod test {
         let k = r("000005", "000015");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2383,7 +2384,7 @@ mod test {
         let k = r("000015", "000025");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2395,7 +2396,7 @@ mod test {
             r("000040", "000050"),
         ];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0, 1]
         );
 
@@ -2403,7 +2404,7 @@ mod test {
         let k = r("000000", "000050");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0, 1]
         );
 
@@ -2411,7 +2412,7 @@ mod test {
         let k = r("000012", "000018");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2419,7 +2420,7 @@ mod test {
         let k = r("000010", "000020");
         let ranges: Vec<(KeyBytes, KeyBytes)> = vec![];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![] as Vec<usize>
         );
 
@@ -2427,7 +2428,7 @@ mod test {
         let k = r("000020", "000030");
         let ranges = vec![r("000010", "000020"), r("000030", "000040")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0, 1]
         );
 
@@ -2435,7 +2436,7 @@ mod test {
         let k = r("000000", "000005");
         let ranges = vec![r("000010", "000020")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![] as Vec<usize>
         );
 
@@ -2443,7 +2444,7 @@ mod test {
         let k = r("000015", "000025");
         let ranges = vec![r("000010", "000020")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2451,7 +2452,7 @@ mod test {
         let k = r("000000", "000000"); // A delete key
         let ranges = vec![r("000000", "000000"), r("000010", "000020")]; // A range for the delete key
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2459,7 +2460,7 @@ mod test {
         let k = r("000000", "000010");
         let ranges = vec![r("000010", "000020")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
 
@@ -2467,7 +2468,7 @@ mod test {
         let k = r("000020", "000030");
         let ranges = vec![r("000010", "000020")];
         assert_eq!(
-            super::LevelStorege::<Memstore>::key_range_overlap(k, &ranges),
+            super::LevelStorage::<Memstore>::key_range_overlap(k, &ranges),
             vec![0]
         );
     }
@@ -2705,9 +2706,9 @@ mod test {
             vec![table_1.clone(), table_2.clone(), table_3.clone()],
             false,
         );
-        let mut level_storage = LevelStorege::new(
+        let mut level_storage = LevelStorage::new(
             vec![level0_empty, level1],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         let input_tables = vec![table_1, table_2, table_3]; // These are the tables to compact
@@ -2763,9 +2764,9 @@ mod test {
 
         let level0_empty = super::Level::new(vec![], true); // Empty level 0
         let level1 = super::Level::new(vec![table_l1_a.clone(), table_l1_b.clone()], false);
-        let mut level_storage = super::LevelStorege::new(
+        let mut level_storage = super::LevelStorage::new(
             vec![level0_empty, level1],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Create a new table (table_c) that will be compacted into level 1.
@@ -2826,7 +2827,7 @@ mod test {
         let level0 = super::Level::new(vec![table_l0_a.clone(), table_l0_b.clone()], true);
         let level1 = super::Level::new(vec![table_l1_x.clone(), table_l1_y.clone()], false);
         let mut level_storage =
-            super::LevelStorege::new(vec![level0, level1], LevelStoregeConfig::config_for_test());
+            super::LevelStorage::new(vec![level0, level1], LevelStorageConfig::config_for_test());
 
         // Perform compaction
         let input_tables = vec![table_l0_a.clone(), table_l0_b.clone()];
@@ -2925,9 +2926,9 @@ mod test {
 
         let level0_case2 = super::Level::new(vec![table_l0_c.clone(), table_l0_d.clone()], true);
         let level1_case2 = super::Level::new(vec![table_l1_z.clone(), table_l1_w.clone()], false);
-        let mut level_storage_case2 = super::LevelStorege::new(
+        let mut level_storage_case2 = super::LevelStorage::new(
             vec![level0_case2, level1_case2],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
 
         // Perform compaction
@@ -3001,9 +3002,9 @@ mod test {
     /// Tests the `table_num_in_levels` method to ensure it correctly reports the number of tables in each level.
     #[test]
     fn test_table_len_in_levels() {
-        // Case 1: Empty LevelStorege
+        // Case 1: Empty LevelStorage
         let empty_storage =
-            LevelStorege::<Memstore>::new(vec![], LevelStoregeConfig::config_for_test());
+            LevelStorage::<Memstore>::new(vec![], LevelStorageConfig::config_for_test());
         assert_eq!(empty_storage.table_num_in_levels(), vec![] as Vec<usize>);
 
         // Case 2: Single level with tables
@@ -3011,7 +3012,7 @@ mod test {
         let table2 = Arc::new(create_test_table_with_id(10..20, 2));
         let level0 = Level::new(vec![table1.clone(), table2.clone()], true);
         let storage_single_level =
-            LevelStorege::new(vec![level0], LevelStoregeConfig::config_for_test());
+            LevelStorage::new(vec![level0], LevelStorageConfig::config_for_test());
         assert_eq!(storage_single_level.table_num_in_levels(), vec![2]);
 
         // Case 3: Multiple levels with different table counts
@@ -3023,23 +3024,23 @@ mod test {
         let table6 = Arc::new(create_test_table_with_id(50..60, 6));
         let level3 = Level::new(vec![table4, table5, table6], false);
 
-        let storage_multi_level = LevelStorege::new(
+        let storage_multi_level = LevelStorage::new(
             vec![
                 Level::new(vec![table1, table2], true), // Level 0: 2 tables
                 level1,                                 // Level 1: 1 table
                 level2,                                 // Level 2: 0 tables
                 level3,                                 // Level 3: 3 tables
             ],
-            LevelStoregeConfig::config_for_test(),
+            LevelStorageConfig::config_for_test(),
         );
         assert_eq!(storage_multi_level.table_num_in_levels(), vec![2, 1, 0, 3]);
     }
 
     #[test]
     fn test_push_new_table() {
-        // Create an empty LevelStorege
+        // Create an empty LevelStorage
         let mut level_storage =
-            LevelStorege::<Memstore>::new(vec![], LevelStoregeConfig::config_for_test());
+            LevelStorage::<Memstore>::new(vec![], LevelStorageConfig::config_for_test());
         let mut next_id: StoreId = 100;
 
         // Case 1: Push data that fits into one table
@@ -3120,7 +3121,7 @@ mod test {
 
         // Reset storage for this case
         let mut level_storage_multi =
-            LevelStorege::<Memstore>::new(vec![], LevelStoregeConfig::config_for_test());
+            LevelStorage::<Memstore>::new(vec![], LevelStorageConfig::config_for_test());
         let mut next_id_multi: StoreId = 200;
 
         // Create enough data to likely span multiple tables.
