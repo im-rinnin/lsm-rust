@@ -179,9 +179,25 @@ impl<T: Store> TableReader<T> {
             .partition_point(|meta| meta.first_key.as_ref().le(key.as_ref()))
             .saturating_sub(1); // saturating_sub(1) handles the case where partition_point returns 0
 
+        // Expand left to cover contiguous blocks whose key range still contains `key`.
+        // Blocks are size-bounded, not key-run bounded. That means a long run of the
+        // same logical key (multiple versions with different OpIds) can span multiple
+        // adjacent blocks. Starting from the last block whose first_key <= key is a good
+        // heuristic to skip irrelevant earlier blocks, but it can miss older versions if
+        // the run actually started in a previous block. To handle this, expand left over
+        // any contiguous blocks whose [first_key, last_key] still contain `key`.
+        let mut left_idx = start_idx;
+        while left_idx > 0 {
+            let prev = &self.block_metas[left_idx - 1];
+            if key.as_ref() < prev.first_key.as_ref() || key.as_ref() > prev.last_key.as_ref() {
+                break;
+            }
+            left_idx -= 1;
+        }
+
         let mut block_buffer_data = Option::Some(vec![0; DATA_BLOCK_SIZE]);
-        // Iterate through blocks from the determined starting point.
-        for i in start_idx..self.block_metas.len() {
+        // Iterate through blocks from the adjusted starting point.
+        for i in left_idx..self.block_metas.len() {
             let block_meta = &self.block_metas[i];
 
             // Optimization: If the current block's first key is already greater than the search key,
@@ -202,7 +218,7 @@ impl<T: Store> TableReader<T> {
             self.store.read_at(&mut data, offset);
             let block_reader = BlockReader::new(data);
 
-            if let Some((current_op_type, op_id_found)) = block_reader.search(&key, id) {
+            if let Some((current_op_type, op_id_found)) = block_reader.search(key, id) {
                 // current_op_type is already OpType, no need for conversion
                 match best_op {
                     Some((_, current_best_id)) => {
@@ -368,14 +384,14 @@ impl<T: Store> TableBuilder<T> {
     /// # Arguments
     /// * `last_key` - The last key contained in the block being flushed.
     fn flush_current_block(&mut self) {
+        if self.block_builder.is_empty() {
+            return; // Nothing to flush
+        }
+
         let last_key = self
             .block_builder
             .last_key()
             .expect("Block should have a last key if it's full and add failed");
-
-        if self.block_builder.is_empty() {
-            return; // Nothing to flush
-        }
 
         let first_key = self
             .current_block_first_key
@@ -740,6 +756,57 @@ pub mod test {
             Some((OpType::Write(1.to_string().as_bytes().into()), 1)),
             "Should find the non-duplicated key"
         );
+    }
+
+    #[test]
+    fn test_table_reader_find_with_duplicate_key_spanning_blocks() {
+        // Build a table where the same key appears many times so that
+        // its versions span multiple blocks. Then verify lookups for
+        // both a very large op_id (latest) and a very small op_id (earliest)
+        // succeed across block boundaries.
+
+        // Choose a fixed key and generate many versions with increasing ids
+        let key_str = pad_zero(123);
+
+        // Create many operations for the same key with relatively large values
+        // so we cross DATA_BLOCK_SIZE and span multiple blocks.
+        // Each op is ~ (id+key_len+key+type+val_len+val) bytes; a 100-byte value
+        // makes it easy to exceed a 4KB block within a few dozen entries.
+        let versions = 300usize;
+        let value_payload = vec![b'v'; 100];
+        let mut ops: Vec<KVOperation> = Vec::with_capacity(versions);
+        for i in 0..versions {
+            ops.push(KVOperation::new(
+                i as u64,
+                KeyBytes::from(key_str.as_bytes()),
+                OpType::Write(value_payload.as_slice().into()),
+            ));
+        }
+
+        // Table build
+        let store_id = 105u64; // unique id for this test
+        let mut tb = TableBuilder::<Memstore>::new_with_id(store_id);
+        tb.fill_with_op(ops.iter());
+        let table_reader = tb.flush();
+
+        // Ensure we indeed spanned at least two blocks
+        assert!(
+            table_reader.block_metas.len() >= 2,
+            "Expected multiple blocks for the same key"
+        );
+
+        // Search with a very large op_id to get the latest version
+        let search_key = KeySlice::from(key_str.as_bytes());
+        let latest = table_reader
+            .find(&search_key, u64::MAX)
+            .expect("should find latest version across blocks");
+        assert_eq!(latest.1, (versions - 1) as u64);
+
+        // Search with a very small op_id that should be located in the earliest block
+        let earliest = table_reader
+            .find(&search_key, 0)
+            .expect("should find earliest version across blocks");
+        assert_eq!(earliest.1, 0u64);
     }
     #[test]
     fn test_table_reader_find() {

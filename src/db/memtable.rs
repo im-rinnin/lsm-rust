@@ -37,11 +37,13 @@ impl Memtable {
     }
     pub fn get(&self, q: &KeyQuery) -> SearchResult {
         let range_start_bound = (q.key.clone(), 0);
-        // Use an inclusive upper bound to avoid overflow when q.op_id == u64::MAX
-        for entry in self
+        // Use an inclusive upper bound to avoid overflow when q.op_id == u64::MAX.
+        // Fetch only the last item efficiently to avoid a never_loop pattern.
+        if let Some(entry) = self
             .table
             .range(range_start_bound..=(q.key.clone(), q.op_id))
             .rev()
+            .next()
         {
             let (_entry_key, entry_op_id) = entry.key();
             let entry_op_type = entry.value();
