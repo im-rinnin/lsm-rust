@@ -199,7 +199,7 @@ impl TableChange {
             }
         }
         // Remove trailing empty levels that might have been created but remain empty
-        while levels.last().map_or(false, |l| l.is_empty()) {
+        while levels.last().is_some_and(|l| l.is_empty()) {
             levels.pop();
         }
         levels
@@ -703,7 +703,7 @@ impl<T: Store> LevelStorage<T> {
                 tables_from_target_to_compact.push(table.clone()); // Clone Arc for compaction
                 table_change.push(TableChange {
                     id: table.store_id(),
-                    index: index, // This index refers to the original position in target_level
+                    index, // This index refers to the original position in target_level
                     level: target_level,
                     change_type: ChangeType::Delete,
                 });
@@ -3138,7 +3138,7 @@ mod test {
 
         let initial_table_count = level_storage_multi
             .levels
-            .get(0)
+            .first()
             .map_or(0, |l| l.sstables.len());
         level_storage_multi.push_new_table(large_data.into_iter(), &mut next_id_multi);
 
