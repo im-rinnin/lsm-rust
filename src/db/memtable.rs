@@ -13,11 +13,9 @@ pub struct Memtable {
     current_size_bytes: AtomicUsize,
 }
 
+// can we remove peeked_entry and just use inner_iter.peek()?
 pub struct MemtableIterator<'a> {
-    inner_iter: crossbeam_skiplist::map::Iter<'a, (KeyBytes, OpId), OpType>,
-    // This field stores the current entry that has been "peeked" from `inner_iter`
-    // but not yet processed (i.e., its key group hasn't been fully deduplicated).
-    peeked_entry: Option<Entry<'a, (KeyBytes, OpId), OpType>>,
+    inner_iter: std::iter::Peekable<crossbeam_skiplist::map::Iter<'a, (KeyBytes, OpId), OpType>>,
 }
 
 impl Memtable {
@@ -65,11 +63,8 @@ impl Memtable {
     }
 
     pub fn to_iter<'a>(&'a self) -> MemtableIterator<'a> {
-        let mut iter = self.table.iter();
-        let first_entry = iter.next(); // Pre-fetch the very first item
         MemtableIterator {
-            inner_iter: iter,
-            peeked_entry: first_entry,
+            inner_iter: self.table.iter().peekable(),
         }
     }
 
@@ -83,55 +78,29 @@ impl<'a> Iterator for MemtableIterator<'a> {
     type Item = KVOperation;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Get the current candidate entry. If `peeked_entry` is `None`, try to fetch from `inner_iter`.
-        let mut best_entry = match self.peeked_entry.take() {
-            Some(entry) => entry,
-            None => {
-                // If `peeked_entry` was `None`, try to get the next from the underlying iterator.
-                // If that's also `None`, then the iterator is exhausted.
-                self.inner_iter.next()?
-            }
-        };
+        // Start with the first entry of the current key group.
+        let mut best_entry = self.inner_iter.next()?;
 
-        // Establish the key we are currently processing.
-        // We clone here to own the KeyBytes, so it doesn't borrow `best_entry`.
-        // This allows `best_entry` to be reassigned later without borrow conflicts.
+        // Clone the key to own it for comparisons while we move the iterator.
         let current_group_key = best_entry.key().0.clone();
 
-        // Loop to find the last (max OpId) entry for this `current_group_key`.
+        // Consume subsequent entries while they have the same key, keeping the latest.
         loop {
-            // Try to get the next raw entry from the inner iterator.
-            match self.inner_iter.next() {
-                Some(next_raw_entry) => {
-                    // Compare the key of the `next_raw_entry` with our `current_group_key`.
-                    if next_raw_entry.key().0 == current_group_key {
-                        // Same key: this `next_raw_entry` is newer (due to SkipMap's OpId sorting),
-                        // so it becomes the new `best_entry` for this key group.
-                        best_entry = next_raw_entry;
-                        // Continue the loop to find even newer versions of this same key.
-                    } else {
-                        // Different key encountered.
-                        // `best_entry` now holds the latest operation for the *previous* key group.
-                        // `next_raw_entry` is the first operation of the *new* key group.
-                        // Store `next_raw_entry` in `peeked_entry` for the *next* call to `next()`.
-                        self.peeked_entry = Some(next_raw_entry);
-                        break; // Exit inner loop; we've found our `best_entry` to return.
-                    }
-                }
-                None => {
-                    // Inner iterator exhausted. No more items.
-                    self.peeked_entry = None; // Explicitly clear, as nothing follows.
-                    break; // Exit inner loop; `best_entry` is the final one.
-                }
+            let same_key = match self.inner_iter.peek() {
+                Some(peeked) => peeked.key().0 == current_group_key,
+                None => false,
+            };
+            if !same_key {
+                break;
             }
+            // Safe to consume now; `peek()` borrow ends before this `.next()`.
+            best_entry = self.inner_iter.next().unwrap();
         }
 
-        // Convert the `best_entry` (which is the latest for its key group)
-        // into the `KVOperation` to be returned.
         Some(KVOperation {
             id: best_entry.key().1,
-            key: best_entry.key().0.clone(), // Clone the KeyBytes for ownership
-            op: best_entry.value().clone(),  // Clone the OpType for ownership
+            key: best_entry.key().0.clone(),
+            op: best_entry.value().clone(),
         })
     }
 }

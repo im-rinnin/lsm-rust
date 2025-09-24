@@ -815,9 +815,9 @@ pub mod test {
 
     #[test]
     fn test_table_builder_add_oversized_op_does_not_panic_and_returns_false() {
+        use crate::db::block::DATA_BLOCK_SIZE;
         use crate::db::common::OpType;
         use crate::db::store::Memstore;
-        use crate::db::block::DATA_BLOCK_SIZE;
 
         // Construct a KVOperation whose encoded size cannot fit in an empty block.
         // op_size = 8(id) + 8(key_len) + key_len + 1(tag) + 8(val_len) + val_len
