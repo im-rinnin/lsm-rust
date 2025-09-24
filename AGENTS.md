@@ -63,3 +63,10 @@
   - Key/Value refactor to `KeyBytes`/`ValueByte`; removed `KeyVec`/`ValueVec`
   - Unit tests across memtable/levels/log/table; zero-copy KV read
   - Block format aligned with mini LSM; configs plumbed; tracing logs
+
+## Recent Commits
+- 59b82af: Merge remote-tracking branch 'origin/master'
+- ac98427: fix(store): enforce append-only seek and efficient file growth in Filestore
+- 9333ec5: fix(memtable): use inclusive range in get to avoid op_id overflow at u64::MAX
+- f289250: test: verify Filestore persists on drop
+- fbed85d: refactor!: unify Store::open API; remove single-arg open; add Memstore::open_for_test; update call sites

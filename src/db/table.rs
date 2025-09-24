@@ -202,7 +202,7 @@ impl<T: Store> TableReader<T> {
             self.store.read_at(&mut data, offset);
             let block_reader = BlockReader::new(data);
 
-            if let Some((current_op_type, op_id_found)) = block_reader.search(&key, id) {
+            if let Some((current_op_type, op_id_found)) = block_reader.search(key, id) {
                 // current_op_type is already OpType, no need for conversion
                 match best_op {
                     Some((_, current_best_id)) => {
