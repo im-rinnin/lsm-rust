@@ -657,7 +657,7 @@ pub mod test {
         let table = tb.flush();
 
         let meta = &table.block_metas;
-        let lasy_key = &meta.last().expect("block_metas empty").last_key;
+        let last_key = &meta.last().expect("block_metas empty").last_key;
 
         let table_iter = table.to_iter();
         let mut kv_index = 0; // Track index in the original kvs Vec
@@ -676,7 +676,7 @@ pub mod test {
         // table has not enough space to save all kv
         assert!(kv_index < num);
         // check kv num
-        let lasy_key_string = lasy_key.to_string();
+        let lasy_key_string = last_key.to_string();
         assert_eq!(kv_index, lasy_key_string.parse::<usize>().unwrap() + 1);
     }
 
