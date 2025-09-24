@@ -178,23 +178,16 @@ impl Store for Filestore {
     fn seek(&mut self, position: usize) {
         use std::io::{Seek, SeekFrom};
 
-        let current_pos = self.f.seek(SeekFrom::Current(0)).unwrap() as usize;
+        // Enforce append-only semantics: do not allow seeking into already-written region
+        let file_len = self.len();
         assert!(
-            current_pos <= position,
-            "Seeking backwards is not allowed in append-only store logic"
+            file_len <= position,
+            "Seeking into existing data is not allowed in append-only store"
         );
 
-        let file_len = self.len();
-
         if position > file_len {
-            // Need to pad
-            let padding_size = position - file_len;
-            // Seek to the end to append padding
-            self.f.seek(SeekFrom::End(0)).unwrap();
-            // Write zeros
-            // Consider writing in chunks for large padding? For now, a single write.
-            let padding = vec![0u8; padding_size];
-            self.f.write_all(&padding).unwrap();
+            // Efficiently grow the file with zeros without allocating a large buffer
+            self.f.set_len(position as u64).unwrap();
         }
         // Ensure the cursor is at the desired final position
         self.f.seek(SeekFrom::Start(position as u64)).unwrap();
