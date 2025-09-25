@@ -41,15 +41,15 @@ pub struct TableChange {
     change_type: ChangeType,
 }
 
+// compact table from input_level to target_level
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableChanges {
-    // compact table from level_low to high_level
     // low_level is the level where the compaction starts
     input_level: usize,
-    delete_tables: Vec<StoreId>,
-    // (index, id) in high level
-    // sorted by index
-    add_tables: Vec<(usize, StoreId)>,
+    // table change entries from the input level (deletes/adds)
+    input_table_changes: Vec<TableChange>,
+    // table change entries applied to the target level (deletes/adds)
+    target_table_changes: Vec<TableChange>,
 }
 
 // level change 0: [table_change_count(u64)][table_change_entry_0][table_change_entry_1][check_sum of all table change]
@@ -79,8 +79,8 @@ impl TableChanges {
     fn new(level_start: usize) -> Self {
         TableChanges {
             input_level: level_start,
-            delete_tables: Vec::new(),
-            add_tables: Vec::new(),
+            input_table_changes: Vec::new(),
+            target_table_changes: Vec::new(),
         }
     }
     fn encode<W: Write>(&self, writer: &mut W) {
@@ -91,26 +91,60 @@ impl TableChanges {
             .write_u64::<LittleEndian>(self.input_level as u64)
             .unwrap();
 
-        // Write delete table count and each id
+        // Write input_table_changes count and all entries
         writer
-            .write_u64::<LittleEndian>(self.delete_tables.len() as u64)
+            .write_u64::<LittleEndian>(self.input_table_changes.len() as u64)
             .unwrap();
-        for id in &self.delete_tables {
-            writer.write_u64::<LittleEndian>(*id).unwrap();
+        for change in &self.input_table_changes {
+            change.encode(writer);
         }
 
-        // Write add table count and each (index, id) pair
+        // Write target_table_changes count and all entries
         writer
-            .write_u64::<LittleEndian>(self.add_tables.len() as u64)
+            .write_u64::<LittleEndian>(self.target_table_changes.len() as u64)
             .unwrap();
-        for (index, id) in &self.add_tables {
-            writer.write_u64::<LittleEndian>(*index as u64).unwrap();
-            writer.write_u64::<LittleEndian>(*id).unwrap();
+        for change in &self.target_table_changes {
+            change.encode(writer);
         }
     }
 
     fn decode<R: Read>(mut data: R) -> Self {
-        todo!()
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        // Read input_level
+        let input_level = data
+            .read_u64::<LittleEndian>()
+            .expect("failed to read input_level") as usize;
+
+        // Read input_table_changes
+        let input_count = data
+            .read_u64::<LittleEndian>()
+            .expect("failed to read input_table_changes count") as usize;
+        let mut input_table_changes = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            let mut buf = [0u8; TABLE_CHANGE_ENCODED_SIZE];
+            data.read_exact(&mut buf)
+                .expect("failed to read TableChange (input)");
+            input_table_changes.push(TableChange::decode(&buf[..]));
+        }
+
+        // Read target_table_changes
+        let target_count = data
+            .read_u64::<LittleEndian>()
+            .expect("failed to read target_table_changes count") as usize;
+        let mut target_table_changes = Vec::with_capacity(target_count);
+        for _ in 0..target_count {
+            let mut buf = [0u8; TABLE_CHANGE_ENCODED_SIZE];
+            data.read_exact(&mut buf)
+                .expect("failed to read TableChange (target)");
+            target_table_changes.push(TableChange::decode(&buf[..]));
+        }
+
+        TableChanges {
+            input_level,
+            input_table_changes,
+            target_table_changes,
+        }
     }
 }
 impl TableChange {
@@ -601,7 +635,7 @@ impl<T: Store> LevelStorage<T> {
             self.split_target_level_tables(target_level, &target_overlap_index_set);
 
         // 4–5) Merge-compact and emit new SSTables (Add changes)
-        let (compacted_tables, mut add_changes) = Self::compact_tables_from_sets(
+        let compacted_tables = Self::compact_tables_from_sets(
             tables_to_compact_from_input,
             tables_from_target_to_compact,
             target_level == self.levels.len() - 1 && target_level > 0,
@@ -609,9 +643,8 @@ impl<T: Store> LevelStorage<T> {
             self.config.table_config,
             target_level,
         );
-        table_change.append(&mut add_changes);
 
-        // 6) assamble target level and re-index Add entries
+        // 6) assamble target level and add Add table changes
         Self::assemble_target_level(
             &mut self.levels[target_level].sstables,
             pass_through_input_tables,
@@ -644,16 +677,27 @@ impl<T: Store> LevelStorage<T> {
         let mut target_overlap_index_set = HashSet::new();
         let mut input_no_overlap_index_set = HashSet::new();
 
-        let target_level_key_value_range =
-            Self::get_target_level_key_ranges(&self.levels.get(target_level).unwrap().sstables);
+        // Build sorted target ranges but keep a mapping back to original indices
+        let target_sstables_ref = &self.levels.get(target_level).unwrap().sstables;
+        let mut sorted_ranges_with_index: Vec<(usize, (KeyBytes, KeyBytes))> = target_sstables_ref
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.key_range()))
+            .collect();
+        sorted_ranges_with_index.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
+        let target_level_key_value_range: Vec<(KeyBytes, KeyBytes)> =
+            sorted_ranges_with_index.iter().map(|(_, r)| r.clone()).collect();
 
         for (input_index, table) in input_tables.iter().enumerate() {
             let key_range = table.key_range();
-            let table_index = Self::key_range_overlap(key_range, &target_level_key_value_range);
-            if table_index.is_empty() {
+            let sorted_hits = Self::key_range_overlap(key_range, &target_level_key_value_range);
+            if sorted_hits.is_empty() {
                 input_no_overlap_index_set.insert(input_index);
             } else {
-                target_overlap_index_set.extend(table_index);
+                for sorted_idx in sorted_hits {
+                    let original_idx = sorted_ranges_with_index[sorted_idx].0;
+                    target_overlap_index_set.insert(original_idx);
+                }
             }
         }
 
@@ -729,7 +773,7 @@ impl<T: Store> LevelStorage<T> {
         store_id_start: &mut u64,
         table_config: TableConfig,
         target_level: usize,
-    ) -> (Vec<ThreadSafeTableReader<T>>, Vec<TableChange>) {
+    ) -> Vec<ThreadSafeTableReader<T>> {
         // Build merged iterator locally within this function scope
         let mut all_tables_for_merge =
             Vec::with_capacity(tables_from_input.len() + tables_from_target.len());
@@ -762,7 +806,6 @@ impl<T: Store> LevelStorage<T> {
             Box::new(kv_iter_agg)
         };
         let mut compacted_tables = Vec::new();
-        let mut table_change = Vec::new();
 
         if let Some(mut op) = final_iter.next() {
             let mut table_builder = TableBuilder::new_with_id_config(*store_id_start, table_config);
@@ -771,11 +814,6 @@ impl<T: Store> LevelStorage<T> {
             loop {
                 if !table_builder.add(op.clone()) {
                     let new_table_reader = table_builder.flush();
-                    table_change.push(TableChange {
-                        id: new_table_reader.store_id(),
-                        index: 0,
-                        change_type: ChangeType::Add,
-                    });
                     compacted_tables.push(Arc::new(new_table_reader));
 
                     table_builder = TableBuilder::new_with_id_config(*store_id_start, table_config);
@@ -790,11 +828,6 @@ impl<T: Store> LevelStorage<T> {
                 } else {
                     if !table_builder.is_empty() {
                         let new_table_reader = table_builder.flush();
-                        table_change.push(TableChange {
-                            id: new_table_reader.store_id(),
-                            index: 0,
-                            change_type: ChangeType::Add,
-                        });
                         compacted_tables.push(Arc::new(new_table_reader));
                     }
                     break;
@@ -802,7 +835,7 @@ impl<T: Store> LevelStorage<T> {
             }
         }
 
-        (compacted_tables, table_change)
+        compacted_tables
     }
 
     /// Assembles the target level after compaction by merging:
@@ -818,14 +851,12 @@ impl<T: Store> LevelStorage<T> {
         target_level: usize,
         table_change: &mut Vec<TableChange>,
     ) {
+        // Capture IDs of tables that are newly added to the target level
+        let mut new_ids: HashSet<u64> = HashSet::new();
+        new_ids.extend(pass_through_input_tables.iter().map(|t| t.store_id()));
+        new_ids.extend(compacted_tables.iter().map(|t| t.store_id()));
+
         let mut final_tables_for_target_level = Vec::new();
-        for table in &pass_through_input_tables {
-            table_change.push(TableChange {
-                index: 0,
-                id: table.store_id(),
-                change_type: ChangeType::Add,
-            });
-        }
         final_tables_for_target_level.extend(pass_through_input_tables);
         final_tables_for_target_level.extend(compacted_tables);
         final_tables_for_target_level.extend(tables_to_pass_through_target);
@@ -834,23 +865,11 @@ impl<T: Store> LevelStorage<T> {
 
         *target_sstables = final_tables_for_target_level;
 
-        let mut current_level_tables_ids: HashMap<u64, usize> = HashMap::new();
+        // Emit Add changes only for newly added tables with their final indices
         for (idx, table) in target_sstables.iter().enumerate() {
-            current_level_tables_ids.insert(table.store_id(), idx);
-        }
-
-        for change in table_change.iter_mut() {
-            if change.change_type == ChangeType::Add {
-                if let Some(&new_index) = current_level_tables_ids.get(&change.id) {
-                    change.index = new_index;
-                } else {
-                    tracing::error!(
-                        id = change.id,
-                        level = target_level,
-                        "Added table ID not found in final target level after sort"
-                    );
-                    // keep original index to avoid panic; continue
-                }
+            let id = table.store_id();
+            if new_ids.contains(&id) {
+                table_change.push(TableChange { index: idx, id, change_type: ChangeType::Add });
             }
         }
     }
@@ -1211,6 +1230,102 @@ mod test {
         // test find key < table a min key ("000000")
         let key_lt_a = KeySlice::from("0".as_bytes()); // Lexicographically smaller than "000000"
         assert_level_find_and_check(&level, &key_lt_a, None);
+    }
+
+    #[test]
+    fn test_compaction_add_indices_final_and_no_add_for_existing() {
+        // Build target level (level 1) with one pass-through table and one overlapping table
+        let t_pass_through_target = Arc::new(create_test_table_with_id(300..350, 100));
+        let t_overlap_target = Arc::new(create_test_table_with_id(50..150, 101));
+
+        // Level 0 input tables: two overlapping (to be compacted) + one pass-through input
+        let i1 = Arc::new(create_test_table_with_id(0..60, 11));
+        let i2 = Arc::new(create_test_table_with_id(120..200, 12));
+        let i_pass_through = Arc::new(create_test_table_with_id(500..550, 10));
+
+        // Assemble storage with L0 empty placeholder and L1 as target
+        let level0 = super::Level::new(vec![], true);
+        let level1 = super::Level::new(
+            vec![t_pass_through_target.clone(), t_overlap_target.clone()],
+            false,
+        );
+        let mut level_storage =
+            super::LevelStorage::new(vec![level0, level1], LevelStorageConfig::config_for_test());
+
+        let input_tables = vec![i1.clone(), i2.clone(), i_pass_through.clone()];
+        let mut store_id_start = 1000;
+        let changes = level_storage.compact_level(&mut store_id_start, input_tables, 0);
+
+        // Collect final target level view
+        let target_level = &level_storage.levels[1];
+        assert!(
+            !target_level.sstables.is_empty(),
+            "target level should have tables after compaction"
+        );
+
+        // All Add changes must point to final indices
+        let add_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Add)
+            .cloned()
+            .collect();
+        assert!(
+            !add_changes.is_empty(),
+            "should emit Add changes for new/inserted tables"
+        );
+        for ch in &add_changes {
+            let pos = target_level
+                .sstables
+                .iter()
+                .enumerate()
+                .find(|(_, t)| t.store_id() == ch.id)
+                .map(|(idx, _)| idx)
+                .expect("added table id must exist in target level");
+            assert_eq!(pos, ch.index, "Add index must equal final position");
+        }
+
+        // No Add changes for pass-through existing target tables
+        let existing_target_id = t_pass_through_target.store_id();
+        assert!(
+            !add_changes.iter().any(|c| c.id == existing_target_id),
+            "should not emit Add for untouched existing target tables"
+        );
+
+        // The number of Add changes equals new tables (pass-through input + compacted outputs)
+        // new_tables = final_count - existing_pass_through_target_count(=1)
+        let expected_adds = target_level.sstables.len() - 1;
+        assert_eq!(add_changes.len(), expected_adds);
+    }
+
+    #[test]
+    fn test_compaction_delete_indices_match_original_positions() {
+        // Build target level (level 1) with known ordering
+        let t_keep = Arc::new(create_test_table_with_id(300..350, 200)); // index 0
+        let t_delete = Arc::new(create_test_table_with_id(50..150, 201)); // index 1 (overlaps)
+
+        // Inputs overlap with t_delete
+        let i1 = Arc::new(create_test_table_with_id(0..60, 21));
+        let i2 = Arc::new(create_test_table_with_id(120..200, 22));
+
+        let level0 = super::Level::new(vec![], true);
+        let level1 = super::Level::new(vec![t_keep.clone(), t_delete.clone()], false);
+        let mut level_storage =
+            super::LevelStorage::new(vec![level0, level1], LevelStorageConfig::config_for_test());
+
+        let input_tables = vec![i1.clone(), i2.clone()];
+        let mut store_id_start = 2000;
+        let changes = level_storage.compact_level(&mut store_id_start, input_tables, 0);
+
+        // Expect exactly one Delete for the overlapping target table at its original index (1)
+        let delete_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Delete)
+            .cloned()
+            .collect();
+        assert_eq!(delete_changes.len(), 1, "exactly one Delete expected");
+        let del = &delete_changes[0];
+        assert_eq!(del.id, t_delete.store_id());
+        assert_eq!(del.index, 1, "Delete index must match original position");
     }
     #[test]
     fn test_search_in_level_storage() {
