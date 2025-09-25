@@ -1006,7 +1006,6 @@ mod test {
     use super::LevelStorageConfig;
     use std::ops::Range;
     use std::sync::Arc; // Moved from test functions
-    const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4; // Moved here for local test scope
 
     use crc32fast::Hasher;
 
