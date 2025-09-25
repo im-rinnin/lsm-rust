@@ -20,7 +20,7 @@ use crate::db::table::TableReader;
 use super::key::KeySlice;
 use super::level;
 use super::level::LevelStorageConfig;
-use super::level::TableChange;
+use super::level::{TableChange, TableChanges};
 use super::store::StoreId;
 use super::table::TableConfig;
 use serde::{Deserialize, Serialize};
@@ -134,7 +134,7 @@ impl<T: Store> LsmStorage<T> {
         }
         tracing::info!("{}", debug_info);
     }
-    pub fn compact_level(&mut self, next_store_id: &mut StoreId) -> Vec<TableChange> {
+    pub fn compact_level(&mut self, next_store_id: &mut StoreId) -> Vec<TableChanges> {
         self.current.compact_storage(next_store_id)
     }
 

@@ -31,7 +31,7 @@ mod lsm_storage;
 mod memtable;
 mod snapshot;
 mod table;
-use level::TableChangeLog;
+use level::TableChangesLog;
 use logfile::LogFile;
 use lsm_storage::{LsmStorage, LsmStorageConfig};
 use once_cell::sync::Lazy;
@@ -206,7 +206,7 @@ impl LsmDB<Memstore> {
 
         let level_meta_log_store_id = store_id; // Use a different ID from logfile
         store_id += 1;
-        let level_meta_log = TableChangeLog::<Memstore>::from(level_meta_log_store_id);
+        let level_meta_log = TableChangesLog::<Memstore>::from(level_meta_log_store_id);
 
         // Initialize atomic counters
         let initial_max_op_id = Arc::new(AtomicU64::new(0)); // Use a new variable name for clarity
@@ -369,7 +369,7 @@ impl<T: Store> LsmDB<T> {
 
     fn dump_and_compact_thread(
         current: Arc<RwLock<LsmStorage<T>>>,
-        mut meta: TableChangeLog<Memstore>,
+        mut meta: TableChangesLog<Memstore>,
         mut next_sstable_id: StoreId,
         compactor_stop_flag: Arc<Mutex<bool>>, // Renamed parameter
         config: Config,
@@ -425,9 +425,10 @@ impl<T: Store> LsmDB<T> {
                     info!("dont need compact return");
                     break;
                 }
-                let table_changes = lsm_storage_clone.compact_level(&mut next_sstable_id);
-                if table_changes.len() > 0 {
-                    meta.append(table_changes); // Persist changes to the TableChangeLog
+                let table_change_batches = lsm_storage_clone.compact_level(&mut next_sstable_id);
+                for batch in table_change_batches.into_iter() {
+                    // Append each batch atomically
+                    meta.append(&batch);
                 }
 
                 info!("after a compact cycle");

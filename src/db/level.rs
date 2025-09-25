@@ -27,7 +27,6 @@ const U32_SIZE: usize = std::mem::size_of::<u32>();
 // index (u64) + id (u64) + change_type (u8)
 const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 2 + std::mem::size_of::<u8>();
 const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
-const MAX_INPUT_TABLE_IN_COMPACT: usize = 1;
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub enum ChangeType {
     Add,    // encode to 0
@@ -52,10 +51,7 @@ pub struct TableChanges {
     target_table_changes: Vec<TableChange>,
 }
 
-// level change 0: [table_change_count(u64)][table_change_entry_0][table_change_entry_1][check_sum of all table change]
-pub struct TableChangeLog<T: Store> {
-    storage: T,
-}
+// Legacy TableChangeLog removed in favor of TableChangesLog
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct LevelStorageConfig {
@@ -108,43 +104,45 @@ impl TableChanges {
         }
     }
 
-    fn decode<R: Read>(mut data: R) -> Self {
+    fn decode<R: Read>(mut data: R) -> Result<Self> {
         use byteorder::{LittleEndian, ReadBytesExt};
 
         // Read input_level
         let input_level = data
             .read_u64::<LittleEndian>()
-            .expect("failed to read input_level") as usize;
+            .map_err(|e| anyhow::anyhow!("decode TableChanges input_level: {e}"))? as usize;
 
         // Read input_table_changes
         let input_count = data
             .read_u64::<LittleEndian>()
-            .expect("failed to read input_table_changes count") as usize;
+            .map_err(|e| anyhow::anyhow!("decode TableChanges input_count: {e}"))? as usize;
         let mut input_table_changes = Vec::with_capacity(input_count);
         for _ in 0..input_count {
             let mut buf = [0u8; TABLE_CHANGE_ENCODED_SIZE];
-            data.read_exact(&mut buf)
-                .expect("failed to read TableChange (input)");
-            input_table_changes.push(TableChange::decode(&buf[..]));
+            data
+                .read_exact(&mut buf)
+                .map_err(|e| anyhow::anyhow!("decode TableChanges input TableChange: {e}"))?;
+            input_table_changes.push(TableChange::decode(&buf[..])?);
         }
 
         // Read target_table_changes
         let target_count = data
             .read_u64::<LittleEndian>()
-            .expect("failed to read target_table_changes count") as usize;
+            .map_err(|e| anyhow::anyhow!("decode TableChanges target_count: {e}"))? as usize;
         let mut target_table_changes = Vec::with_capacity(target_count);
         for _ in 0..target_count {
             let mut buf = [0u8; TABLE_CHANGE_ENCODED_SIZE];
-            data.read_exact(&mut buf)
-                .expect("failed to read TableChange (target)");
-            target_table_changes.push(TableChange::decode(&buf[..]));
+            data
+                .read_exact(&mut buf)
+                .map_err(|e| anyhow::anyhow!("decode TableChanges target TableChange: {e}"))?;
+            target_table_changes.push(TableChange::decode(&buf[..])?);
         }
 
-        TableChanges {
+        Ok(TableChanges {
             input_level,
             input_table_changes,
             target_table_changes,
-        }
+        })
     }
 }
 impl TableChange {
@@ -158,121 +156,125 @@ impl TableChange {
             })
             .unwrap();
     }
-    fn decode<R: Read>(mut data: R) -> Self {
+    fn decode<R: Read>(mut data: R) -> Result<Self> {
         use byteorder::{LittleEndian, ReadBytesExt};
 
-        let index = data.read_u64::<LittleEndian>().unwrap() as usize;
-        let id = data.read_u64::<LittleEndian>().unwrap();
-        let change_type_byte = data.read_u8().unwrap();
+        let index = data
+            .read_u64::<LittleEndian>()
+            .map_err(|e| anyhow::anyhow!("decode TableChange index: {e}"))? as usize;
+        let id = data
+            .read_u64::<LittleEndian>()
+            .map_err(|e| anyhow::anyhow!("decode TableChange id: {e}"))?;
+        let change_type_byte = data
+            .read_u8()
+            .map_err(|e| anyhow::anyhow!("decode TableChange change_type: {e}"))?;
         let change_type = match change_type_byte {
             0 => ChangeType::Add,
             1 => ChangeType::Delete,
-            _ => panic!("Unknown ChangeType byte: {}", change_type_byte),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unknown ChangeType byte: {}",
+                    change_type_byte
+                ))
+            }
         };
-        TableChange { index, id, change_type }
+        Ok(TableChange { index, id, change_type })
     }
 }
 
-impl TableChangeLog<Filestore> {
+
+// A log for persisting batches of TableChanges (variable-sized entries with checksums)
+pub struct TableChangesLog<T: Store> {
+    storage: T,
+}
+
+impl TableChangesLog<Filestore> {
     pub fn from_file(f: File, id: StoreId) -> Self {
-        TableChangeLog {
+        TableChangesLog {
             storage: Filestore::open_with_file(f, id),
         }
     }
 }
-impl<T: Store> TableChangeLog<T> {
+
+impl<T: Store> TableChangesLog<T> {
     pub fn from(id: StoreId) -> Self {
-        TableChangeLog {
-            storage: T::open(id, "table_changes", "data"),
+        TableChangesLog {
+            storage: T::open(id, "table_changes_batch", "data"),
         }
     }
 
     #[cfg(test)]
     pub fn new_with_store(storage: T) -> Self {
-        TableChangeLog { storage }
+        TableChangesLog { storage }
     }
 
-    pub fn append(&mut self, changes: Vec<TableChange>) {
-        // Write the number of changes as a u64
-        self.storage.append(&(changes.len() as u64).to_le_bytes());
+    // Entry format: [len(u64)] [payload bytes len] [checksum u32 over payload]
+    pub fn append(&mut self, changes: &TableChanges) {
+        let mut payload = Vec::new();
+        changes.encode(&mut payload);
 
-        // Write each TableChange entry
+        // write length
+        self.storage.append(&(payload.len() as u64).to_le_bytes());
+        // write payload
+        self.storage.append(&payload);
+        // checksum
         let mut hasher = Hasher::new();
-        for change in changes {
-            let mut buffer = Vec::new();
-            change.encode(&mut buffer);
-            hasher.update(&buffer); // Update checksum with each change's bytes
-            self.storage.append(&buffer);
-        }
+        hasher.update(&payload);
         let checksum = hasher.finalize();
-        self.storage.append(&checksum.to_le_bytes()); // Append the checksum
+        self.storage.append(&checksum.to_le_bytes());
         self.storage.flush();
     }
 
-    pub fn get_all_changes(&self) -> Result<Vec<TableChange>> {
+    pub fn get_all_batches(&self) -> Result<Vec<TableChanges>> {
         let storage_len = self.storage.len();
-        let mut all_decoded_changes = Vec::new();
-        let mut current_read_offset = 0;
+        let mut all = Vec::new();
+        let mut offset = 0usize;
 
-        while current_read_offset < storage_len {
-            // Read count (u64)
-            if current_read_offset + U64_SIZE > storage_len {
-                tracing::error!(
-                    offset = current_read_offset,
-                    remaining = storage_len - current_read_offset,
-                    "TableChangeLog: Corrupted log file - incomplete count header"
-                );
-                break;
+        while offset < storage_len {
+            if offset + U64_SIZE > storage_len {
+                return Err(anyhow::anyhow!(
+                    "TableChangesLog: incomplete length header at offset {}",
+                    offset
+                ));
             }
-            let mut count_buf = [0u8; U64_SIZE];
-            self.storage.read_at(&mut count_buf, current_read_offset);
-            let num_changes_in_batch = u64::from_le_bytes(count_buf) as usize;
-            current_read_offset += U64_SIZE;
+            let mut len_buf = [0u8; U64_SIZE];
+            self.storage.read_at(&mut len_buf, offset);
+            let payload_len = u64::from_le_bytes(len_buf) as usize;
+            offset += U64_SIZE;
 
-            let batch_changes_data_len = num_changes_in_batch * TABLE_CHANGE_ENCODED_SIZE;
-            let batch_expected_total_len = batch_changes_data_len + U32_SIZE; // Data + Checksum
-
-            if current_read_offset + batch_expected_total_len > storage_len {
-                tracing::error!(
-                    offset = current_read_offset,
-                    expected_total = batch_expected_total_len,
-                    remaining = storage_len - current_read_offset,
-                    "TableChangeLog: Corrupted log file - incomplete batch data or checksum"
-                );
-                break;
+            let expected_total = payload_len + U32_SIZE;
+            if offset + expected_total > storage_len {
+                return Err(anyhow::anyhow!(
+                    "TableChangesLog: incomplete payload/checksum at offset {}",
+                    offset
+                ));
             }
 
-            let mut hasher = Hasher::new();
-            let mut change_bytes_buf = [0u8; TABLE_CHANGE_ENCODED_SIZE];
+            let mut payload = vec![0u8; payload_len];
+            self.storage.read_at(&mut payload, offset);
+            offset += payload_len;
 
-            for _i in 0..num_changes_in_batch {
-                self.storage
-                    .read_at(&mut change_bytes_buf, current_read_offset);
-                hasher.update(&change_bytes_buf);
-
-                let decoded_change = TableChange::decode(&change_bytes_buf[..]);
-                all_decoded_changes.push(decoded_change);
-                current_read_offset += TABLE_CHANGE_ENCODED_SIZE;
-            }
-
-            // Read checksum (u32)
             let mut checksum_buf = [0u8; U32_SIZE];
-            self.storage.read_at(&mut checksum_buf, current_read_offset);
-            let expected_checksum = u32::from_le_bytes(checksum_buf);
-            current_read_offset += U32_SIZE;
+            self.storage.read_at(&mut checksum_buf, offset);
+            offset += U32_SIZE;
 
-            let calculated_checksum = hasher.finalize();
-            if calculated_checksum != expected_checksum {
-                tracing::error!(
-                    offset = current_read_offset - U32_SIZE,
-                    calculated = calculated_checksum,
-                    expected = expected_checksum,
-                    "TableChangeLog: Checksum mismatch detected for a batch; log might be corrupted"
-                );
-                return Err(anyhow::anyhow!("decode table change checksum"));
+            let expected_checksum = u32::from_le_bytes(checksum_buf);
+            let mut hasher = Hasher::new();
+            hasher.update(&payload);
+            let calculated = hasher.finalize();
+            if calculated != expected_checksum {
+                return Err(anyhow::anyhow!(
+                    "TableChangesLog: checksum mismatch (expected {}, got {})",
+                    expected_checksum,
+                    calculated
+                ));
             }
+
+            let decoded = TableChanges::decode(&payload[..])?;
+            all.push(decoded);
         }
-        Ok(all_decoded_changes)
+
+        Ok(all)
     }
 }
 
@@ -485,18 +487,16 @@ impl<T: Store> LevelStorage<T> {
     /// the current level with overlapping tables from the next level, creating
     /// new compacted tables, and updating the level metadata.
     ///
-    /// It returns a vector of `TableChange` events that describe the additions
-    /// and deletions of tables during the compaction process. These changes
-    /// should be persisted to the table change log.
+    /// It returns a vector of `TableChanges` batches, one per level compaction
+    /// executed in this call. Each batch contains the `input_level` and separate
+    /// change vectors for the input and target levels.
     ///
     /// # Arguments
     /// * `next_store_id` - The starting ID to use for newly created SSTable files.
     ///
-    /// # Returns
-    /// A `Vec<TableChange>` detailing all table additions and deletions that occurred.
-    pub fn compact_storage(&mut self, mut next_store_id: &mut u64) -> Vec<TableChange> {
+    pub fn compact_storage(&mut self, mut next_store_id: &mut u64) -> Vec<TableChanges> {
         info!("start compact storage");
-        let mut table_change = Vec::new();
+        let mut batches = Vec::new();
         // Iterate through all levels starting from level 0
         for level_depth in 0..self.levels.len() {
             // Check if this level needs compaction
@@ -511,7 +511,6 @@ impl<T: Store> LevelStorage<T> {
             if tables_to_compact.is_empty() {
                 continue; // Nothing to compact
             }
-            table_change.extend(table_changes_from_take_out);
 
             // Ensure we have a target level (level_depth + 1)
             let target_level_depth = level_depth + 1;
@@ -521,23 +520,19 @@ impl<T: Store> LevelStorage<T> {
             }
 
             // Perform compaction to the next level
-            let table_changes_from_compact_level =
+            let mut target_changes =
                 self.compact_level(&mut next_store_id, tables_to_compact, level_depth);
 
-            table_change.extend(table_changes_from_compact_level);
+            // Assemble TableChanges batch and record
+            let mut batch = TableChanges::new(level_depth);
+            batch.input_table_changes = table_changes_from_take_out;
+            batch.target_table_changes.append(&mut target_changes);
+            batches.push(batch);
 
             // After compacting one level, we might need to check if the target level
             // now also needs compaction, but we'll handle that in the next iteration
         }
-        for change in &table_change {
-            debug!(
-                index = change.index,
-                id = change.id,
-                change_type = ?change.change_type,
-                "table change during lsm compaction"
-            );
-        }
-        table_change
+        batches
     }
 
     /// Gets the overall key range (min and max keys) across a collection of tables.
@@ -590,12 +585,12 @@ impl<T: Store> LevelStorage<T> {
     /// 4) Build a merged iterator over all tables-to-compact; when compacting
     ///    into the deepest level, filter out Delete ops (tombstones) so they do
     ///    not persist further.
-    /// 5) Stream the merged KVs into one or more new SSTables, recording Add
-    ///    changes for each flushed table.
-    /// 6) assemble the target level by merging pass-through input tables,
+    /// 5) Stream the merged KVs into one or more new SSTables.
+    /// 6) Assemble the target level by merging pass-through input tables,
     ///    new compacted tables, and pass-through target tables; then sort by
-    ///    first key and re-index Add changes to reflect the final order.
-    /// 7) Return the complete list of TableChange entries.
+    ///    first key and emit Add changes with their final indices (no reindex step).
+    /// 7) Return the complete list of TableChange entries (Delete for removed target
+    ///    tables and Add for newly inserted tables with final indices).
     ///
     fn compact_level(
         &mut self,
@@ -745,9 +740,10 @@ impl<T: Store> LevelStorage<T> {
         let mut table_change = vec![];
         for (index, table) in current_target_sstables.into_iter().enumerate() {
             if target_overlap_index_set.contains(&index) {
-                tables_from_target_to_compact.push(table.clone());
+                let id = table.store_id();
+                tables_from_target_to_compact.push(table);
                 table_change.push(TableChange {
-                    id: table.store_id(),
+                    id,
                     index,
                     change_type: ChangeType::Delete,
                 });
@@ -1910,10 +1906,15 @@ mod test {
         // Perform compaction
         let mut start_id_case1 = 1000;
         let original_start_id = start_id_case1;
-        let table_changes = level_storage.compact_storage(&mut start_id_case1);
+        let table_batches = level_storage.compact_storage(&mut start_id_case1);
 
         // Find the maximum store ID among the newly added tables in level 1
-        let max_new_id_case1 = table_changes
+        let mut flat_changes: Vec<TableChange> = Vec::new();
+        for b in &table_batches {
+            flat_changes.extend(b.input_table_changes.clone());
+            flat_changes.extend(b.target_table_changes.clone());
+        }
+        let max_new_id_case1 = flat_changes
             .iter()
             .filter(|tc| tc.change_type == ChangeType::Add)
             .map(|tc| tc.id)
@@ -1928,11 +1929,11 @@ mod test {
         assert!(!level_storage.levels[1].sstables.is_empty()); // Level 1 has compacted data
 
         // Verify table_changes
-        let delete_changes: Vec<_> = table_changes
+        let delete_changes: Vec<_> = flat_changes
             .iter()
             .filter(|tc| tc.change_type == ChangeType::Delete)
             .collect();
-        let add_changes: Vec<_> = table_changes
+        let add_changes: Vec<_> = flat_changes
             .iter()
             .filter(|tc| tc.change_type == ChangeType::Add)
             .collect();
@@ -2005,10 +2006,15 @@ mod test {
 
         // Perform compaction
         let mut start_id_case2 = 2000;
-        let table_changes_case2 = level_storage_multi.compact_storage(&mut start_id_case2);
+        let table_batches_case2 = level_storage_multi.compact_storage(&mut start_id_case2);
 
         // Find the maximum store ID among the newly added tables in level 2
-        let max_new_id_case2 = table_changes_case2
+        let mut flat_case2: Vec<TableChange> = Vec::new();
+        for b in &table_batches_case2 {
+            flat_case2.extend(b.input_table_changes.clone());
+            flat_case2.extend(b.target_table_changes.clone());
+        }
+        let max_new_id_case2 = flat_case2
             .iter()
             .filter(|tc| tc.change_type == ChangeType::Add)
             .map(|tc| tc.id)
@@ -2079,7 +2085,7 @@ mod test {
         let mut encoded_data = Vec::new();
         original_change.encode(&mut encoded_data);
 
-        let decoded_change = super::TableChange::decode(encoded_data.as_slice());
+        let decoded_change = super::TableChange::decode(encoded_data.as_slice()).unwrap();
 
         assert_eq!(original_change.index, decoded_change.index);
         assert_eq!(original_change.id, decoded_change.id);
@@ -2090,7 +2096,7 @@ mod test {
         let mut encoded_data_delete = Vec::new();
         original_change_delete.encode(&mut encoded_data_delete);
 
-        let decoded_change_delete = super::TableChange::decode(encoded_data_delete.as_slice());
+        let decoded_change_delete = super::TableChange::decode(encoded_data_delete.as_slice()).unwrap();
 
         assert_eq!(original_change_delete.index, decoded_change_delete.index);
         assert_eq!(original_change_delete.id, decoded_change_delete.id);
@@ -2211,95 +2217,74 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_table_change_log_get_all_changes() {
-        use std::fs::OpenOptions;
-        use tempfile::NamedTempFile;
+    // Legacy TableChangeLog tests removed.
 
+    #[test]
+    fn test_table_changes_encode_decode_and_log_roundtrip() {
+        use std::fs::OpenOptions;
         use tempfile::tempdir;
-        let store_id = 999;
-        // Create a temporary directory
+
+        // Build a TableChanges batch
+        let mut batch = super::TableChanges::new(1);
+        batch.input_table_changes.push(TableChange { index: 2, id: 42, change_type: ChangeType::Delete });
+        batch.target_table_changes.push(TableChange { index: 5, id: 99, change_type: ChangeType::Add });
+
+        // Encode/Decode roundtrip
+        let mut buf = Vec::new();
+        batch.encode(&mut buf);
+        let decoded = super::TableChanges::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.input_level, 1);
+        assert_eq!(decoded.input_table_changes.len(), 1);
+        assert_eq!(decoded.target_table_changes.len(), 1);
+        assert_eq!(decoded.input_table_changes[0].index, 2);
+
+        // Log roundtrip
+        let store_id = 12345;
         let tmp_dir = tempdir().expect("Failed to create temp directory");
-        // Get a file path in the temporary directory and record it
-        let path = tmp_dir.path().join(format!("{}.data", store_id));
-        // Open file by path and pass it to log
+        let path = tmp_dir.path().join(format!("{}_batch.data", store_id));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&path)
             .expect("Failed to open file in temp dir");
-        let mut log = super::TableChangeLog::<Filestore>::from_file(file, store_id);
+        let mut log = super::TableChangesLog::<Filestore>::from_file(file, store_id);
+        log.append(&batch);
 
-        // Case 1: Empty log
-        let empty_tmp_dir = tempdir().expect("Failed to create temp directory for empty log");
-        let empty_path = empty_tmp_dir.path().join(format!("{}.data", store_id + 1));
-        let empty_file = OpenOptions::new()
+        // Reopen and read
+        let file2 = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .open(&empty_path)
-            .expect("Failed to open empty file in temp dir");
-        let empty_log = super::TableChangeLog::<Filestore>::from_file(empty_file, store_id + 1);
-        assert!(empty_log.get_all_changes().unwrap().is_empty());
-
-        // Case 2: Log with one change batch
-        let change1 = TableChange { index: 0, id: 100, change_type: ChangeType::Add };
-        log.append(vec![change1.clone()]);
-        // To read from the same log instance, we need to re-open the file or ensure the Filestore's internal cursor is reset.
-        // Since Filestore is append-only and doesn't reset its internal cursor for reads,
-        // we'll simulate re-opening the log from the file for each read operation to get all changes from the beginning.
-        // This is consistent with how a log would be read from disk.
-        let file_for_read1 = OpenOptions::new()
-            .read(true)
             .open(&path)
-            .expect("Failed to open file for read");
-        let retrieved_changes_batch1 =
-            super::TableChangeLog::<Filestore>::from_file(file_for_read1, store_id)
-                .get_all_changes()
-                .unwrap();
-        assert_eq!(retrieved_changes_batch1.len(), 1);
-        assert_eq!(retrieved_changes_batch1[0].id, 100);
-        assert_eq!(retrieved_changes_batch1[0].index, 0);
-        assert_eq!(retrieved_changes_batch1[0].change_type, ChangeType::Add);
+            .expect("Failed to reopen file");
+        let log2 = super::TableChangesLog::<Filestore>::from_file(file2, store_id);
+        let batches = log2.get_all_batches().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].input_level, 1);
+        assert_eq!(batches[0].input_table_changes[0].id, 42);
+        assert_eq!(batches[0].target_table_changes[0].id, 99);
+    }
 
-        // Case 3: Log with multiple change batches
-        let change2 = TableChange { index: 5, id: 200, change_type: ChangeType::Delete };
-        let change3 = TableChange { index: 1, id: 101, change_type: ChangeType::Add };
-        log.append(vec![change2.clone(), change3.clone()]);
+    #[test]
+    fn test_table_changes_log_corrupted_checksum() {
+        use crate::db::store::Memstore;
 
-        // Re-create log from same store_id to simulate opening an existing log
-        let file_for_read2 = OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .expect("Failed to open file for read");
-        let log_reopened = super::TableChangeLog::<Filestore>::from_file(file_for_read2, store_id);
-        let retrieved_changes_reopened = log_reopened.get_all_changes().unwrap();
+        // Prepare a valid batch payload
+        let mut batch = super::TableChanges::new(2);
+        batch.input_table_changes.push(TableChange { index: 0, id: 7, change_type: ChangeType::Delete });
+        batch.target_table_changes.push(TableChange { index: 3, id: 9, change_type: ChangeType::Add });
+        let mut payload = Vec::new();
+        batch.encode(&mut payload);
 
-        assert_eq!(retrieved_changes_reopened.len(), 3); // Total changes: 1 from first batch + 2 from second batch
-        assert_eq!(retrieved_changes_reopened[0].id, 100);
-        assert_eq!(retrieved_changes_reopened[1].id, 200);
-        assert_eq!(retrieved_changes_reopened[2].id, 101);
+        // Write length + payload + wrong checksum to a Memstore
+        let mut mem = Memstore::open_for_test(42);
+        mem.append(&(payload.len() as u64).to_le_bytes());
+        mem.append(&payload);
+        // Wrong checksum (0)
+        mem.append(&0u32.to_le_bytes());
 
-        // Verify details of the second batch
-        assert_eq!(retrieved_changes_reopened[1].index, 5);
-        assert_eq!(
-            retrieved_changes_reopened[1].change_type,
-            ChangeType::Delete
-        );
-        assert_eq!(retrieved_changes_reopened[2].index, 1);
-        assert_eq!(retrieved_changes_reopened[2].change_type, ChangeType::Add);
-
-        // Case 4: Test with a batch of zero changes (should be handled gracefully)
-        log.append(vec![]);
-        let file_for_read3 = OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .expect("Failed to open file for read");
-        let log_reopened_empty_batch =
-            super::TableChangeLog::<Filestore>::from_file(file_for_read3, store_id);
-        let retrieved_changes_empty_batch = log_reopened_empty_batch.get_all_changes().unwrap();
-        assert_eq!(retrieved_changes_empty_batch.len(), 3); // Should still be 3, as empty batch adds no changes
+        let log = super::TableChangesLog::new_with_store(mem);
+        assert!(log.get_all_batches().is_err());
     }
 
     /// Tests the `need_compact` method to ensure it correctly identifies when compaction is needed.
@@ -2396,45 +2381,7 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_table_change_log_corrupted_checksum() {
-        let store_id = 100;
-        let mut memstore = Memstore::open_for_test(store_id);
-
-        // Manually create a valid TableChange and its encoded bytes
-        let change = TableChange { index: 0, id: 1, change_type: ChangeType::Add };
-        let mut change_buffer = Vec::new();
-        change.encode(&mut change_buffer); // This is 25 bytes
-
-        // Calculate correct checksum
-        let mut hasher = Hasher::new();
-        hasher.update(&change_buffer);
-        let correct_checksum = hasher.finalize();
-
-        // Prepare the full batch bytes: count + change_data + checksum
-        let mut batch_bytes = Vec::new();
-        batch_bytes.extend_from_slice(&(1u64).to_le_bytes()); // num_changes_in_batch = 1
-        batch_bytes.extend_from_slice(&change_buffer);
-        batch_bytes.extend_from_slice(&correct_checksum.to_le_bytes());
-
-        // Corrupt the checksum byte (e.g., flip a bit in the last byte of the checksum)
-        let checksum_start_index = batch_bytes.len() - U32_SIZE; // U32_SIZE is 4
-        batch_bytes[checksum_start_index] = batch_bytes[checksum_start_index].wrapping_add(1); // Corrupt one byte
-
-        // Append the corrupted bytes to the memstore
-        memstore.append(&batch_bytes);
-
-        // Create a TableChangeLog from the corrupted memstore
-        let corrupted_log = super::TableChangeLog::new_with_store(memstore);
-
-        // Attempt to get changes, expecting an error due to checksum mismatch
-        let result = corrupted_log.get_all_changes();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "decode table change checksum"
-        );
-    }
+    // Legacy checksum test removed.
 
     #[test]
     fn test_key_range_overlap() {
