@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 const U32_SIZE: usize = std::mem::size_of::<u32>();
-// level (u64) + index (u64) + id (u64) + change_type (u8)
-const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 3 + std::mem::size_of::<u8>();
+// index (u64) + id (u64) + change_type (u8)
+const TABLE_CHANGE_ENCODED_SIZE: usize = U64_SIZE * 2 + std::mem::size_of::<u8>();
 const DEFAULT_MAX_LEVEL_ZERO_TABLE_SIZE: usize = 4;
 const MAX_INPUT_TABLE_IN_COMPACT: usize = 1;
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -36,7 +36,6 @@ pub enum ChangeType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableChange {
-    level: usize,
     index: usize,
     id: u64,
     change_type: ChangeType,
@@ -46,7 +45,7 @@ pub struct TableChange {
 pub struct TableChanges {
     // compact table from level_low to high_level
     // low_level is the level where the compaction starts
-    low_level: usize,
+    input_level: usize,
     delete_tables: Vec<StoreId>,
     // (index, id) in high level
     // sorted by index
@@ -79,7 +78,7 @@ pub struct LevelStorage<T: Store> {
 impl TableChanges {
     fn new(level_start: usize) -> Self {
         TableChanges {
-            low_level: level_start,
+            input_level: level_start,
             delete_tables: Vec::new(),
             add_tables: Vec::new(),
         }
@@ -89,7 +88,7 @@ impl TableChanges {
 
         // Write low_level as u64
         writer
-            .write_u64::<LittleEndian>(self.low_level as u64)
+            .write_u64::<LittleEndian>(self.input_level as u64)
             .unwrap();
 
         // Write delete table count and each id
@@ -116,7 +115,6 @@ impl TableChanges {
 }
 impl TableChange {
     fn encode<W: Write>(&self, writer: &mut W) {
-        writer.write_u64::<LittleEndian>(self.level as u64).unwrap();
         writer.write_u64::<LittleEndian>(self.index as u64).unwrap();
         writer.write_u64::<LittleEndian>(self.id).unwrap();
         writer
@@ -129,7 +127,6 @@ impl TableChange {
     fn decode<R: Read>(mut data: R) -> Self {
         use byteorder::{LittleEndian, ReadBytesExt};
 
-        let level = data.read_u64::<LittleEndian>().unwrap() as usize;
         let index = data.read_u64::<LittleEndian>().unwrap() as usize;
         let id = data.read_u64::<LittleEndian>().unwrap();
         let change_type_byte = data.read_u8().unwrap();
@@ -138,62 +135,7 @@ impl TableChange {
             1 => ChangeType::Delete,
             _ => panic!("Unknown ChangeType byte: {}", change_type_byte),
         };
-        TableChange {
-            level,
-            index,
-            id,
-            change_type,
-        }
-    }
-    // build level table id from table change return vec[n]:all table in level n
-    // insert it with its index in table_changes
-    fn apply_change_to_level(table_changes: Vec<TableChange>) -> Vec<Vec<StoreId>> {
-        let mut levels: Vec<Vec<StoreId>> = Vec::new();
-
-        for change in table_changes {
-            // Ensure the levels vector is large enough for the current change's level
-            while levels.len() <= change.level {
-                levels.push(Vec::new());
-            }
-
-            let current_level_tables = &mut levels[change.level];
-
-            match change.change_type {
-                ChangeType::Add => {
-                    // The index should be valid for insertion: 0 <= index <= len.
-                    // The compaction logic ensures `index` is correctly calculated based on sort order.
-                    // If `change.index` is greater than `current_level_tables.len()`,
-                    // it indicates an issue in change generation, but `Vec::insert` at `len` works
-                    // as `push`. We will use `insert` directly.
-                    current_level_tables.insert(change.index, change.id);
-                }
-                ChangeType::Delete => {
-                    // For deletion, the index must be exactly valid (0 <= index < len).
-                    // And the ID at that index should match the expected ID to ensure consistency.
-                    if change.index < current_level_tables.len()
-                        && current_level_tables[change.index] == change.id
-                    {
-                        current_level_tables.remove(change.index);
-                    } else {
-                        // Log error instead of panicking to avoid crashing library users.
-                        tracing::error!(
-                            level = change.level,
-                            index = change.index,
-                            id = change.id,
-                            current_len = current_level_tables.len(),
-                            current_tables = ?current_level_tables,
-                            "TableChange::Delete mismatch or out of bounds; skipping this change"
-                        );
-                        // Skip applying this invalid deletion.
-                    }
-                }
-            }
-        }
-        // Remove trailing empty levels that might have been created but remain empty
-        while levels.last().is_some_and(|l| l.is_empty()) {
-            levels.pop();
-        }
-        levels
+        TableChange { index, id, change_type }
     }
 }
 
@@ -555,7 +497,6 @@ impl<T: Store> LevelStorage<T> {
         }
         for change in &table_change {
             debug!(
-                level = change.level,
                 index = change.index,
                 id = change.id,
                 change_type = ?change.change_type,
@@ -682,7 +623,6 @@ impl<T: Store> LevelStorage<T> {
 
         for change in &table_change {
             debug!(
-                level = change.level,
                 index = change.index,
                 id = change.id,
                 change_type = ?change.change_type,
@@ -765,7 +705,6 @@ impl<T: Store> LevelStorage<T> {
                 table_change.push(TableChange {
                     id: table.store_id(),
                     index,
-                    level: target_level,
                     change_type: ChangeType::Delete,
                 });
             } else {
@@ -780,6 +719,9 @@ impl<T: Store> LevelStorage<T> {
         )
     }
 
+    /// Compacts overlapping tables from input and target sets into new SSTables.
+    /// Merges KV operations, filters deletes at the deepest level, and splits into multiple tables if needed.
+    /// Returns the new compacted tables and any table changes (e.g., for logging).
     fn compact_tables_from_sets(
         tables_from_input: Vec<ThreadSafeTableReader<T>>,
         tables_from_target: Vec<ThreadSafeTableReader<T>>,
@@ -832,7 +774,6 @@ impl<T: Store> LevelStorage<T> {
                     table_change.push(TableChange {
                         id: new_table_reader.store_id(),
                         index: 0,
-                        level: target_level,
                         change_type: ChangeType::Add,
                     });
                     compacted_tables.push(Arc::new(new_table_reader));
@@ -852,7 +793,6 @@ impl<T: Store> LevelStorage<T> {
                         table_change.push(TableChange {
                             id: new_table_reader.store_id(),
                             index: 0,
-                            level: target_level,
                             change_type: ChangeType::Add,
                         });
                         compacted_tables.push(Arc::new(new_table_reader));
@@ -881,7 +821,6 @@ impl<T: Store> LevelStorage<T> {
         let mut final_tables_for_target_level = Vec::new();
         for table in &pass_through_input_tables {
             table_change.push(TableChange {
-                level: target_level,
                 index: 0,
                 id: table.store_id(),
                 change_type: ChangeType::Add,
@@ -901,7 +840,7 @@ impl<T: Store> LevelStorage<T> {
         }
 
         for change in table_change.iter_mut() {
-            if change.change_type == ChangeType::Add && change.level == target_level {
+            if change.change_type == ChangeType::Add {
                 if let Some(&new_index) = current_level_tables_ids.get(&change.id) {
                     change.index = new_index;
                 } else {
@@ -992,9 +931,8 @@ impl<T: Store> LevelStorage<T> {
         for pos in positions_to_remove {
             let table = level.sstables.remove(pos);
             table_change.push(TableChange {
-                id: table.store_id(), // Convert u64 to String
+                id: table.store_id(),
                 index: pos,
-                level: level_depth,
                 change_type: ChangeType::Delete,
             });
             tables_to_compact.push(table);
@@ -1822,7 +1760,6 @@ mod test {
         changed_ids.sort();
         assert_eq!(changed_ids, compacted_ids); // IDs should match
         for change in changes4 {
-            assert_eq!(change.level, 1);
             assert_eq!(change.change_type, ChangeType::Delete);
         }
     }
@@ -1863,7 +1800,7 @@ mod test {
         // Find the maximum store ID among the newly added tables in level 1
         let max_new_id_case1 = table_changes
             .iter()
-            .filter(|tc| tc.change_type == ChangeType::Add && tc.level == 1)
+            .filter(|tc| tc.change_type == ChangeType::Add)
             .map(|tc| tc.id)
             .max()
             .expect("Should have added tables in level 1");
@@ -1885,14 +1822,12 @@ mod test {
             .filter(|tc| tc.change_type == ChangeType::Add)
             .collect();
 
-        // Expect one delete from level 0 (id_001)
+        // Expect deletes from the input level
         assert_eq!(delete_changes.len(), 5);
-        assert_eq!(delete_changes[0].level, 0);
 
         // Expect at least one add to level 1 (the compacted table)
         assert!(!add_changes.is_empty());
         for add_change in add_changes {
-            assert_eq!(add_change.level, 1);
             assert!(add_change.id <= max_origin_id); // Should use the provided store_id_start
         }
 
@@ -1960,7 +1895,7 @@ mod test {
         // Find the maximum store ID among the newly added tables in level 2
         let max_new_id_case2 = table_changes_case2
             .iter()
-            .filter(|tc| tc.change_type == ChangeType::Add && tc.level == 2)
+            .filter(|tc| tc.change_type == ChangeType::Add)
             .map(|tc| tc.id)
             .max()
             .expect("Should have added tables in level 2");
@@ -2024,36 +1959,24 @@ mod test {
 
     #[test]
     fn test_table_change_encode_decode() {
-        let original_change = super::TableChange {
-            level: 5,
-            index: 10,
-            id: 12345,
-            change_type: super::ChangeType::Add,
-        };
+        let original_change = super::TableChange { index: 10, id: 12345, change_type: super::ChangeType::Add };
 
         let mut encoded_data = Vec::new();
         original_change.encode(&mut encoded_data);
 
         let decoded_change = super::TableChange::decode(encoded_data.as_slice());
 
-        assert_eq!(original_change.level, decoded_change.level);
         assert_eq!(original_change.index, decoded_change.index);
         assert_eq!(original_change.id, decoded_change.id);
         assert_eq!(original_change.change_type, decoded_change.change_type);
 
-        let original_change_delete = super::TableChange {
-            level: 1,
-            index: 0,
-            id: 67890,
-            change_type: super::ChangeType::Delete,
-        };
+        let original_change_delete = super::TableChange { index: 0, id: 67890, change_type: super::ChangeType::Delete };
 
         let mut encoded_data_delete = Vec::new();
         original_change_delete.encode(&mut encoded_data_delete);
 
         let decoded_change_delete = super::TableChange::decode(encoded_data_delete.as_slice());
 
-        assert_eq!(original_change_delete.level, decoded_change_delete.level);
         assert_eq!(original_change_delete.index, decoded_change_delete.index);
         assert_eq!(original_change_delete.id, decoded_change_delete.id);
         assert_eq!(
@@ -2206,12 +2129,7 @@ mod test {
         assert!(empty_log.get_all_changes().unwrap().is_empty());
 
         // Case 2: Log with one change batch
-        let change1 = TableChange {
-            level: 0,
-            index: 0,
-            id: 100,
-            change_type: ChangeType::Add,
-        };
+        let change1 = TableChange { index: 0, id: 100, change_type: ChangeType::Add };
         log.append(vec![change1.clone()]);
         // To read from the same log instance, we need to re-open the file or ensure the Filestore's internal cursor is reset.
         // Since Filestore is append-only and doesn't reset its internal cursor for reads,
@@ -2227,23 +2145,12 @@ mod test {
                 .unwrap();
         assert_eq!(retrieved_changes_batch1.len(), 1);
         assert_eq!(retrieved_changes_batch1[0].id, 100);
-        assert_eq!(retrieved_changes_batch1[0].level, 0);
         assert_eq!(retrieved_changes_batch1[0].index, 0);
         assert_eq!(retrieved_changes_batch1[0].change_type, ChangeType::Add);
 
         // Case 3: Log with multiple change batches
-        let change2 = TableChange {
-            level: 1,
-            index: 5,
-            id: 200,
-            change_type: ChangeType::Delete,
-        };
-        let change3 = TableChange {
-            level: 0,
-            index: 1,
-            id: 101,
-            change_type: ChangeType::Add,
-        };
+        let change2 = TableChange { index: 5, id: 200, change_type: ChangeType::Delete };
+        let change3 = TableChange { index: 1, id: 101, change_type: ChangeType::Add };
         log.append(vec![change2.clone(), change3.clone()]);
 
         // Re-create log from same store_id to simulate opening an existing log
@@ -2260,14 +2167,11 @@ mod test {
         assert_eq!(retrieved_changes_reopened[2].id, 101);
 
         // Verify details of the second batch
-        assert_eq!(retrieved_changes_reopened[1].level, 1);
         assert_eq!(retrieved_changes_reopened[1].index, 5);
         assert_eq!(
             retrieved_changes_reopened[1].change_type,
             ChangeType::Delete
         );
-
-        assert_eq!(retrieved_changes_reopened[2].level, 0);
         assert_eq!(retrieved_changes_reopened[2].index, 1);
         assert_eq!(retrieved_changes_reopened[2].change_type, ChangeType::Add);
 
@@ -2383,12 +2287,7 @@ mod test {
         let mut memstore = Memstore::open_for_test(store_id);
 
         // Manually create a valid TableChange and its encoded bytes
-        let change = TableChange {
-            level: 0,
-            index: 0,
-            id: 1,
-            change_type: ChangeType::Add,
-        };
+        let change = TableChange { index: 0, id: 1, change_type: ChangeType::Add };
         let mut change_buffer = Vec::new();
         change.encode(&mut change_buffer); // This is 25 bytes
 
@@ -2561,179 +2460,8 @@ mod test {
         table_builder.flush()
     }
 
-    #[test]
-    fn test_apply_change_to_level() {
-        // Test case 1: Adding a single table to an empty levels structure
-        let changes1 = vec![TableChange {
-            level: 0,
-            index: 0,
-            id: 101,
-            change_type: ChangeType::Add,
-        }];
-        let result1 = TableChange::apply_change_to_level(changes1);
-        assert_eq!(result1.len(), 1);
-        assert_eq!(result1[0], vec![101]);
-
-        // Test case 2: Adding multiple tables to the same level at different indices
-        // Should handle insertion order correctly based on index
-        let changes2 = vec![
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 101,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 1,
-                id: 102,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 103,
-                change_type: ChangeType::Add, // Insert at beginning
-            },
-        ];
-        let result2 = TableChange::apply_change_to_level(changes2);
-        assert_eq!(result2.len(), 1);
-        assert_eq!(result2[0], vec![103, 101, 102]); // Expected order after insertions
-
-        // Test case 3: Adding to a higher level, ensuring intermediate levels are created
-        let changes3 = vec![
-            TableChange {
-                level: 2,
-                index: 0,
-                id: 301,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 1,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 2,
-                index: 1,
-                id: 302,
-                change_type: ChangeType::Add,
-            },
-        ];
-        let result3 = TableChange::apply_change_to_level(changes3);
-        assert_eq!(result3.len(), 3); // Levels 0, 1, 2 should exist
-        assert_eq!(result3[0], vec![1]);
-        assert!(result3[1].is_empty()); // Level 1 should be empty
-        assert_eq!(result3[2], vec![301, 302]);
-
-        // Test case 4: Deleting a table
-        let changes4 = vec![
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 1,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 1,
-                id: 2,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 1,
-                change_type: ChangeType::Delete,
-            }, // Delete 1
-        ];
-        let result4 = TableChange::apply_change_to_level(changes4);
-        assert_eq!(result4.len(), 1);
-        assert_eq!(result4[0], vec![2]);
-
-        // Test case 5: Deleting the last table in a level, making the level empty
-        let changes5 = vec![
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 1,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 1,
-                change_type: ChangeType::Delete,
-            },
-        ];
-        let result5 = TableChange::apply_change_to_level(changes5);
-        assert!(result5.is_empty()); // Level 0 should be removed as it's empty
-
-        // Test case 6: Multiple adds and deletes across levels, with trailing empty level removal
-        let changes6 = vec![
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 10,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 1,
-                index: 0,
-                id: 20,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 2,
-                index: 0,
-                id: 30,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 10,
-                change_type: ChangeType::Delete,
-            }, // Deletes from L0
-            TableChange {
-                level: 2,
-                index: 0,
-                id: 30,
-                change_type: ChangeType::Delete,
-            }, // Deletes from L2
-        ];
-        let result6 = TableChange::apply_change_to_level(changes6);
-        assert_eq!(result6.len(), 2); // Level 0 and Level 2 should be removed, only Level 1 remains
-        assert!(result6[0].is_empty()); // Level 0 is created but made empty and remains due to a non-empty L1
-        assert_eq!(result6[1], vec![20]);
-        // The previous behavior was to pop empty trailing levels.
-        // If level 0 becomes empty and level 1 is not empty, level 0 will still exist as an empty vec.
-        // If the highest level (e.g. level 2) becomes empty, it should be popped.
-        assert_eq!(result6.len(), 2); // Expected levels after removing trailing empty ones
-        assert_eq!(result6[0], vec![] as Vec<u64>); // Level 0 is now empty
-        assert_eq!(result6[1], vec![20]); // Level 1 still has 20
-
-        // Test case 7: Deletion with incorrect ID (should panic in real application, but for test, simulate with expected valid case)
-        // This test case aims to verify that the consistency check works. We cannot make it panic and continue.
-        // So, we'll confirm a correct deletion scenario.
-        let changes7 = vec![
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 100,
-                change_type: ChangeType::Add,
-            },
-            TableChange {
-                level: 0,
-                index: 0,
-                id: 100,
-                change_type: ChangeType::Delete,
-            },
-        ];
-        let result7 = TableChange::apply_change_to_level(changes7);
-        assert!(result7.is_empty()); // Should be empty
-    }
+    // test_apply_change_to_level removed as TableChange no longer carries level;
+    // reconstruction now depends on higher-level context.
 
     #[test]
     fn test_compact_level_to_depthest_level() {
@@ -2930,13 +2658,11 @@ mod test {
 
         // Should delete the overlapping table (table_l1_x)
         assert_eq!(delete_changes.len(), 1);
-        assert_eq!(delete_changes[0].level, 1);
         assert_eq!(delete_changes[0].id, table_l1_x.store_id());
 
         // Should add new compacted tables
         assert!(!add_changes.is_empty());
         for add_change in &add_changes {
-            assert_eq!(add_change.level, 1);
             assert_eq!(add_change.change_type, ChangeType::Add);
             assert_eq!(add_change.id, 5000); // Assuming one compacted table for this data volume and using the starting ID
         }
@@ -3059,7 +2785,6 @@ mod test {
             "Expected exactly one new compacted table to be added in Case 2"
         );
         let add_change = &add_changes_case2[0];
-        assert_eq!(add_change.level, 1);
         assert_eq!(add_change.change_type, ChangeType::Add);
         assert_eq!(add_change.id, 6000); // The single new compacted table should have this starting ID
                                          // Since input keys are smaller than target level keys, new tables should be inserted at the beginning
