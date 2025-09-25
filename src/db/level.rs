@@ -617,7 +617,7 @@ impl<T: Store> LevelStorage<T> {
     ///    not persist further.
     /// 5) Stream the merged KVs into one or more new SSTables, recording Add
     ///    changes for each flushed table.
-    /// 6) Finalize the target level by merging pass-through input tables,
+    /// 6) assemble the target level by merging pass-through input tables,
     ///    new compacted tables, and pass-through target tables; then sort by
     ///    first key and re-index Add changes to reflect the final order.
     /// 7) Return the complete list of TableChange entries.
@@ -670,7 +670,7 @@ impl<T: Store> LevelStorage<T> {
         );
         table_change.append(&mut add_changes);
 
-        // 6) Finalize target level and re-index Add entries
+        // 6) assamble target level and re-index Add entries
         Self::assemble_target_level(
             &mut self.levels[target_level].sstables,
             pass_through_input_tables,
