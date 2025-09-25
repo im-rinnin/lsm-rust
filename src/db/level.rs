@@ -3178,4 +3178,28 @@ mod test {
             u64::MAX,
         );
     }
+
+
+    /// Tests that delete operations are filtered out during compaction to the deepest level,
+    /// ensuring deleted keys are not persisted in the final SSTable.
+    #[test]
+    fn test_compact_level_deep_level_delete_filtering() {
+        // Create table with only a delete operation
+        let data = vec![
+            KVOperation::new(1, "000000".as_bytes().into(), OpType::Delete),
+        ];
+        let table = Arc::new(create_test_table_from_kvs_with_id(data, 1));
+
+        // Set up level 1 as deepest level (no level 2)
+        let level0 = Level::new(vec![], true);
+        let level1 = Level::new(vec![table.clone()], false);
+        let mut storage = LevelStorage::new(vec![level0, level1], LevelStorageConfig::config_for_test());
+
+        let mut id = 100;
+        let _changes = storage.compact_level(&mut id, vec![table], 0);
+
+        // After compaction to deepest level, delete should be filtered out, so no key
+        let compacted = &storage.levels[1];
+        assert_level_find_and_check(&compacted, &KeySlice::from("000000".as_bytes()), None);
+    }
 }
